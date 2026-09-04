@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { agents as defaultAgents } from "../agents";
-import type { AgentAdapter, AgentId, FlowRole, FlowStep, FlowStepId, ReviewFlowResult } from "../agents/types";
+import type { AgentAdapter, AgentId, FlowEvent, FlowRole, FlowStep, FlowStepId, ReviewFlowResult } from "../agents/types";
 
 export const MAX_FLOW_MS = 5 * 60 * 1_000;
 export const MAX_HANDOFF_CHARS = 30_000;
@@ -14,6 +14,7 @@ type FlowOptions = {
   now?: () => number;
   flowId?: string;
   log?: (entry: FlowLogEntry) => void;
+  onEvent?: (event: FlowEvent) => void;
 };
 type FlowLogEntry = { flowId: string; stepId: FlowStepId; agent: AgentId; status: FlowStep["status"]; durationMs?: number };
 
@@ -40,36 +41,37 @@ export async function runReviewFlow(prompt: string, options: FlowOptions = {}): 
   timeout.unref();
 
   try {
+    emit(options.onEvent, { type: "flow_started", flowId, timestamp: new Date(now()).toISOString() });
     if (options.signal?.aborted) controller.abort(options.signal.reason);
-    await executeStep(steps[0], draftPrompt(prompt), adapters, controller.signal, flowId, now, options.log);
+    await executeStep(steps[0], draftPrompt(prompt), adapters, controller.signal, flowId, now, options.log, options.onEvent);
     if (steps[0].status === "error") {
-      skipRemaining(steps, 1, timedOut ? "Flow time limit reached" : controller.signal.aborted ? "Request was aborted" : "Codex draft failed", flowId, options.log);
-      return result(flowId, steps, timedOut, controller.signal.aborted);
+      skipRemaining(steps, 1, timedOut ? "Flow time limit reached" : controller.signal.aborted ? "Request was aborted" : "Codex draft failed", flowId, options.log, options.onEvent);
+      return finish(flowId, steps, timedOut, controller.signal.aborted, options.onEvent);
     }
 
-    await executeStep(steps[1], cursorPrompt(prompt, steps[0].output), adapters, controller.signal, flowId, now, options.log);
+    await executeStep(steps[1], cursorPrompt(prompt, steps[0].output), adapters, controller.signal, flowId, now, options.log, options.onEvent);
     if (controller.signal.aborted) {
-      skipRemaining(steps, 2, timedOut ? "Flow time limit reached" : "Request was aborted", flowId, options.log);
-      return result(flowId, steps, timedOut, true);
+      skipRemaining(steps, 2, timedOut ? "Flow time limit reached" : "Request was aborted", flowId, options.log, options.onEvent);
+      return finish(flowId, steps, timedOut, true, options.onEvent);
     }
 
-    await executeStep(steps[2], claudePrompt(prompt, steps[0].output, steps[1]), adapters, controller.signal, flowId, now, options.log);
+    await executeStep(steps[2], claudePrompt(prompt, steps[0].output, steps[1]), adapters, controller.signal, flowId, now, options.log, options.onEvent);
     if (controller.signal.aborted) {
-      skipRemaining(steps, 3, timedOut ? "Flow time limit reached" : "Request was aborted", flowId, options.log);
-      return result(flowId, steps, timedOut, true);
+      skipRemaining(steps, 3, timedOut ? "Flow time limit reached" : "Request was aborted", flowId, options.log, options.onEvent);
+      return finish(flowId, steps, timedOut, true, options.onEvent);
     }
 
-    await executeStep(steps[3], finalPrompt(prompt, steps[0].output, steps[1], steps[2]), adapters, controller.signal, flowId, now, options.log);
-    return result(flowId, steps, timedOut, controller.signal.aborted);
+    await executeStep(steps[3], finalPrompt(prompt, steps[0].output, steps[1], steps[2]), adapters, controller.signal, flowId, now, options.log, options.onEvent);
+    return finish(flowId, steps, timedOut, controller.signal.aborted, options.onEvent);
   } finally {
     clearTimeout(timeout);
     options.signal?.removeEventListener("abort", abortFromRequest);
   }
 }
 
-async function executeStep(step: FlowStep, input: string, adapters: AgentSet, signal: AbortSignal, flowId: string, now: () => number, log?: FlowOptions["log"]) {
+async function executeStep(step: FlowStep, input: string, adapters: AgentSet, signal: AbortSignal, flowId: string, now: () => number, log?: FlowOptions["log"], onEvent?: FlowOptions["onEvent"]) {
   if (signal.aborted) {
-    markSkipped(step, "Flow was cancelled before this step started", flowId, log);
+    markSkipped(step, "Flow was cancelled before this step started", flowId, log, onEvent);
     return;
   }
   const start = now();
@@ -77,6 +79,7 @@ async function executeStep(step: FlowStep, input: string, adapters: AgentSet, si
   step.startedAt = new Date(start).toISOString();
   step.inputSummary = `${input.length.toLocaleString("en-US")} characters`;
   log?.({ flowId, stepId: step.id, agent: step.agent, status: step.status });
+  emit(onEvent, { type: "step_started", flowId, step: snapshot(step) });
   try {
     const run = await adapters[step.agent].run(input, { signal });
     step.status = run.status;
@@ -90,18 +93,30 @@ async function executeStep(step: FlowStep, input: string, adapters: AgentSet, si
   step.completedAt = new Date(end).toISOString();
   step.durationMs = Math.max(0, end - start);
   log?.({ flowId, stepId: step.id, agent: step.agent, status: step.status, durationMs: step.durationMs });
+  emit(onEvent, { type: step.status === "completed" ? "step_completed" : "step_error", flowId, step: snapshot(step) });
 }
 
-function skipRemaining(steps: FlowStep[], from: number, reason: string, flowId: string, log?: FlowOptions["log"]) {
-  for (let index = from; index < steps.length; index += 1) markSkipped(steps[index], reason, flowId, log);
+function skipRemaining(steps: FlowStep[], from: number, reason: string, flowId: string, log?: FlowOptions["log"], onEvent?: FlowOptions["onEvent"]) {
+  for (let index = from; index < steps.length; index += 1) markSkipped(steps[index], reason, flowId, log, onEvent);
 }
 
-function markSkipped(step: FlowStep, reason: string, flowId: string, log?: FlowOptions["log"]) {
+function markSkipped(step: FlowStep, reason: string, flowId: string, log?: FlowOptions["log"], onEvent?: FlowOptions["onEvent"]) {
   if (step.status !== "idle") return;
   step.status = "skipped";
   step.error = reason;
   log?.({ flowId, stepId: step.id, agent: step.agent, status: step.status });
+  emit(onEvent, { type: "step_skipped", flowId, step: snapshot(step) });
 }
+
+function finish(flowId: string, steps: FlowStep[], timedOut: boolean, aborted: boolean, onEvent?: FlowOptions["onEvent"]) {
+  const value = result(flowId, steps, timedOut, aborted);
+  const type = value.status === "timed_out" ? "flow_timed_out" : value.status === "aborted" ? "flow_aborted" : "flow_completed";
+  emit(onEvent, { type, flowId, result: value });
+  return value;
+}
+
+function snapshot(step: FlowStep): FlowStep { return { ...step }; }
+function emit(onEvent: FlowOptions["onEvent"], event: FlowEvent) { onEvent?.(event); }
 
 function result(flowId: string, steps: FlowStep[], timedOut: boolean, aborted: boolean): ReviewFlowResult {
   const final = steps[3];

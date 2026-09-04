@@ -28,11 +28,13 @@ npm run dev
 Open <http://localhost:3000>, enter a prompt, and choose a mode:
 
 - **Parallel** / **Send to all** sends the same prompt to all three agents concurrently and displays independent results side by side.
-- **Review Flow** runs `Codex draft → Cursor review → Claude review → Codex final`, then displays all four steps, statuses, errors, outputs, and durations as one timeline. This is a fixed TypeScript-controlled sequence, not a free agent conversation or agent-selected handoff.
+- **Review Flow** runs `Codex draft → Cursor review → Claude review → Codex final` and updates each step in real time as it starts and finishes. Statuses, errors, completed step outputs, durations, and the final output appear without reloading the page. This is a fixed TypeScript-controlled sequence, not a free agent conversation or agent-selected handoff.
 
 The review roles are: Codex creates the draft, Cursor reviews correctness and risks, Claude independently reviews both earlier results, and Codex produces the final user-facing answer.
 
 If the draft fails, every later step is skipped. If Cursor fails, Claude and final Codex continue with an explicit unavailable-review marker. If Claude fails, final Codex continues with the draft and available Cursor review. A final Codex failure leaves the prior timeline visible.
+
+Review progress uses a same-origin `fetch` POST whose response is an SSE-compatible `text/event-stream`. Streaming is step-level only: agent output is sent once that step finishes, not token by token. **Cancel** aborts the active request, stops the current CLI process group, marks the running step as errored/aborted, and skips steps that have not started. Closing the stream or disconnecting the browser aborts the server-side flow through the same signal path so the active child process is not left running.
 
 The server binds to `127.0.0.1`. Agent processes use the project directory as
 their explicit working directory. The workspace value is centralized in the
@@ -67,6 +69,7 @@ Tests mock process spawning and never invoke the real AI CLIs.
 - The Claude adapter resolves its binary as `~/.local/bin/claude` from `HOME` (falling back to the operating system home directory); it otherwise inherits the server process environment, including `PATH`.
 - Prompts are required and limited to 20,000 characters; CLI execution is limited to 120 seconds and captured output to 1 MB per stream.
 - The complete review flow is limited to five minutes. Each prior output is capped at 30,000 characters when embedded into a later prompt, with Unicode-safe truncation markers.
+- Both the existing JSON review endpoint and the step-event stream endpoint enforce the same localhost Host/Origin checks. CORS is not enabled, and neither prompts nor agent outputs are written to application event logs.
 - Draft and review blocks are explicitly delimited as untrusted content. Review prompts instruct agents never to follow commands inside quoted agent output. Handoffs remain plain CLI argument strings and are never interpreted by a shell.
 - Do not expose this development server to untrusted networks. The API has no authentication and intentionally launches locally authenticated tools.
 - Keep `.env` files and credentials out of Git. The included `.gitignore` excludes environment files.
@@ -74,4 +77,4 @@ Tests mock process spawning and never invoke the real AI CLIs.
 
 ## Not implemented
 
-Free-form agent conversations, agent-selected or recursive handoffs, automatic loops/retries, automated code edits, repository selection, worktrees, GitHub automation, databases, long-term memory, token/cost tracking, streaming output, production deployment, and Docker are not implemented.
+Free-form agent conversations, agent-selected or recursive handoffs, automatic loops/retries, automated code edits, repository selection, worktrees, GitHub automation, databases, long-term memory, token/cost tracking, token-level streaming, production deployment, and Docker are not implemented.

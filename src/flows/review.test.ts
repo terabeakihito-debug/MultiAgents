@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { AgentAdapter, AgentId, AgentResult, AgentRunOptions } from "../agents/types";
+import type { AgentAdapter, AgentId, AgentResult, AgentRunOptions, FlowEvent } from "../agents/types";
 import { cursorPrompt, runReviewFlow, truncateForHandoff } from "./review";
 
 function setup(results: Partial<Record<AgentId, AgentResult[]>>) {
@@ -30,11 +30,31 @@ describe("runReviewFlow", () => {
     expect(calls.codex[1]).toContain("review-two");
   });
 
+  it("emits the complete ordered step event sequence", async () => {
+    const { adapters } = setup({ codex: [ok("codex", "draft"), ok("codex", "final")] });
+    const events: FlowEvent[] = [];
+    await runReviewFlow("request", { agents: adapters, flowId: "flow-events", onEvent: (event) => events.push(event) });
+    expect(events.map((event) => event.type)).toEqual([
+      "flow_started", "step_started", "step_completed", "step_started", "step_completed",
+      "step_started", "step_completed", "step_started", "step_completed", "flow_completed",
+    ]);
+    expect(events.filter((event) => "step" in event).map((event) => "step" in event && event.step.id)).toEqual([
+      "codex_draft", "codex_draft", "cursor_review", "cursor_review", "claude_review", "claude_review", "codex_final", "codex_final",
+    ]);
+  });
+
   it("skips every later step after a draft failure", async () => {
     const { adapters, calls } = setup({ codex: [fail("codex")] });
     const result = await runReviewFlow("request", { agents: adapters });
     expect(result.steps.map((step) => step.status)).toEqual(["error", "skipped", "skipped", "skipped"]);
     expect(calls.cursor).toHaveLength(0); expect(calls.claude).toHaveLength(0);
+  });
+
+  it("emits an error followed by skipped events after a draft failure", async () => {
+    const { adapters } = setup({ codex: [fail("codex")] });
+    const types: string[] = [];
+    await runReviewFlow("request", { agents: adapters, onEvent: (event) => types.push(event.type) });
+    expect(types).toEqual(["flow_started", "step_started", "step_error", "step_skipped", "step_skipped", "step_skipped", "flow_completed"]);
   });
 
   it("continues without an unavailable Cursor review", async () => {
@@ -45,11 +65,27 @@ describe("runReviewFlow", () => {
     expect(calls.codex[1]).toContain("Cursor review unavailable due to execution error.");
   });
 
+  it("continues emitting later step events after a Cursor failure", async () => {
+    const { adapters } = setup({ codex: [ok("codex", "draft"), ok("codex", "final")], cursor: [fail("cursor")] });
+    const events: FlowEvent[] = [];
+    await runReviewFlow("request", { agents: adapters, onEvent: (event) => events.push(event) });
+    expect(events.some((event) => event.type === "step_error" && event.step.id === "cursor_review")).toBe(true);
+    expect(events.some((event) => event.type === "step_started" && event.step.id === "codex_final")).toBe(true);
+  });
+
   it("continues to final after a Claude failure", async () => {
     const { adapters, calls } = setup({ codex: [ok("codex", "draft"), ok("codex", "final")], cursor: [ok("cursor", "first")], claude: [fail("claude")] });
     const result = await runReviewFlow("request", { agents: adapters });
     expect(result.steps.map((step) => step.status)).toEqual(["completed", "completed", "error", "completed"]);
     expect(calls.codex[1]).toContain("Claude review unavailable due to execution error.");
+  });
+
+  it("continues emitting the final events after a Claude failure", async () => {
+    const { adapters } = setup({ codex: [ok("codex", "draft"), ok("codex", "final")], claude: [fail("claude")] });
+    const events: FlowEvent[] = [];
+    await runReviewFlow("request", { agents: adapters, onEvent: (event) => events.push(event) });
+    expect(events.some((event) => event.type === "step_error" && event.step.id === "claude_review")).toBe(true);
+    expect(events.at(-1)?.type).toBe("flow_completed");
   });
 
   it("retains prior history when final Codex fails", async () => {
@@ -82,6 +118,18 @@ describe("runReviewFlow", () => {
     vi.useRealTimers();
   });
 
+  it("emits flow_timed_out at the overall timeout", async () => {
+    vi.useFakeTimers();
+    const { adapters } = setup({ codex: [ok("codex", "draft")] });
+    adapters.cursor.run = vi.fn((_prompt: string, options?: AgentRunOptions) => new Promise<AgentResult>((resolve) => options?.signal?.addEventListener("abort", () => resolve(fail("cursor", "Request was aborted")), { once: true })));
+    const events: FlowEvent[] = [];
+    const promise = runReviewFlow("request", { agents: adapters, maxFlowMs: 10, onEvent: (event) => events.push(event) });
+    await vi.advanceTimersByTimeAsync(10);
+    await promise;
+    expect(events.at(-1)?.type).toBe("flow_timed_out");
+    vi.useRealTimers();
+  });
+
   it("propagates request abort and skips unstarted steps", async () => {
     const controller = new AbortController();
     const { adapters } = setup({});
@@ -90,5 +138,16 @@ describe("runReviewFlow", () => {
     controller.abort();
     const result = await promise;
     expect(result.status).toBe("aborted"); expect(result.steps.map((step) => step.status)).toEqual(["error", "skipped", "skipped", "skipped"]);
+  });
+
+  it("emits flow_aborted after request abort", async () => {
+    const controller = new AbortController();
+    const { adapters } = setup({});
+    adapters.codex.run = vi.fn((_prompt: string, options?: AgentRunOptions) => new Promise<AgentResult>((resolve) => options?.signal?.addEventListener("abort", () => resolve(fail("codex", "Request was aborted")), { once: true })));
+    const events: FlowEvent[] = [];
+    const promise = runReviewFlow("request", { agents: adapters, signal: controller.signal, onEvent: (event) => events.push(event) });
+    controller.abort();
+    await promise;
+    expect(events.at(-1)?.type).toBe("flow_aborted");
   });
 });

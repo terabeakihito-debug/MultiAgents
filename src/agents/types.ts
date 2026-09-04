@@ -49,3 +49,8 @@ export type ReviewFlowResult = {
   steps: FlowStep[];
   finalOutput: string;
 };
+
+export type FlowEvent =
+  | { type: "flow_started"; flowId: string; timestamp: string }
+  | { type: "step_started" | "step_completed" | "step_error" | "step_skipped"; flowId: string; step: FlowStep }
+  | { type: "flow_completed" | "flow_aborted" | "flow_timed_out"; flowId: string; result: ReviewFlowResult };

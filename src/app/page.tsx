@@ -1,7 +1,9 @@
 "use client";
 
 import { useRef, useState, type FormEvent } from "react";
-import { agentIds, flowStepIds, type AgentId, type AgentResult, type AgentStatus, type FlowStep, type ReviewFlowResult } from "@/agents/types";
+import { agentIds, flowStepIds, type AgentId, type AgentResult, type AgentStatus, type FlowEvent, type FlowStep, type ReviewFlowResult } from "@/agents/types";
+import { FlowEventParser } from "@/flows/sse";
+import { acquireRunLock, releaseRunLock } from "./run-lock";
 
 const labels: Record<AgentId, string> = { codex: "Codex", cursor: "Cursor", claude: "Claude" };
 const roleLabels = { draft: "Draft", review: "Review", final: "Final" } as const;
@@ -21,16 +23,17 @@ export default function Home() {
   const [cards, setCards] = useState(initialCards);
   const [steps, setSteps] = useState(initialSteps);
   const [flowStatus, setFlowStatus] = useState<ReviewFlowResult["status"] | "idle" | "running">("idle");
+  const [finalOutput, setFinalOutput] = useState("");
   const [sending, setSending] = useState(false);
   const sendingRef = useRef(false);
+  const flowAbortRef = useRef<AbortController | null>(null);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
-    if (!prompt.trim() || sendingRef.current) return;
-    sendingRef.current = true;
+    if (!prompt.trim() || !acquireRunLock(sendingRef)) return;
     setSending(true);
     try { if (mode === "parallel") await runParallel(); else await runFlow(); }
-    finally { sendingRef.current = false; setSending(false); }
+    finally { releaseRunLock(sendingRef); setSending(false); }
   }
 
   async function runParallel() {
@@ -47,17 +50,48 @@ export default function Home() {
 
   async function runFlow() {
     setFlowStatus("running");
-    setSteps(initialSteps().map((step, index) => ({ ...step, status: index === 0 ? "running" : "idle" })));
+    setSteps(initialSteps());
+    setFinalOutput("");
+    const abortController = new AbortController();
+    flowAbortRef.current = abortController;
     try {
-      const response = await fetch("/api/flows/review", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt }) });
-      const data = await response.json() as ReviewFlowResult | { error: string };
-      if (!response.ok || !("steps" in data)) throw new Error(("error" in data && data.error) || `Request failed (${response.status})`);
-      setSteps(data.steps); setFlowStatus(data.status);
+      const response = await fetch("/api/flows/review/stream", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt }), signal: abortController.signal });
+      if (!response.ok) {
+        const data = await response.json() as { error?: string };
+        throw new Error(data.error || `Request failed (${response.status})`);
+      }
+      if (!response.body) throw new Error("Streaming response body is unavailable");
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      const parser = new FlowEventParser();
+      while (true) {
+        const { value, done } = await reader.read();
+        for (const flowEvent of parser.push(decoder.decode(value, { stream: !done }))) applyFlowEvent(flowEvent);
+        if (done) break;
+      }
     } catch (error) {
-      setFlowStatus("error");
-      setSteps((current) => current.map((step, index) => index === 0 ? { ...step, status: "error", error: message(error) } : { ...step, status: "skipped", error: "Flow request failed" }));
+      const aborted = abortController.signal.aborted;
+      setFlowStatus(aborted ? "aborted" : "error");
+      setSteps((current) => current.map((step) => step.status === "running"
+        ? { ...step, status: "error", error: aborted ? "Request was aborted" : message(error) }
+        : step.status === "idle" ? { ...step, status: "skipped", error: aborted ? "Request was aborted" : "Flow request failed" } : step));
+    } finally {
+      if (flowAbortRef.current === abortController) flowAbortRef.current = null;
     }
   }
+
+  function applyFlowEvent(event: FlowEvent) {
+    if (event.type === "flow_started") { setFlowStatus("running"); return; }
+    if ("step" in event) {
+      setSteps((current) => current.map((step) => step.id === event.step.id ? event.step : step));
+      return;
+    }
+    setSteps(event.result.steps);
+    setFinalOutput(event.result.finalOutput);
+    setFlowStatus(event.result.status);
+  }
+
+  function cancelFlow() { flowAbortRef.current?.abort(new Error("Cancelled by user")); }
 
   return <main>
     <header><h1>MultiAgents</h1><p>Parallel answers or a fixed, reviewed response from local AI CLIs.</p></header>
@@ -65,14 +99,14 @@ export default function Home() {
       <fieldset className="modes" disabled={sending}><legend>Mode</legend><label><input type="radio" checked={mode === "parallel"} onChange={() => setMode("parallel")} /> Parallel</label><label><input type="radio" checked={mode === "review"} onChange={() => setMode("review")} /> Review Flow</label></fieldset>
       <label htmlFor="prompt">Prompt</label>
       <textarea id="prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} maxLength={20_000} rows={6} placeholder="Ask Codex, Cursor, and Claude…" />
-      <div className="actions"><span>{prompt.length.toLocaleString()} / 20,000</span><button type="submit" disabled={sending || !prompt.trim()}>{sending ? "Running…" : mode === "parallel" ? "Send to all" : "Run review flow"}</button></div>
+      <div className="actions"><span>{prompt.length.toLocaleString()} / 20,000</span><div className="actionButtons">{sending && mode === "review" && <button className="cancel" type="button" onClick={cancelFlow}>Cancel</button>}<button type="submit" disabled={sending || !prompt.trim()}>{sending ? "Running…" : mode === "parallel" ? "Send to all" : "Run review flow"}</button></div></div>
     </form>
-    {mode === "parallel" ? <section className="cards" aria-label="Agent responses">{agentIds.map((id) => <AgentCard key={id} name={labels[id]} state={cards[id]} />)}</section> : <FlowTimeline steps={steps} status={flowStatus} />}
+    {mode === "parallel" ? <section className="cards" aria-label="Agent responses">{agentIds.map((id) => <AgentCard key={id} name={labels[id]} state={cards[id]} />)}</section> : <FlowTimeline steps={steps} status={flowStatus} finalOutput={finalOutput} />}
   </main>;
 }
 
 function AgentCard({ name, state }: { name: string; state: CardState }) { return <article className="card"><div className="cardHeader"><h2>{name}</h2><Status value={state.status} /></div>{state.error && <ErrorBlock error={state.error} />}<pre className="output">{state.output || fallback(state.status)}</pre></article>; }
-function FlowTimeline({ steps, status }: { steps: FlowStep[]; status: ReviewFlowResult["status"] | "idle" | "running" }) { return <section className="flow" aria-label="Review flow"><div className="flowTitle"><h2>Review Flow</h2><Status value={status} /></div>{flowStepIds.map((id, index) => { const step = steps.find((item) => item.id === id)!; return <div key={id}><article className={`card flowStep ${step.role === "final" ? "finalStep" : ""}`}><div className="cardHeader"><div><span className="stepNumber">Step {index + 1}</span><h2>{labels[step.agent]} — {roleLabels[step.role]}</h2></div><Status value={step.status} /></div><div className="duration">Duration: {step.durationMs === undefined ? "—" : formatDuration(step.durationMs)}</div>{step.error && <ErrorBlock error={step.error} />}<pre className="output">{step.output || fallback(step.status)}</pre></article>{index < steps.length - 1 && <div className="arrow" aria-hidden="true">↓</div>}</div>; })}</section>; }
+function FlowTimeline({ steps, status, finalOutput }: { steps: FlowStep[]; status: ReviewFlowResult["status"] | "idle" | "running"; finalOutput: string }) { return <section className="flow" aria-label="Review flow"><div className="flowTitle"><h2>Review Flow</h2><Status value={status} /></div>{flowStepIds.map((id, index) => { const step = steps.find((item) => item.id === id)!; return <div key={id}><article className={`card flowStep ${step.role === "final" ? "finalStep" : ""}`}><div className="cardHeader"><div><span className="stepNumber">Step {index + 1}</span><h2>{labels[step.agent]} — {roleLabels[step.role]}</h2></div><Status value={step.status} /></div><div className="duration">{step.status === "running" ? "Running..." : <>Duration: {step.durationMs === undefined ? "—" : formatDuration(step.durationMs)}</>}</div>{step.error && <ErrorBlock error={step.error} />}<pre className="output">{step.output || fallback(step.status)}</pre></article>{index < steps.length - 1 && <div className="arrow" aria-hidden="true">↓</div>}</div>; })}{finalOutput && <article className="card finalOutput"><h2>Final Output</h2><pre className="output">{finalOutput}</pre></article>}</section>; }
 function Status({ value }: { value: string }) { return <span className={`status ${value}`}>{value.toUpperCase()}</span>; }
 function ErrorBlock({ error }: { error: string }) { return <div className="error"><strong>Error</strong><pre>{error}</pre></div>; }
 function fallback(status: string) { return status === "idle" ? "Waiting for a prompt." : status === "running" ? "Waiting for response…" : status === "skipped" ? "This step was not run." : "No output."; }
