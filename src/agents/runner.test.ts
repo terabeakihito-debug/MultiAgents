@@ -63,7 +63,7 @@ describe("createAgentAdapter", () => {
   it("returns an agent-scoped error without throwing", async () => {
     const child = fakeChild();
     const adapter = createAgentAdapter(
-      { id: "cursor", name: "Cursor", binary: "cursor-agent", args: (prompt) => ["-p", prompt] },
+      { id: "cursor", name: "Cursor", binary: "agent", args: (prompt) => ["-p", prompt] },
       { spawnProcess: vi.fn(() => child) as never },
     );
     const promise = adapter.run("test");

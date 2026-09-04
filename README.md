@@ -12,7 +12,7 @@ This is intentionally a small MVP. The browser calls Next.js server routes; only
 - Node.js 20.9 or newer and npm
 - Authenticated commands available on `PATH`:
   - `codex exec "..."`
-  - `cursor-agent --trust -p "..."`
+  - `agent --trust --workspace <project-directory> -p "..."`
   - `~/.local/bin/claude -p "..."`
 
 No API keys are required by this app; it uses the existing CLI authentication.

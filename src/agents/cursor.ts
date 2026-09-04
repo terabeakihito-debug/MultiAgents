@@ -4,6 +4,6 @@ import { workspaceDirectory } from "./workspace";
 export const cursorAgent = createAgentAdapter({
   id: "cursor",
   name: "Cursor",
-  binary: "cursor-agent",
+  binary: "agent",
   args: (prompt, cwd) => ["--trust", "--workspace", cwd, "-p", prompt],
 }, { cwd: workspaceDirectory });
