@@ -24,3 +24,28 @@ export type AgentAdapter = {
   name: string;
   run: (prompt: string, options?: AgentRunOptions) => Promise<AgentResult>;
 };
+
+export const flowStepIds = ["codex_draft", "cursor_review", "claude_review", "codex_final"] as const;
+export type FlowStepId = (typeof flowStepIds)[number];
+export type FlowStepStatus = AgentStatus | "skipped";
+export type FlowRole = "draft" | "review" | "final";
+
+export type FlowStep = {
+  id: FlowStepId;
+  agent: AgentId;
+  role: FlowRole;
+  status: FlowStepStatus;
+  inputSummary?: string;
+  output: string;
+  error?: string;
+  startedAt?: string;
+  completedAt?: string;
+  durationMs?: number;
+};
+
+export type ReviewFlowResult = {
+  flowId: string;
+  status: "completed" | "error" | "aborted" | "timed_out";
+  steps: FlowStep[];
+  finalOutput: string;
+};
