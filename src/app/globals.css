@@ -1,0 +1,20 @@
+:root { color-scheme: dark; --bg: #0b1020; --panel: #151c31; --line: #29334f; --text: #eef2ff; --muted: #9ca9c8; --accent: #7c9cff; }
+* { box-sizing: border-box; }
+body { margin: 0; background: radial-gradient(circle at top, #17213d, var(--bg) 45%); color: var(--text); font-family: Arial, Helvetica, sans-serif; min-height: 100vh; }
+main { width: min(1180px, calc(100% - 32px)); margin: 0 auto; padding: 48px 0; }
+header { margin-bottom: 28px; } h1 { font-size: clamp(2rem, 5vw, 3.4rem); letter-spacing: -.05em; margin: 0; } header p { color: var(--muted); margin: 8px 0 0; }
+form, .card { border: 1px solid var(--line); background: color-mix(in srgb, var(--panel) 92%, transparent); border-radius: 16px; box-shadow: 0 20px 60px #0004; }
+form { padding: 22px; } label { display: block; font-weight: 700; margin-bottom: 10px; }
+textarea { width: 100%; resize: vertical; min-height: 130px; padding: 14px; border-radius: 10px; border: 1px solid var(--line); background: #0a0f1e; color: var(--text); font: inherit; line-height: 1.5; }
+textarea:focus { outline: 2px solid var(--accent); border-color: transparent; }
+.actions { display: flex; justify-content: space-between; align-items: center; margin-top: 12px; color: var(--muted); font-size: .85rem; }
+button { border: 0; border-radius: 9px; background: var(--accent); color: #081027; padding: 11px 18px; font-weight: 800; cursor: pointer; }
+button:disabled { opacity: .45; cursor: not-allowed; }
+.cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-top: 20px; }
+.card { min-height: 330px; padding: 20px; overflow: hidden; }
+.cardHeader { display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--line); padding-bottom: 14px; }
+h2 { margin: 0; font-size: 1.15rem; }.status { border-radius: 999px; padding: 5px 8px; font-size: .7rem; font-weight: 800; letter-spacing: .07em; background: #30394f; }
+.status.running { background: #4b3b16; color: #ffd875; }.status.completed { background: #153e32; color: #72e6b5; }.status.error { background: #521f2a; color: #ff9daf; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 0.88rem/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.output { color: #dce4fa; margin: 18px 0 0; }.error { margin-top: 16px; color: #ff9daf; }.error pre { margin: 6px 0; }
+@media (max-width: 800px) { main { padding-top: 28px; } .cards { grid-template-columns: 1fr; } .card { min-height: 220px; } }
