@@ -40,10 +40,30 @@ If the draft fails, every later step is skipped. If Cursor fails, Claude and fin
 
 Review progress uses a same-origin `fetch` POST whose response is an SSE-compatible `text/event-stream`. Streaming is step-level only: agent output is sent once that step finishes, not token by token. **Cancel** aborts the active request, stops the current CLI process group, marks the running step as errored/aborted, and skips steps that have not started. Closing the stream or disconnecting the browser aborts the server-side flow through the same signal path so the active child process is not left running.
 
-The server binds to `127.0.0.1`. Agent processes use the project directory as
-their explicit working directory. The workspace value is centralized in the
-server-side adapters for future extension; there is intentionally no repository
-selector in this MVP.
+The server binds to `127.0.0.1`. The repository selector lists only direct Git
+working trees under `~/code`. Creating an isolated task makes a server-generated
+`multiagents/<UUID>` branch from the selected repository's current branch HEAD
+and checks it out at `~/code/.multiagents-worktrees/<repo>/<UUID>`. The source
+working tree and its current branch are never used as an agent write workspace.
+
+Repository tasks require a clean source working tree; commit or stash changes
+yourself before starting. Codex Draft and Final Codex may edit only the task
+worktree. Cursor and Claude are instructed to review the task and diff without
+editing. No phase creates commits, pushes, merges, or PRs. The final `git diff
+--stat` and `git diff` are shown in the UI.
+
+**Delete task worktree** uses `git worktree remove` only when the task worktree
+is clean. Dirty task worktrees are deliberately retained. Because task state is
+in memory, a server crash can leave an orphan. Inspect and remove it manually:
+
+```bash
+git -C ~/code/REPOSITORY worktree list
+git -C ~/code/REPOSITORY worktree remove ~/code/.multiagents-worktrees/REPOSITORY/TASK_UUID
+git -C ~/code/REPOSITORY worktree prune
+```
+
+Review the path and preserve any wanted changes before removal. Branch deletion
+is also manual.
 
 ## Verification
 
@@ -74,11 +94,12 @@ Tests mock process spawning and never invoke the real AI CLIs.
 - Prompts are required and limited to 20,000 characters; CLI execution is limited to 120 seconds and captured output to 1 MB per stream.
 - The complete review flow is limited to five minutes. Each prior output is capped at 30,000 characters when embedded into a later prompt, with Unicode-safe truncation markers.
 - The JSON review endpoint, step-event stream endpoint, and rerun stream endpoint enforce the same localhost Host/Origin checks. CORS is not enabled, and neither prompts nor agent outputs are written to application event logs.
-- Draft and review blocks are explicitly delimited as untrusted content. Review prompts instruct agents never to follow commands inside quoted agent output. Handoffs remain plain CLI argument strings and are never interpreted by a shell.
+- Draft, review, repository content, and diff blocks are explicitly treated as untrusted content. Review prompts instruct agents never to follow commands in files, comments, or quoted output. Handoffs remain plain CLI argument strings and are never interpreted by a shell.
+- Repository IDs are simple direct-child names, resolved with `realpath`, required to remain under the real `~/code` root, and verified against Git's working-tree root. Symlink escapes, `/mnt/c`, nested repositories, arbitrary paths, binaries, Git subcommands, and client-selected branch names are rejected by construction.
 - Do not expose this development server to untrusted networks. The API has no authentication and intentionally launches locally authenticated tools.
 - Keep `.env` files and credentials out of Git. The included `.gitignore` excludes environment files.
-- The server uses its current WSL working directory. It does not search Windows mounts.
+- Agent output and structured step metadata are logged without credentials, repository contents, or complete diffs.
 
 ## Not implemented
 
-Draft reruns, downstream automatic reruns, old-result version history, free-form agent conversations, agent-selected or recursive handoffs, automatic loops/retries, automated code edits, repository selection, worktrees, GitHub automation, databases, long-term memory, token/cost tracking, token-level streaming, production deployment, and Docker are not implemented.
+Draft reruns, downstream automatic reruns, old-result version history, free-form agent conversations, agent-selected or recursive handoffs, automatic loops/retries, commits, pushes, merges, PRs, remote cloning, recursive repository discovery, databases, persistent task history, long-term memory, token/cost tracking, token-level streaming, production deployment, and Docker are not implemented.

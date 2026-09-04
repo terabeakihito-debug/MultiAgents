@@ -15,6 +15,7 @@ type RerunOptions = {
   rerunId?: string;
   log?: (entry: RerunLogEntry) => void;
   onEvent?: (event: ReviewRerunEvent) => void;
+  cwd?: string;
 };
 
 export type ReviewRerunRequest = { prompt: string; flowId: string; stepId: RerunnableStepId; steps: FlowStep[] };
@@ -76,7 +77,7 @@ export async function rerunReviewStep(request: ReviewRerunRequest, options: Reru
     options.log?.({ flowId: request.flowId, rerunId, stepId: request.stepId, agent: target.agent, status: "running" });
     emit(options.onEvent, { type: "rerun_step_started", flowId: request.flowId, rerunId, step: { ...target } });
     try {
-      const result = await adapters[target.agent].run(input, { signal: controller.signal });
+      const result = await adapters[target.agent].run(input, { signal: controller.signal, cwd: options.cwd });
       if (result.status === "completed") {
         target.status = "completed";
         target.output = result.output;
@@ -107,11 +108,12 @@ export async function rerunReviewStep(request: ReviewRerunRequest, options: Reru
   }
 }
 
-export function createReviewRerunStream(request: ReviewRerunRequest, requestSignal: AbortSignal, runner = rerunReviewStep) {
+export function createReviewRerunStream(request: ReviewRerunRequest, requestSignal: AbortSignal, runner = rerunReviewStep, options: { cwd?: string } = {}) {
   return createEventStream(requestSignal, ({ signal, send }) => runner(request, {
     signal,
     onEvent: (event) => send(event),
     log: (entry) => console.info("review_rerun", JSON.stringify(entry)),
+    ...options,
   }), "review_rerun_event");
 }
 

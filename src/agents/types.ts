@@ -17,7 +17,7 @@ export type AgentDefinition = {
   args: (prompt: string, cwd: string) => string[];
 };
 
-export type AgentRunOptions = { signal?: AbortSignal };
+export type AgentRunOptions = { signal?: AbortSignal; cwd?: string };
 
 export type AgentAdapter = {
   id: AgentId;

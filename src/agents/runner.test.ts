@@ -60,6 +60,19 @@ describe("createAgentAdapter", () => {
     );
   });
 
+  it("uses a per-run validated worktree cwd override", async () => {
+    const child = fakeChild();
+    const spawnProcess = vi.fn(() => child);
+    const adapter = createAgentAdapter(
+      { id: "codex", name: "Codex", binary: "codex", args: (prompt, cwd) => ["exec", "--cd", cwd, prompt] },
+      { cwd: "/default", spawnProcess: spawnProcess as never },
+    );
+    const promise = adapter.run("implement", { cwd: "/isolated/task" });
+    child.emit("close", 0, null);
+    await promise;
+    expect(spawnProcess).toHaveBeenCalledWith("codex", ["exec", "--cd", "/isolated/task", "implement"], expect.objectContaining({ cwd: "/isolated/task", shell: false }));
+  });
+
   it("returns an agent-scoped error without throwing", async () => {
     const child = fakeChild();
     const adapter = createAgentAdapter(

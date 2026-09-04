@@ -3,7 +3,8 @@
 body { margin: 0; background: radial-gradient(circle at top, #17213d, var(--bg) 45%); color: var(--text); font-family: Arial, Helvetica, sans-serif; min-height: 100vh; }
 main { width: min(1180px, calc(100% - 32px)); margin: 0 auto; padding: 48px 0; }
 header { margin-bottom: 28px; } h1 { font-size: clamp(2rem, 5vw, 3.4rem); letter-spacing: -.05em; margin: 0; } header p { color: var(--muted); margin: 8px 0 0; }
-form, .card { border: 1px solid var(--line); background: color-mix(in srgb, var(--panel) 92%, transparent); border-radius: 16px; box-shadow: 0 20px 60px #0004; }
+form, .card, .repoPanel { border: 1px solid var(--line); background: color-mix(in srgb, var(--panel) 92%, transparent); border-radius: 16px; box-shadow: 0 20px 60px #0004; }
+.repoPanel { padding: 22px; margin-bottom: 16px; }.repoControls { display: flex; gap: 12px; }.repoControls select { flex: 1; border: 1px solid var(--line); border-radius: 9px; padding: 10px; background: #0a0f1e; color: var(--text); }.taskReady { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; margin-top: 16px; color: var(--muted); }.taskReady .delete { margin-left: auto; background: #ff9daf; color: #351019; }.diff { min-height: 0; margin-top: 20px; }.diff h3 { color: var(--muted); font-size: .9rem; margin-top: 20px; }
 form { padding: 22px; } label { display: block; font-weight: 700; margin-bottom: 10px; }
 .modes { display: flex; gap: 22px; padding: 0; margin: 0 0 20px; border: 0; }.modes legend { font-weight: 700; margin-bottom: 10px; }.modes label { display: flex; align-items: center; gap: 7px; font-weight: 500; }
 textarea { width: 100%; resize: vertical; min-height: 130px; padding: 14px; border-radius: 10px; border: 1px solid var(--line); background: #0a0f1e; color: var(--text); font: inherit; line-height: 1.5; }

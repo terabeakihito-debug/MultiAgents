@@ -20,7 +20,7 @@ export function createAgentAdapter(
   return {
     id: definition.id,
     name: definition.name,
-    run: (prompt, runOptions) => runProcess(definition, prompt, options, runOptions?.signal),
+    run: (prompt, runOptions) => runProcess(definition, prompt, options, runOptions),
   };
 }
 
@@ -28,11 +28,12 @@ function runProcess(
   definition: AgentDefinition,
   prompt: string,
   options: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number; spawnProcess?: SpawnLike },
-  signal?: AbortSignal,
+  runOptions?: { signal?: AbortSignal; cwd?: string },
 ): Promise<AgentResult> {
   return new Promise((resolve) => {
     const spawnProcess = options.spawnProcess ?? spawn;
-    const cwd = options.cwd ?? process.cwd();
+    const signal = runOptions?.signal;
+    const cwd = runOptions?.cwd ?? options.cwd ?? process.cwd();
     const spawnOptions: SpawnOptions = {
       cwd,
       env: options.env ?? process.env,

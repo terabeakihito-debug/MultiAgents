@@ -1,5 +1,6 @@
 import { createReviewRerunStream, parseReviewRerunRequest } from "@/flows/review-rerun";
 import { rejectNonLocalRequest } from "@/server/request-security";
+import { getTask } from "@/server/tasks";
 
 export const runtime = "nodejs";
 
@@ -11,7 +12,10 @@ export async function POST(request: Request) {
   catch { return Response.json({ error: "Request body must be valid JSON" }, { status: 400 }); }
   const parsed = parseReviewRerunRequest(body);
   if ("error" in parsed) return Response.json(parsed, { status: 400 });
-  return new Response(createReviewRerunStream(parsed, request.signal), {
+  const taskId = (body as { taskId?: unknown }).taskId;
+  const task = typeof taskId === "string" ? getTask(taskId) : undefined;
+  if (taskId !== undefined && !task) return Response.json({ error: "Valid repository taskId is required" }, { status: 400 });
+  return new Response(createReviewRerunStream(parsed, request.signal, undefined, task ? { cwd: task.worktreePath } : {}), {
     headers: {
       "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-cache, no-transform",

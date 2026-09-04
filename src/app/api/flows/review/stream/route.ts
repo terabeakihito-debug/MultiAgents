@@ -1,5 +1,6 @@
 import { createReviewFlowStream } from "@/flows/review-stream";
 import { rejectNonLocalRequest } from "@/server/request-security";
+import { getTask, getTaskDiff } from "@/server/tasks";
 
 export const runtime = "nodejs";
 const MAX_PROMPT_LENGTH = 20_000;
@@ -12,10 +13,13 @@ export async function POST(request: Request) {
   try { body = await request.json(); }
   catch { return Response.json({ error: "Request body must be valid JSON" }, { status: 400 }); }
   const prompt = (body as { prompt?: unknown })?.prompt;
+  const taskId = (body as { taskId?: unknown })?.taskId;
   if (typeof prompt !== "string" || !prompt.trim()) return Response.json({ error: "Prompt is required" }, { status: 400 });
   if (prompt.length > MAX_PROMPT_LENGTH) return Response.json({ error: `Prompt must be ${MAX_PROMPT_LENGTH} characters or fewer` }, { status: 400 });
 
-  return new Response(createReviewFlowStream(prompt, request.signal), {
+  const task = typeof taskId === "string" ? getTask(taskId) : undefined;
+  if (taskId !== undefined && !task) return Response.json({ error: "Valid repository taskId is required" }, { status: 400 });
+  return new Response(createReviewFlowStream(prompt, request.signal, undefined, task ? { cwd: task.worktreePath, getDiff: async () => { const diff = await getTaskDiff(task); return [diff.patch, diff.untrackedPatch].filter(Boolean).join("\n\n"); } } : {}), {
     headers: {
       "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-cache, no-transform",
