@@ -18,8 +18,10 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 h2 { margin: 0; font-size: 1.15rem; }.status { border-radius: 999px; padding: 5px 8px; font-size: .7rem; font-weight: 800; letter-spacing: .07em; background: #30394f; }
 .status.running { background: #4b3b16; color: #ffd875; }.status.completed { background: #153e32; color: #72e6b5; }.status.error { background: #521f2a; color: #ff9daf; }
 .status.skipped { background: #30394f; color: #b8c1d8; }.status.timed_out, .status.aborted { background: #521f2a; color: #ff9daf; }
+.status.stale { background: #473913; color: #ffd875; }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 0.88rem/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; }
 .output { color: #dce4fa; margin: 18px 0 0; }.error { margin-top: 16px; color: #ff9daf; }.error pre { margin: 6px 0; }
 .flow { width: min(860px, 100%); margin: 24px auto 0; }.flowTitle { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }.flowStep { min-height: 0; }.stepNumber, .duration { color: var(--muted); font-size: .8rem; }.stepNumber { display: block; margin-bottom: 5px; }.duration { margin-top: 12px; }.arrow { color: var(--accent); font-size: 1.6rem; text-align: center; line-height: 1.5; }.finalStep { border-color: var(--accent); box-shadow: 0 20px 70px #5778ff26; }
 .finalOutput { min-height: 0; margin-top: 20px; border-color: var(--accent); }
+.rerun { margin-top: 18px; background: transparent; color: var(--accent); border: 1px solid var(--accent); }.staleReason { margin-top: 14px; color: #ffd875; font-size: .88rem; }
 @media (max-width: 800px) { main { padding-top: 28px; } .cards { grid-template-columns: 1fr; } .card { min-height: 220px; } }

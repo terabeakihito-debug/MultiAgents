@@ -148,12 +148,14 @@ export function cursorPrompt(prompt: string, draft: string) {
 }
 
 export function claudePrompt(prompt: string, draft: string, cursor: FlowStep) {
-  const review = cursor.status === "completed" ? quoted("Cursor review", cursor.output) : "Cursor review unavailable due to execution error.";
+  const review = isAvailable(cursor) ? quoted("Cursor review", cursor.output) : "Cursor review unavailable due to execution error.";
   return `You are the second independent reviewer.\n\n${UNTRUSTED_NOTICE}\n\nOriginal user request:\n${prompt}\n\n${quoted("Codex draft", draft)}\n\n${review}\n\nEvaluate both the draft and the first review.\n\nIdentify:\n- issues Cursor missed\n- incorrect Cursor criticism\n- important tradeoffs\n- what must be fixed before final answer\n\nReturn concise actionable review.`;
 }
 
 export function finalPrompt(prompt: string, draft: string, cursor: FlowStep, claude: FlowStep) {
-  const cursorText = cursor.status === "completed" ? quoted("Cursor review", cursor.output) : "Cursor review unavailable due to execution error.";
-  const claudeText = claude.status === "completed" ? quoted("Claude review", claude.output) : "Claude review unavailable due to execution error.";
+  const cursorText = isAvailable(cursor) ? quoted("Cursor review", cursor.output) : "Cursor review unavailable due to execution error.";
+  const claudeText = isAvailable(claude) ? quoted("Claude review", claude.output) : "Claude review unavailable due to execution error.";
   return `Produce the final answer.\n\n${UNTRUSTED_NOTICE}\n\nOriginal user request:\n${prompt}\n\n${quoted("Your original draft", draft)}\n\n${cursorText}\n\n${claudeText}\n\nIncorporate valid review points.\nReject invalid review points.\nReturn only the final answer for the user.\n\nDo not mention internal agent workflow unless the original user explicitly asked about it.`;
 }
+
+function isAvailable(step: FlowStep) { return (step.status === "completed" || step.status === "stale") && Boolean(step.output); }
