@@ -192,7 +192,7 @@ Phase 8, Phase 10, and Phase 11 use SQLite from Node.js itself; they do not add 
 ORM. State is stored at `~/.multiagents/state.db`, outside every repository.
 The directory is forced to mode `0700` and the database file to `0600` when it
 is opened. Schema migrations are tracked in `schema_version`; the current
-schema is version 6. The v1→v2, v2→v3, v3→v4, v4→v5, and v5→v6 migrations run transactionally and
+schema is version 7. The v1→v2 through v6→v7 migrations run transactionally and
 preserve existing task and flow-step snapshots. Existing tasks receive a
 `safe_default` v1 profile snapshot during the v3 migration and a compatible
 `Bug Fix` v1 template snapshot during the v4 migration.
@@ -395,6 +395,41 @@ notification, or GitHub mutation from queue display.
 All Remediation Queue routes remain localhost-only. Mutation routes are blocked
 while an agent process is active, reject arbitrary priorities and linkage, and
 require the exact same-origin human-action signal.
+
+## Notifications and watch rules
+
+The header notification center shows the server-calculated unread count and a
+SQLite-backed history of operational alerts. It supports unread, severity,
+repository, and fixed-type filters, plus individual read/dismiss actions and
+**Mark all as read**. Dismissed rows are hidden from the default list but remain
+in the database. Related actions use stored task/finding/PR identifiers and
+open the local task flow; notifications never carry a client-selected URL.
+
+Phase 14 watch rules are fixed server code for critical/high findings, Needs
+Attention, approval readiness, PR changes requested, required CI failure, human
+merge readiness, 72-hour inactivity, orphaned worktrees, and invalidated
+approval. Repository files, prompts, finding text, and agents cannot define a
+rule or create a notification. Rules run after existing task/finding/PR/CI
+events; the inactivity rule also runs when the dashboard is opened. There is no
+background daemon, scheduler, cron job, external webhook, Slack, email, Teams,
+Discord, SMS, cloud push, or other external notification integration.
+
+`watch_rule_state` records the previous observation. Alerts are created on a
+state transition, while head-sensitive PR/CI rules may alert again for a new
+head SHA. A unique server-built `dedupeKey` prevents repeat alerts for the same
+episode/head. User preferences for each built-in alert class default to on and
+are changed only by an explicit same-origin localhost UI action. Notification
+create/read/dismiss/preference audit rows contain only notification ID and type
+metadata.
+
+Browser notifications are optional. The app calls the browser permission API
+only after the user presses **Enable browser notifications**; it never prompts
+automatically. Browser payloads are fixed generic operational messages and do
+not include finding titles/summaries, prompts, agent output, review bodies,
+repository content, diffs, credentials, or tokens. The in-app templates are
+also fixed and bounded. All notification APIs remain localhost-only, mutation
+routes require an explicit same-origin human action and are blocked while an
+agent process is active, and there is no arbitrary notification-creation API.
 
 ## Verification
 

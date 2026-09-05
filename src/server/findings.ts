@@ -7,6 +7,7 @@ import { findingSeverities, humanPriorities, type Finding, type FindingCandidate
 import { getOrCreateRepoProfile, requireUsableTaskProfile, taskProfileSnapshot } from "./project-profiles";
 import { createDiffSnapshot } from "./pull-request";
 import { getStateStore } from "./state-store";
+import { evaluateFindingNotification } from "./notifications";
 import { selectTaskTemplate } from "./task-templates";
 import { createTask, getTask, requireTaskTemplate, type RepoTask } from "./tasks";
 
@@ -84,6 +85,7 @@ export async function extractTaskFindings(taskId: string, agent: AgentAdapter = 
       store.appendTaskEvent(task.id, { type: "finding_created", actor: "system", createdAt: now, status: finding.severity, metadata: { findingId: finding.findingId, sourceTaskId: task.id } });
     }
   });
+  for (const finding of findings) evaluateFindingNotification(finding);
   return findings;
 }
 
@@ -128,11 +130,13 @@ export function markFindingResolved(findingId: string) {
   if (implementation.sourceFindingId !== finding.findingId || implementation.sourceTaskId !== finding.sourceTaskId) throw new Error("Linked implementation task does not match the finding");
   if (!implementation.prNumber || !implementation.prReview?.merged || implementation.prReview.state !== "MERGED") throw new Error("The linked pull request must be confirmed merged before resolution");
   const now = new Date().toISOString();
-  return store.transaction(() => {
+  const updated = store.transaction(() => {
     const updated = store.resolveFinding(finding.findingId, now);
     store.appendFindingEvent(updated, { type: "finding_resolved", actor: "user", createdAt: now, convertedTaskId: implementation.id });
     return updated;
   });
+  evaluateFindingNotification(updated);
+  return updated;
 }
 
 export function findingHistory(findingId: string) {
@@ -190,12 +194,14 @@ export function clearFindingLocksForTests() { conversionLocks.clear(); }
 function transitionFinding(findingId: string, expected: readonly FindingStatus[], status: FindingStatus, event: "finding_accepted" | "finding_dismissed", reason?: string) {
   const store = getStateStore();
   const finding = requireFinding(findingId);
-  return store.transaction(() => {
+  const updated = store.transaction(() => {
     const updated = store.updateFindingStatus(finding.findingId, expected, status);
     store.appendFindingEvent(updated, { type: event, actor: "user", reason });
     store.appendTaskEvent(finding.sourceTaskId, { type: "finding_status_changed", actor: "user", status, metadata: { findingId: finding.findingId, sourceTaskId: finding.sourceTaskId } });
     return updated;
   });
+  evaluateFindingNotification(updated);
+  return updated;
 }
 
 function requireFinding(findingId: string) {

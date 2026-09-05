@@ -32,6 +32,10 @@ export function rejectNonHumanFindingMutation(request: Request, action: "finding
   return rejectNonHumanMutation(request, action, "Finding");
 }
 
+export function rejectNonHumanNotificationMutation(request: Request, action: "notification-read" | "notification-dismiss" | "notification-read-all" | "notification-preferences"): Response | undefined {
+  return rejectNonHumanMutation(request, action, "Notification");
+}
+
 function rejectNonHumanMutation(request: Request, expectedAction: string, label: string): Response | undefined {
   const local = rejectNonLocalRequest(request);
   if (local) return local;

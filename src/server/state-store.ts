@@ -9,6 +9,16 @@ import { parseProfileSnapshot, safeDefaultSnapshot, type ProjectProfile, type Pr
 import { builtInTemplates, mergeTemplateWithProfile, parseTemplateSnapshot, snapshotTemplate, type RepoTemplateSettings, type TaskTemplate, type TaskTemplateSnapshot } from "../templates/policy";
 import type { RepoTask } from "./tasks";
 import {
+  defaultNotificationPreferences,
+  notificationSeverities,
+  notificationTypes,
+  type AppNotification,
+  type NotificationPreferences,
+  type NotificationQuery,
+  type NotificationSeverity,
+  type NotificationType,
+} from "../notifications/types";
+import {
   findingEventTypes,
   type Finding,
   type FindingEvent,
@@ -23,7 +33,7 @@ import {
 
 export const STATE_DIRECTORY = join(homedir(), ".multiagents");
 export const STATE_DATABASE = join(STATE_DIRECTORY, "state.db");
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 const MAX_STORED_PROMPT_CHARS = 20_000;
 const MAX_STORED_OUTPUT_CHARS = 1_000_000;
 
@@ -447,9 +457,111 @@ export class StateStore {
   clearForTests() {
     this.transaction(() => {
       this.dropAppendOnlyTriggers();
-      this.database.exec("DELETE FROM finding_events; DELETE FROM findings; DELETE FROM approval_events; DELETE FROM diff_versions; DELETE FROM step_versions; DELETE FROM task_events; DELETE FROM flow_steps; DELETE FROM tasks; DELETE FROM template_audit_events; DELETE FROM task_template_versions; DELETE FROM repo_template_settings; DELETE FROM task_templates; DELETE FROM profile_audit_events; DELETE FROM project_profile_versions; DELETE FROM project_profiles;");
+      this.database.exec("DELETE FROM notification_audit_events; DELETE FROM notifications; DELETE FROM watch_rule_state; DELETE FROM notification_preferences; DELETE FROM finding_events; DELETE FROM findings; DELETE FROM approval_events; DELETE FROM diff_versions; DELETE FROM step_versions; DELETE FROM task_events; DELETE FROM flow_steps; DELETE FROM tasks; DELETE FROM template_audit_events; DELETE FROM task_template_versions; DELETE FROM repo_template_settings; DELETE FROM task_templates; DELETE FROM profile_audit_events; DELETE FROM project_profile_versions; DELETE FROM project_profiles;");
       this.createAppendOnlyTriggers();
     });
+  }
+
+  loadTaskIdentity(taskId: string): { repoId: string; repoName: string } | undefined {
+    const row = this.database.prepare("SELECT repo_id, repo_name FROM tasks WHERE task_id = ?").get(taskId) as TaskRow | undefined;
+    return row ? { repoId: String(row.repo_id), repoName: String(row.repo_name) } : undefined;
+  }
+
+  createBuiltInNotification(input: Omit<AppNotification, "notificationId" | "status" | "createdAt" | "readAt" | "dismissedAt">): boolean {
+    if (!notificationTypes.includes(input.type) || !notificationSeverities.includes(input.severity)) throw new Error("Notification type or severity is invalid");
+    if (!/^[A-Za-z0-9:._-]{1,500}$/.test(input.dedupeKey)) throw new Error("Notification dedupe key is invalid");
+    if (!input.title || input.title.length > 120 || !input.message || input.message.length > 240) throw new Error("Notification content is invalid");
+    if (input.repoId && !/^[A-Za-z0-9._-]{1,100}$/.test(input.repoId)) throw new Error("Notification repository is invalid");
+    for (const id of [input.taskId, input.findingId]) if (id && !/^[0-9a-f-]{36}$/i.test(id)) throw new Error("Notification relation is invalid");
+    if (input.prNumber !== undefined && (!Number.isSafeInteger(input.prNumber) || input.prNumber < 1)) throw new Error("Notification PR is invalid");
+    const notificationId = randomUUID();
+    const createdAt = new Date().toISOString();
+    const result = this.database.prepare(`INSERT OR IGNORE INTO notifications
+      (notification_id, type, severity, repo_id, repo_name, task_id, finding_id, pr_number, title, message, status, dedupe_key, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unread', ?, ?)`)
+      .run(notificationId, input.type, input.severity, input.repoId ?? null, input.repoName?.slice(0, 160) ?? null, input.taskId ?? null, input.findingId ?? null, input.prNumber ?? null, input.title, input.message, input.dedupeKey, createdAt);
+    if (Number(result.changes) === 1) this.appendNotificationAudit("notification_created", notificationId, input.type);
+    return Number(result.changes) === 1;
+  }
+
+  queryNotifications(input: NotificationQuery): { notifications: AppNotification[]; unreadCount: number } {
+    const filters = ["status <> 'dismissed'"];
+    const values: Array<string | number> = [];
+    if (input.unreadOnly) filters.push("status = 'unread'");
+    if (input.severity) { filters.push("severity = ?"); values.push(input.severity); }
+    if (input.repoId) { filters.push("repo_id = ?"); values.push(input.repoId); }
+    if (input.type) { filters.push("type = ?"); values.push(input.type); }
+    const rows = this.database.prepare(`SELECT * FROM notifications WHERE ${filters.join(" AND ")} ORDER BY created_at DESC, notification_id DESC LIMIT ?`).all(...values, input.limit) as TaskRow[];
+    const unread = this.database.prepare("SELECT COUNT(*) AS count FROM notifications WHERE status = 'unread'").get() as { count: number };
+    return { notifications: rows.map(rowToNotification), unreadCount: Number(unread.count) };
+  }
+
+  markNotificationRead(notificationId: string): AppNotification | undefined {
+    requireUuid(notificationId, "Notification ID");
+    const now = new Date().toISOString();
+    const result = this.database.prepare("UPDATE notifications SET status = 'read', read_at = COALESCE(read_at, ?) WHERE notification_id = ? AND status = 'unread'").run(now, notificationId);
+    const value = this.loadNotification(notificationId);
+    if (Number(result.changes) === 1 && value) this.appendNotificationAudit("notification_read", notificationId, value.type);
+    return value;
+  }
+
+  dismissNotification(notificationId: string): AppNotification | undefined {
+    requireUuid(notificationId, "Notification ID");
+    const now = new Date().toISOString();
+    const result = this.database.prepare("UPDATE notifications SET status = 'dismissed', dismissed_at = ? WHERE notification_id = ? AND status <> 'dismissed'").run(now, notificationId);
+    const value = this.loadNotification(notificationId);
+    if (Number(result.changes) === 1 && value) this.appendNotificationAudit("notification_dismissed", notificationId, value.type);
+    return value;
+  }
+
+  markAllNotificationsRead(): number {
+    const now = new Date().toISOString();
+    const unread = this.database.prepare("SELECT notification_id, type FROM notifications WHERE status = 'unread'").all() as Array<{ notification_id: string; type: NotificationType }>;
+    this.transaction(() => {
+      this.database.prepare("UPDATE notifications SET status = 'read', read_at = ? WHERE status = 'unread'").run(now);
+      for (const item of unread) this.appendNotificationAudit("notification_read", item.notification_id, item.type);
+    });
+    return unread.length;
+  }
+
+  loadNotificationPreferences(): NotificationPreferences {
+    const row = this.database.prepare("SELECT preferences_json FROM notification_preferences WHERE singleton = 1").get() as { preferences_json: string } | undefined;
+    if (!row) return { ...defaultNotificationPreferences };
+    const value = parseObject(row.preferences_json);
+    return Object.fromEntries(Object.keys(defaultNotificationPreferences).map((key) => [key, value[key] === true])) as NotificationPreferences;
+  }
+
+  saveNotificationPreferences(preferences: NotificationPreferences) {
+    const now = new Date().toISOString();
+    this.database.prepare(`INSERT INTO notification_preferences(singleton, preferences_json, updated_at) VALUES (1, ?, ?)
+      ON CONFLICT(singleton) DO UPDATE SET preferences_json = excluded.preferences_json, updated_at = excluded.updated_at`).run(JSON.stringify(preferences), now);
+    this.appendNotificationAudit("notification_preferences_updated");
+    return preferences;
+  }
+
+  loadWatchRuleState(subjectType: "task" | "finding", subjectId: string, ruleType: NotificationType) {
+    const row = this.database.prepare("SELECT last_state, last_notified_key, updated_at FROM watch_rule_state WHERE subject_type = ? AND subject_id = ? AND rule_type = ?").get(subjectType, subjectId, ruleType) as TaskRow | undefined;
+    return row ? { lastState: String(row.last_state), lastNotifiedKey: optionalString(row.last_notified_key), updatedAt: String(row.updated_at) } : undefined;
+  }
+
+  saveWatchRuleState(subjectType: "task" | "finding", subjectId: string, ruleType: NotificationType, lastState: "active" | "inactive", lastNotifiedKey?: string) {
+    this.database.prepare(`INSERT INTO watch_rule_state(subject_type, subject_id, rule_type, last_state, last_notified_key, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(subject_type, subject_id, rule_type) DO UPDATE SET last_state = excluded.last_state, last_notified_key = excluded.last_notified_key, updated_at = excluded.updated_at`)
+      .run(subjectType, subjectId, ruleType, lastState, lastNotifiedKey ?? null, new Date().toISOString());
+  }
+
+  loadNotificationAuditEvents() {
+    return this.database.prepare("SELECT event_type, notification_id, notification_type, created_at FROM notification_audit_events ORDER BY sequence").all();
+  }
+
+  private loadNotification(notificationId: string): AppNotification | undefined {
+    const row = this.database.prepare("SELECT * FROM notifications WHERE notification_id = ?").get(notificationId) as TaskRow | undefined;
+    return row ? rowToNotification(row) : undefined;
+  }
+
+  private appendNotificationAudit(eventType: "notification_created" | "notification_read" | "notification_dismissed" | "notification_preferences_updated", notificationId?: string, notificationType?: NotificationType) {
+    this.database.prepare("INSERT INTO notification_audit_events(event_id, event_type, notification_id, notification_type, created_at) VALUES (?, ?, ?, ?, ?)")
+      .run(randomUUID(), eventType, notificationId ?? null, notificationType ?? null, new Date().toISOString());
   }
 
   appendTaskEvent(taskId: string, input: { type: TaskEventType; actor: TaskEventActor; createdAt?: string; stepId?: string; status?: string; metadata?: TaskEventMetadata }) {
@@ -1036,11 +1148,41 @@ export class StateStore {
       `);
       this.database.prepare("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)").run(6, new Date().toISOString());
     });
+    if (version < 6) version = 6;
+    if (version < 7) this.transaction(() => {
+      this.database.exec(`
+        CREATE TABLE notifications (
+          notification_id TEXT PRIMARY KEY, type TEXT NOT NULL CHECK(type IN ('finding_critical_created','finding_high_created','task_needs_attention','task_ready_for_approval','pr_changes_requested','ci_failed','pr_ready_for_human_merge','task_inactive','worktree_orphaned','approval_invalidated')),
+          severity TEXT NOT NULL CHECK(severity IN ('info','warning','high','critical')),
+          repo_id TEXT, repo_name TEXT, task_id TEXT REFERENCES tasks(task_id), finding_id TEXT REFERENCES findings(finding_id), pr_number INTEGER CHECK(pr_number IS NULL OR pr_number > 0),
+          title TEXT NOT NULL CHECK(length(title) BETWEEN 1 AND 120), message TEXT NOT NULL CHECK(length(message) BETWEEN 1 AND 240),
+          status TEXT NOT NULL CHECK(status IN ('unread','read','dismissed')), dedupe_key TEXT NOT NULL UNIQUE,
+          created_at TEXT NOT NULL, read_at TEXT, dismissed_at TEXT
+        );
+        CREATE INDEX notifications_status_created_idx ON notifications(status, created_at DESC);
+        CREATE INDEX notifications_repo_created_idx ON notifications(repo_id, created_at DESC);
+        CREATE TABLE notification_preferences (
+          singleton INTEGER PRIMARY KEY CHECK(singleton = 1), preferences_json TEXT NOT NULL CHECK(json_valid(preferences_json)), updated_at TEXT NOT NULL
+        );
+        CREATE TABLE watch_rule_state (
+          subject_type TEXT NOT NULL CHECK(subject_type IN ('task','finding')), subject_id TEXT NOT NULL, rule_type TEXT NOT NULL,
+          last_state TEXT NOT NULL CHECK(last_state IN ('active','inactive')), last_notified_key TEXT, updated_at TEXT NOT NULL,
+          PRIMARY KEY(subject_type, subject_id, rule_type)
+        );
+        CREATE TABLE notification_audit_events (
+          sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE,
+          event_type TEXT NOT NULL CHECK(event_type IN ('notification_created','notification_read','notification_dismissed','notification_preferences_updated')),
+          notification_id TEXT, notification_type TEXT, created_at TEXT NOT NULL
+        );
+      `);
+      this.database.prepare("INSERT INTO notification_preferences(singleton, preferences_json, updated_at) VALUES (1, ?, ?)").run(JSON.stringify(defaultNotificationPreferences), new Date().toISOString());
+      this.database.prepare("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)").run(7, new Date().toISOString());
+    });
     this.createAppendOnlyTriggers();
   }
 
   private createAppendOnlyTriggers() {
-    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events", "task_template_versions", "template_audit_events", "finding_events"]) {
+    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events", "task_template_versions", "template_audit_events", "finding_events", "notification_audit_events"]) {
       this.database.exec(`
         CREATE TRIGGER IF NOT EXISTS ${table}_no_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT, '${table} is append-only'); END;
         CREATE TRIGGER IF NOT EXISTS ${table}_no_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT, '${table} is append-only'); END;
@@ -1049,7 +1191,7 @@ export class StateStore {
   }
 
   private dropAppendOnlyTriggers() {
-    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events", "task_template_versions", "template_audit_events", "finding_events"]) {
+    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events", "task_template_versions", "template_audit_events", "finding_events", "notification_audit_events"]) {
       this.database.exec(`DROP TRIGGER IF EXISTS ${table}_no_update; DROP TRIGGER IF EXISTS ${table}_no_delete;`);
     }
   }
@@ -1169,6 +1311,19 @@ function rowToFindingEvent(row: TaskRow): FindingEvent {
     previousHumanPriority: optionalString(row.previous_human_priority) as FindingEvent["previousHumanPriority"],
     humanPriority: optionalString(row.human_priority) as FindingEvent["humanPriority"],
   };
+}
+function rowToNotification(row: TaskRow): AppNotification {
+  return {
+    notificationId: String(row.notification_id), type: String(row.type) as NotificationType,
+    severity: String(row.severity) as NotificationSeverity, repoId: optionalString(row.repo_id),
+    repoName: optionalString(row.repo_name), taskId: optionalString(row.task_id), findingId: optionalString(row.finding_id),
+    prNumber: optionalNumber(row.pr_number), title: String(row.title), message: String(row.message),
+    status: String(row.status) as AppNotification["status"], dedupeKey: String(row.dedupe_key),
+    createdAt: String(row.created_at), readAt: optionalString(row.read_at), dismissedAt: optionalString(row.dismissed_at),
+  };
+}
+function requireUuid(value: string, label: string) {
+  if (!/^[0-9a-f-]{36}$/i.test(value)) throw new Error(`${label} is invalid`);
 }
 function parseJson(value: unknown): unknown { try { return JSON.parse(String(value)); } catch { return undefined; } }
 function rowToFlowStep(row: FlowStepRow): FlowStep {

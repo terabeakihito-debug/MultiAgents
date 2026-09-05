@@ -3,6 +3,7 @@ import { taskBuckets } from "../dashboard/types";
 import { runGit } from "./git";
 import { getStateStore, type DashboardQuery, type DashboardRow } from "./state-store";
 import { getTask, type RepoTask, type TaskStatus } from "./tasks";
+import { evaluateInactiveTasks } from "./notifications";
 
 const MAX_DASHBOARD_LIMIT = 100;
 const DEFAULT_DASHBOARD_LIMIT = 50;
@@ -61,6 +62,7 @@ export function parseDashboardQuery(url: URL): DashboardQuery {
 }
 
 export async function getDashboard(query: DashboardQuery, now = new Date()): Promise<DashboardResponse> {
+  evaluateInactiveTasks(now);
   const result = getStateStore().queryDashboard(query);
   const tasks = await Promise.all(result.rows.map((row) => dashboardTask(row, now)));
   return { tasks, counts: result.counts, limit: query.limit };

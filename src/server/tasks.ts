@@ -11,6 +11,7 @@ import type { PrReviewIntake, PullRequestReview, ReworkFlowResult } from "./pr-r
 import { getOrCreateRepoProfile, requireUsableTaskProfile, taskProfileSnapshot } from "./project-profiles";
 import { selectTaskTemplate } from "./task-templates";
 import { builtInTemplate, mergeTemplateWithProfile, parseTemplateSnapshot, taskExecutionPrompt, type TaskTemplateSnapshot } from "../templates/policy";
+import { evaluateTaskNotifications } from "./notifications";
 
 export const WORKTREE_ROOT = join(homedir(), "code", ".multiagents-worktrees");
 export const TASK_BRANCH_PATTERN = /^multiagents\/[0-9a-f-]{36}$/;
@@ -355,7 +356,10 @@ export function publicTask(task: RepoTask) {
   };
 }
 
-export function persistTask(task: RepoTask) { getStateStore().saveTask(task); }
+export function persistTask(task: RepoTask) {
+  getStateStore().saveTask(task);
+  evaluateTaskNotifications(task);
+}
 
 export function getTaskHistory(taskId: string): TaskHistory { return getStateStore().loadTaskHistory(taskId); }
 
@@ -569,6 +573,7 @@ async function recoverTask(task: RepoTask, allowedRoot: string, worktreeRoot: st
     task.recoveryStatus = "needs_attention";
     task.recoveryMessage = error instanceof Error ? error.message : "Task profile snapshot is invalid";
     getStateStore().markTaskProfileNeedsAttention(task.id, task.recoveryMessage);
+    evaluateTaskNotifications(task);
     return;
   }
   if (template.readOnly) {
