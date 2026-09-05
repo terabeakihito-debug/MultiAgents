@@ -19,6 +19,7 @@ import {
   recordDiffVersion,
   recordTaskEvent,
   requireTaskProfile,
+  requireTaskTemplate,
   transitionTask,
   type RepoTask,
   type SecretFinding,
@@ -99,6 +100,20 @@ export class ApprovalError extends Error {
 
 export async function prepareApproval(task: RepoTask) {
   const diff = await getTaskDiff(task);
+  const template = requireTaskTemplate(task);
+  if (template.readOnly || !template.requireHumanApproval || !template.requirePr) {
+    invalidateApproval(task);
+    persistTask(task);
+    return { diff, approval: { blockedReason: "This task template is read-only and forbids commit, push, and pull request creation." }, task: publicTask(task) };
+  }
+  if (template.taskType === "documentation") {
+    const outOfScope = [...diff.trackedFiles, ...diff.untrackedFiles].find((path) => !isDocumentationPath(path));
+    if (outOfScope) {
+      invalidateApproval(task);
+      persistTask(task);
+      return { diff, approval: { blockedReason: `Documentation template scope forbids non-documentation path ${JSON.stringify(outOfScope)}.` }, task: publicTask(task) };
+    }
+  }
   if (["validating", "committing", "pushing", "creating_pr", "pr_created", "push_failed", "pr_failed", "fetching_review", "reworking", "reviewing_rework", "committing_rework", "pushing_rework", "checking_ci", "ready_for_human_merge", "review_fetch_failed", "rework_failed", "ci_failed", "ci_pending"].includes(task.status)) {
     return { diff, approval: undefined, task: publicTask(task) };
   }
@@ -154,6 +169,12 @@ export async function prepareApproval(task: RepoTask) {
   };
 }
 
+function isDocumentationPath(path: string) {
+  const lower = path.toLowerCase();
+  const name = lower.split("/").at(-1) ?? lower;
+  return lower.startsWith("docs/") || lower.startsWith("documentation/") || ["readme", "changelog", "contributing", "license", "security", "code_of_conduct"].some((prefix) => name === prefix || name.startsWith(`${prefix}.`)) || [".md", ".mdx", ".rst", ".txt"].some((extension) => lower.endsWith(extension));
+}
+
 export async function approveAndCreatePullRequest(taskId: string, input: ApprovalInput, dependencies: Partial<ApprovalDependencies> = {}): Promise<PullRequestResult> {
   if (!acquireTaskLock(taskId)) throw new ApprovalError("This task is already being processed", 409);
   const deps = { ...defaultDependencies, ...dependencies };
@@ -161,6 +182,8 @@ export async function approveAndCreatePullRequest(taskId: string, input: Approva
     const task = getTask(taskId);
     if (!task) throw new ApprovalError("Task not found", 404);
     const profile = requireTaskProfile(task);
+    const template = requireTaskTemplate(task);
+    if (template.readOnly || !template.requireWorktree || !template.requireHumanApproval || !template.requirePr) throw new ApprovalError("Task template forbids commit, push, and PR creation");
     if (!profile.git.prRequired || !profile.git.commitRequiresApproval || !profile.approval.beforeCommit || !profile.approval.diffHashRequired || !profile.approval.secretScanRequired || !profile.approval.validationRequired || profile.git.mergeAllowedInApp || profile.git.forcePushAllowed || profile.git.deployAllowedInApp) {
       throw new ApprovalError("Task profile does not satisfy the enforced safe PR policy");
     }
@@ -294,6 +317,8 @@ export async function retryPullRequest(taskId: string, dependencies: Partial<App
     const task = getTask(taskId);
     if (!task) throw new ApprovalError("Task not found", 404);
     const profile = requireTaskProfile(task);
+    const template = requireTaskTemplate(task);
+    if (template.readOnly || !template.requirePr) throw new ApprovalError("Task template forbids this Git operation");
     if (!profile.git.prRequired || profile.git.mergeAllowedInApp || profile.git.forcePushAllowed || profile.git.deployAllowedInApp) throw new ApprovalError("Task profile forbids this Git operation");
     if (task.prNumber && task.prUrl) return publicTask(task);
     if (task.status !== "pr_failed" || !task.commitSha || task.approvalState !== "used") throw new ApprovalError("PR retry is not available for this task");
@@ -335,6 +360,8 @@ function requireApproval(task: RepoTask, input: ApprovalInput) {
 
 export async function validateTaskSafety(task: RepoTask) {
   const profile = requireTaskProfile(task);
+  const template = requireTaskTemplate(task);
+  if (template.readOnly || !template.requireWorktree) throw new Error("Task template does not permit an implementation worktree");
   if (!profile.git.isolatedWorktreeRequired || !profile.git.directMainWriteForbidden) throw new Error("Task profile does not require an isolated worktree");
   const validated = await validateRepository(task.repoId, task.allowedRoot);
   const repoPath = await realpath(task.repoPath);
@@ -463,6 +490,8 @@ export async function scanSecrets(snapshot: DiffSnapshot): Promise<SecretFinding
 
 export async function runProjectValidation(task: RepoTask, deps: Pick<ApprovalDependencies, "checkDependencies" | "runValidation">) {
   const profile = requireTaskProfile(task);
+  const template = requireTaskTemplate(task);
+  if (template.readOnly) throw new ApprovalError("Read-only task templates cannot run pre-PR validation");
   let packageJson: { scripts?: Record<string, unknown> } | undefined;
   const packagePath = join(task.worktreePath, "package.json");
   try {
@@ -477,7 +506,7 @@ export async function runProjectValidation(task: RepoTask, deps: Pick<ApprovalDe
       throw new ApprovalError(task.error);
     }
   }
-  const configured = profile.validation.steps.map((step: ValidationStep) => ({ step, script: validationScript(step) }));
+  const configured = template.validationPreset.map((step: ValidationStep) => ({ step, script: validationScript(step) }));
   const scripts = configured.filter(({ script }) => typeof packageJson?.scripts?.[script] === "string");
   const missing = configured.filter(({ script }) => typeof packageJson?.scripts?.[script] !== "string");
   if (missing.length && profile.validation.missingScript === "fail") {

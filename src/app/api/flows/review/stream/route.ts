@@ -1,6 +1,6 @@
 import { createReviewFlowStream } from "@/flows/review-stream";
 import { rejectNonLocalRequest } from "@/server/request-security";
-import { beginTaskReview, completeTaskReview, getTask, getTaskDiff, initializeTaskRecovery, recordFlowEvent, requireTaskProfile } from "@/server/tasks";
+import { beginTaskReview, completeTaskReview, executionPromptForTask, executionRootForTask, getTask, getTaskDiff, initializeTaskRecovery, recordFlowEvent, requireTaskTemplate } from "@/server/tasks";
 import { createDiffSnapshot } from "@/server/pull-request";
 
 export const runtime = "nodejs";
@@ -21,12 +21,14 @@ export async function POST(request: Request) {
 
   const task = typeof taskId === "string" ? getTask(taskId) : undefined;
   if (taskId !== undefined && !task) return Response.json({ error: "Valid repository taskId is required" }, { status: 400 });
-  if (task && !task.worktreeAvailable) return Response.json({ error: task.recoveryMessage ?? "Managed task worktree is unavailable" }, { status: 409 });
   try { if (task) beginTaskReview(task, prompt); }
   catch (error) { return Response.json({ error: error instanceof Error ? error.message : "Task cannot start review" }, { status: 409 }); }
-  return new Response(createReviewFlowStream(prompt, request.signal, undefined, task ? {
-    cwd: task.worktreePath,
-    roles: requireTaskProfile(task).roles,
+  const executionPrompt = task ? executionPromptForTask(task, prompt) : prompt;
+  const template = task ? requireTaskTemplate(task) : undefined;
+  return new Response(createReviewFlowStream(executionPrompt, request.signal, undefined, task ? {
+    cwd: executionRootForTask(task),
+    roles: template!.roles,
+    repositoryReadOnly: template!.readOnly,
     fingerprint: async () => (await createDiffSnapshot(task)).hash,
     getDiff: async () => { const diff = await getTaskDiff(task); return [diff.patch, diff.untrackedPatch].filter(Boolean).join("\n\n"); },
     onEvent: (event) => recordFlowEvent(task, event),

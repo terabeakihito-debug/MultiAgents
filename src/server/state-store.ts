@@ -6,11 +6,12 @@ import { DatabaseSync } from "node:sqlite";
 import type { FlowStep } from "../agents/types";
 import type { DashboardCounts, DashboardSort, PrFilter, TaskBucket } from "../dashboard/types";
 import { parseProfileSnapshot, safeDefaultSnapshot, type ProjectProfile, type ProjectProfileSnapshot } from "../profiles/policy";
+import { builtInTemplates, mergeTemplateWithProfile, parseTemplateSnapshot, snapshotTemplate, type RepoTemplateSettings, type TaskTemplate, type TaskTemplateSnapshot } from "../templates/policy";
 import type { RepoTask } from "./tasks";
 
 export const STATE_DIRECTORY = join(homedir(), ".multiagents");
 export const STATE_DATABASE = join(STATE_DIRECTORY, "state.db");
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 const MAX_STORED_PROMPT_CHARS = 20_000;
 const MAX_STORED_OUTPUT_CHARS = 1_000_000;
 
@@ -20,7 +21,7 @@ export const taskEventTypes = [
   "validation_started", "validation_passed", "validation_failed", "diff_generated", "commit_created", "branch_pushed",
   "pr_created", "pr_review_fetched", "rework_started", "rework_completed", "ready_for_human_merge", "task_archived",
   "task_resumed", "worktree_cleanup_requested", "worktree_removed", "pr_status_refreshed",
-  "profile_snapshot_created",
+  "profile_snapshot_created", "template_snapshot_created",
 ] as const;
 export type TaskEventType = (typeof taskEventTypes)[number];
 export type TaskEventActor = "user" | "system" | "codex" | "cursor" | "claude";
@@ -34,6 +35,8 @@ export type TaskEventMetadata = Partial<{
   deletions: number;
   profileId: string;
   profileVersion: number;
+  templateId: string;
+  templateVersion: number;
 }>;
 export type TaskEvent = {
   id: string;
@@ -114,10 +117,14 @@ export type DashboardRow = {
   payload: Record<string, unknown>;
   profileId?: string;
   profileVersion?: number;
+  templateId?: string;
+  templateVersion?: number;
 };
 
 export type ProfileAuditEventType = "profile_created" | "profile_updated" | "profile_assigned" | "profile_snapshot_created";
 export type ProjectProfileVersion = { profileId: string; version: number; changedAt: string; changedFields: string[]; actor: "user"; snapshot: ProjectProfileSnapshot };
+export type TemplateAuditEventType = "template_enabled" | "template_disabled" | "default_template_changed" | "template_snapshot_created";
+export type TaskTemplateVersion = { repoId: string; templateId: string; version: number; changedAt: string; changedFields: string[]; actor: "user"; snapshot: TaskTemplateSnapshot };
 
 const DASHBOARD_BUCKET_SQL = `CASE
   WHEN status = 'archived' OR worktree_status = 'removed' THEN 'archived'
@@ -181,6 +188,9 @@ export class StateStore {
     const profile = parseProfileSnapshot(task.profile ?? safeDefaultSnapshot(task.repoId));
     if (profile.repoId !== task.repoId) throw new Error("Task profile snapshot repository does not match the task");
     task.profile = profile;
+    const template = parseTemplateSnapshot(task.template ?? mergeTemplateWithProfile(snapshotTemplate(builtInTemplates(task.repoId)[0]), profile));
+    if (template.repoId !== task.repoId) throw new Error("Task template snapshot repository does not match the task");
+    task.template = template;
     const payload = {
       reviewReady: task.reviewReady,
       validation: task.validation,
@@ -198,6 +208,7 @@ export class StateStore {
       ciMessage: task.ciMessage,
       error: task.error,
       profileSnapshot: profile,
+      templateSnapshot: template,
     };
     this.transaction(() => {
       this.database.prepare(`
@@ -207,9 +218,10 @@ export class StateStore {
           status, original_prompt, created_at, updated_at, flow_id, flow_status, final_output,
           diff_hash, approval_state, approval_purpose, approval_id, commit_sha, pr_number, pr_url,
           pr_head_sha, review_disposition, unresolved_count, ci_status, merge_readiness,
-          recovery_status, recovery_message, payload_json, profile_id, profile_version, profile_snapshot_json
+          recovery_status, recovery_message, payload_json, profile_id, profile_version, profile_snapshot_json,
+          template_id, template_version, template_snapshot_json
         ) VALUES (
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT(task_id) DO UPDATE SET
           repo_id=excluded.repo_id, repo_name=excluded.repo_name, repo_path=excluded.repo_path,
@@ -227,7 +239,9 @@ export class StateStore {
           merge_readiness=excluded.merge_readiness, recovery_status=excluded.recovery_status,
           recovery_message=excluded.recovery_message, payload_json=excluded.payload_json,
           profile_id=excluded.profile_id, profile_version=excluded.profile_version,
-          profile_snapshot_json=excluded.profile_snapshot_json
+          profile_snapshot_json=excluded.profile_snapshot_json,
+          template_id=excluded.template_id, template_version=excluded.template_version,
+          template_snapshot_json=excluded.template_snapshot_json
       `).run(
         task.id, task.repoId, task.repoName, task.repoPath, task.allowedRoot, task.baseBranch, task.branch,
         task.baseSha, task.originUrl ?? null, task.worktreePath, task.worktreeRoot,
@@ -241,6 +255,7 @@ export class StateStore {
         task.status === "ready_for_human_merge" ? "ready_for_human_merge" : null,
         task.recoveryStatus, task.recoveryMessage ?? null, JSON.stringify(payload),
         profile.profileId, profile.version, JSON.stringify(profile),
+        template.templateId, template.version, JSON.stringify(template),
       );
       this.replaceFlowSteps(task.id, task.flowSteps ?? []);
     });
@@ -284,7 +299,8 @@ export class StateStore {
     const raw = this.database.prepare(`
       SELECT task_id, repo_id, repo_name, task_branch, base_branch, status, original_prompt,
         created_at, updated_at, pr_number, pr_url, recovery_status, recovery_message,
-        worktree_status, worktree_available, payload_json, profile_id, profile_version, ${DASHBOARD_BUCKET_SQL} AS bucket
+        worktree_status, worktree_available, payload_json, profile_id, profile_version,
+        template_id, template_version, ${DASHBOARD_BUCKET_SQL} AS bucket
       FROM tasks ${where} ORDER BY ${order} LIMIT ?
     `).all(...listValues, input.limit) as TaskRow[];
     return { rows: raw.map(rowToDashboardRow), counts };
@@ -293,7 +309,7 @@ export class StateStore {
   clearForTests() {
     this.transaction(() => {
       this.dropAppendOnlyTriggers();
-      this.database.exec("DELETE FROM approval_events; DELETE FROM diff_versions; DELETE FROM step_versions; DELETE FROM task_events; DELETE FROM flow_steps; DELETE FROM tasks; DELETE FROM profile_audit_events; DELETE FROM project_profile_versions; DELETE FROM project_profiles;");
+      this.database.exec("DELETE FROM approval_events; DELETE FROM diff_versions; DELETE FROM step_versions; DELETE FROM task_events; DELETE FROM flow_steps; DELETE FROM tasks; DELETE FROM template_audit_events; DELETE FROM task_template_versions; DELETE FROM repo_template_settings; DELETE FROM task_templates; DELETE FROM profile_audit_events; DELETE FROM project_profile_versions; DELETE FROM project_profiles;");
       this.createAppendOnlyTriggers();
     });
   }
@@ -416,6 +432,82 @@ export class StateStore {
       .run(randomUUID(), type, new Date().toISOString(), repoId, profileId, profileVersion, taskId ?? null);
   }
 
+  loadRepoTemplates(repoId: string): TaskTemplate[] {
+    const rows = this.database.prepare("SELECT template_json FROM task_templates WHERE repo_id = ? ORDER BY template_id").all(repoId) as Array<{ template_json: string }>;
+    return rows.map((row) => templateFromStored(row.template_json));
+  }
+
+  loadRepoTemplate(repoId: string, templateId: string): TaskTemplate | undefined {
+    const row = this.database.prepare("SELECT template_json FROM task_templates WHERE repo_id = ? AND template_id = ?").get(repoId, templateId) as { template_json: string } | undefined;
+    return row ? templateFromStored(row.template_json) : undefined;
+  }
+
+  loadRepoTemplateSettings(repoId: string): RepoTemplateSettings | undefined {
+    const row = this.database.prepare("SELECT repo_id, default_template_id, updated_at FROM repo_template_settings WHERE repo_id = ?").get(repoId) as TaskRow | undefined;
+    return row ? { repoId: String(row.repo_id), defaultTemplateId: String(row.default_template_id), updatedAt: String(row.updated_at) } : undefined;
+  }
+
+  createRepoTemplates(repoId: string, templates: TaskTemplate[], defaultTemplateId = "bug_fix") {
+    if (templates.some((template) => template.repoId !== repoId) || !templates.some((template) => template.templateId === defaultTemplateId && template.enabled)) throw new Error("Repository task template defaults are invalid");
+    this.transaction(() => {
+      const insert = this.database.prepare(`INSERT INTO task_templates(repo_id, template_id, name, version, enabled, template_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
+      const version = this.database.prepare(`INSERT INTO task_template_versions(repo_id, template_id, version, changed_at, changed_fields_json, actor, snapshot_json) VALUES (?, ?, ?, ?, ?, 'user', ?)`);
+      for (const template of templates) {
+        const snapshot = snapshotTemplate(template);
+        insert.run(repoId, template.templateId, template.name, template.version, template.enabled ? 1 : 0, JSON.stringify(template), template.createdAt, template.updatedAt);
+        version.run(repoId, template.templateId, template.version, template.createdAt, JSON.stringify(["created"]), JSON.stringify(snapshot));
+      }
+      const now = templates[0]?.createdAt ?? new Date().toISOString();
+      this.database.prepare("INSERT INTO repo_template_settings(repo_id, default_template_id, updated_at) VALUES (?, ?, ?)").run(repoId, defaultTemplateId, now);
+    });
+  }
+
+  updateTaskTemplate(template: TaskTemplate, changedFields: readonly string[]) {
+    const snapshot = snapshotTemplate(template);
+    this.transaction(() => {
+      const result = this.database.prepare(`UPDATE task_templates SET version = ?, enabled = ?, template_json = ?, updated_at = ? WHERE repo_id = ? AND template_id = ? AND version = ?`)
+        .run(template.version, template.enabled ? 1 : 0, JSON.stringify(template), template.updatedAt, template.repoId, template.templateId, template.version - 1);
+      if (Number(result.changes) !== 1) throw new Error("Task template was changed concurrently; reload and retry");
+      this.database.prepare(`INSERT INTO task_template_versions(repo_id, template_id, version, changed_at, changed_fields_json, actor, snapshot_json) VALUES (?, ?, ?, ?, ?, 'user', ?)`)
+        .run(template.repoId, template.templateId, template.version, template.updatedAt, JSON.stringify(changedFields), JSON.stringify(snapshot));
+      this.appendTemplateAudit(template.enabled ? "template_enabled" : "template_disabled", template.repoId, template.templateId, template.version);
+    });
+  }
+
+  updateDefaultTemplate(repoId: string, templateId: string) {
+    const template = this.loadRepoTemplate(repoId, templateId);
+    if (!template?.enabled) throw new Error("Default task template must be enabled");
+    const now = new Date().toISOString();
+    const result = this.database.prepare("UPDATE repo_template_settings SET default_template_id = ?, updated_at = ? WHERE repo_id = ?").run(templateId, now, repoId);
+    if (Number(result.changes) !== 1) throw new Error("Repository task template settings do not exist");
+    this.appendTemplateAudit("default_template_changed", repoId, templateId, template.version);
+    return { repoId, defaultTemplateId: templateId, updatedAt: now } satisfies RepoTemplateSettings;
+  }
+
+  loadTemplateVersions(repoId: string, templateId?: string): TaskTemplateVersion[] {
+    const rows = (templateId
+      ? this.database.prepare("SELECT * FROM task_template_versions WHERE repo_id = ? AND template_id = ? ORDER BY version").all(repoId, templateId)
+      : this.database.prepare("SELECT * FROM task_template_versions WHERE repo_id = ? ORDER BY template_id, version").all(repoId)) as TaskRow[];
+    return rows.map((row) => ({
+      repoId: String(row.repo_id), templateId: String(row.template_id), version: Number(row.version), changedAt: String(row.changed_at),
+      changedFields: JSON.parse(String(row.changed_fields_json)) as string[], actor: "user", snapshot: parseTemplateSnapshot(JSON.parse(String(row.snapshot_json))),
+    }));
+  }
+
+  loadTemplateAuditEvents(repoId?: string) {
+    const rows = (repoId
+      ? this.database.prepare("SELECT * FROM template_audit_events WHERE repo_id = ? ORDER BY sequence").all(repoId)
+      : this.database.prepare("SELECT * FROM template_audit_events ORDER BY sequence").all()) as TaskRow[];
+    return rows.map((row) => ({ type: String(row.event_type) as TemplateAuditEventType, createdAt: String(row.created_at), actor: "user" as const, repoId: String(row.repo_id), templateId: String(row.template_id), templateVersion: Number(row.template_version), taskId: optionalString(row.task_id) }));
+  }
+
+  appendTemplateAudit(type: TemplateAuditEventType, repoId: string, templateId: string, templateVersion: number, taskId?: string) {
+    if (!["template_enabled", "template_disabled", "default_template_changed", "template_snapshot_created"].includes(type)) throw new Error("Task template audit event type is invalid");
+    if (!/^[A-Za-z0-9._-]{1,100}$/.test(repoId) || !/^[A-Za-z0-9._-]{1,100}$/.test(templateId) || !Number.isSafeInteger(templateVersion) || templateVersion < 1) throw new Error("Task template audit identity is invalid");
+    this.database.prepare(`INSERT INTO template_audit_events(event_id, event_type, created_at, actor, repo_id, template_id, template_version, task_id) VALUES (?, ?, ?, 'user', ?, ?, ?, ?)`)
+      .run(randomUUID(), type, new Date().toISOString(), repoId, templateId, templateVersion, taskId ?? null);
+  }
+
   /** Exposed for rollback tests; application writes use saveTask(). */
   transaction<T>(operation: () => T): T {
     if (this.transactionDepth > 0) return operation();
@@ -452,6 +544,7 @@ export class StateStore {
   private rowToTask(row: TaskRow, steps: FlowStepRow[]): RepoTask {
     const payload = parseObject(row.payload_json);
     const parsedProfile = storedTaskProfile(row, payload);
+    const parsedTemplate = storedTaskTemplate(row, payload, parsedProfile.profile);
     return {
       id: String(row.task_id), repoId: String(row.repo_id), repoName: String(row.repo_name),
       repoPath: String(row.repo_path), allowedRoot: String(row.allowed_root), branch: String(row.task_branch),
@@ -478,6 +571,8 @@ export class StateStore {
       recoveryMessage: optionalString(row.recovery_message),
       profile: parsedProfile.profile,
       profileSnapshotValid: parsedProfile.valid,
+      template: parsedTemplate.template,
+      templateSnapshotValid: parsedTemplate.valid,
     } as RepoTask;
   }
 
@@ -618,11 +713,61 @@ export class StateStore {
       `);
       this.database.prepare("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)").run(3, new Date().toISOString());
     });
+    if (version < 3) version = 3;
+    if (version < 4) this.transaction(() => {
+      this.database.exec(`
+        CREATE TABLE task_templates (
+          repo_id TEXT NOT NULL, template_id TEXT NOT NULL, name TEXT NOT NULL,
+          version INTEGER NOT NULL CHECK(version > 0), enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+          template_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          PRIMARY KEY(repo_id, template_id)
+        );
+        CREATE TABLE task_template_versions (
+          repo_id TEXT NOT NULL, template_id TEXT NOT NULL, version INTEGER NOT NULL CHECK(version > 0),
+          changed_at TEXT NOT NULL, changed_fields_json TEXT NOT NULL,
+          actor TEXT NOT NULL CHECK(actor = 'user'), snapshot_json TEXT NOT NULL,
+          PRIMARY KEY(repo_id, template_id, version),
+          FOREIGN KEY(repo_id, template_id) REFERENCES task_templates(repo_id, template_id)
+        );
+        CREATE TABLE repo_template_settings (
+          repo_id TEXT PRIMARY KEY, default_template_id TEXT NOT NULL, updated_at TEXT NOT NULL,
+          FOREIGN KEY(repo_id, default_template_id) REFERENCES task_templates(repo_id, template_id)
+        );
+        CREATE TABLE template_audit_events (
+          sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE,
+          event_type TEXT NOT NULL CHECK(event_type IN ('template_enabled', 'template_disabled', 'default_template_changed', 'template_snapshot_created')),
+          created_at TEXT NOT NULL, actor TEXT NOT NULL CHECK(actor = 'user'), repo_id TEXT NOT NULL,
+          template_id TEXT NOT NULL, template_version INTEGER NOT NULL CHECK(template_version > 0), task_id TEXT
+        );
+        ALTER TABLE tasks ADD COLUMN template_id TEXT;
+        ALTER TABLE tasks ADD COLUMN template_version INTEGER;
+        ALTER TABLE tasks ADD COLUMN template_snapshot_json TEXT;
+      `);
+      const profiles = this.database.prepare("SELECT repo_id, profile_json FROM project_profiles ORDER BY repo_id").all() as Array<{ repo_id: string; profile_json: string }>;
+      for (const row of profiles) {
+        const profile = parseProfileSnapshot(JSON.parse(row.profile_json));
+        const templates = builtInTemplates(row.repo_id);
+        this.createRepoTemplates(row.repo_id, templates);
+        const legacy = mergeTemplateWithProfile(snapshotTemplate(templates.find((item) => item.templateId === "bug_fix")!), profile);
+        this.database.prepare("UPDATE tasks SET template_id = ?, template_version = ?, template_snapshot_json = ? WHERE repo_id = ? AND template_id IS NULL")
+          .run(legacy.templateId, legacy.version, JSON.stringify(legacy), row.repo_id);
+      }
+      this.database.exec(`
+        INSERT INTO task_events(event_id, task_id, event_type, created_at, actor, status, metadata_json)
+          SELECT lower(hex(randomblob(16))), task_id, 'template_snapshot_created', updated_at, 'system', 'created',
+            json_object('templateId', template_id, 'templateVersion', template_version)
+          FROM tasks WHERE template_id IS NOT NULL;
+        INSERT INTO template_audit_events(event_id, event_type, created_at, actor, repo_id, template_id, template_version, task_id)
+          SELECT lower(hex(randomblob(16))), 'template_snapshot_created', updated_at, 'user', repo_id, template_id, template_version, task_id
+          FROM tasks WHERE template_id IS NOT NULL;
+      `);
+      this.database.prepare("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)").run(4, new Date().toISOString());
+    });
     this.createAppendOnlyTriggers();
   }
 
   private createAppendOnlyTriggers() {
-    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events"]) {
+    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events", "task_template_versions", "template_audit_events"]) {
       this.database.exec(`
         CREATE TRIGGER IF NOT EXISTS ${table}_no_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT, '${table} is append-only'); END;
         CREATE TRIGGER IF NOT EXISTS ${table}_no_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT, '${table} is append-only'); END;
@@ -631,7 +776,7 @@ export class StateStore {
   }
 
   private dropAppendOnlyTriggers() {
-    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events"]) {
+    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events", "task_template_versions", "template_audit_events"]) {
       this.database.exec(`DROP TRIGGER IF EXISTS ${table}_no_update; DROP TRIGGER IF EXISTS ${table}_no_delete;`);
     }
   }
@@ -665,6 +810,13 @@ function profileFromStored(value: unknown): ProjectProfile {
   if (typeof parsed.createdAt !== "string" || typeof parsed.updatedAt !== "string") throw new Error("Stored project profile timestamps are invalid");
   return { ...snapshot, createdAt: parsed.createdAt, updatedAt: parsed.updatedAt };
 }
+function templateFromStored(value: unknown): TaskTemplate {
+  const parsed = parseObject(value);
+  if (typeof parsed.createdAt !== "string" || typeof parsed.updatedAt !== "string") throw new Error("Stored task template timestamps are invalid");
+  const { createdAt, updatedAt, ...rawSnapshot } = parsed;
+  const snapshot = parseTemplateSnapshot(rawSnapshot);
+  return { ...snapshot, createdAt, updatedAt };
+}
 function storedTaskProfile(row: TaskRow, payload: Record<string, unknown>): { profile: ProjectProfileSnapshot; valid: boolean } {
   const raw = row.profile_snapshot_json ?? payload.profileSnapshot;
   try {
@@ -677,7 +829,20 @@ function storedTaskProfile(row: TaskRow, payload: Record<string, unknown>): { pr
     return { profile: safeDefaultSnapshot(String(row.repo_id), optionalString(row.profile_id) ?? `invalid-${String(row.repo_id)}`, optionalNumber(row.profile_version) ?? 1), valid: false };
   }
 }
-const metadataKeys = new Set(["durationMs", "diffHash", "commitSha", "prNumber", "changedFileCount", "additions", "deletions", "profileId", "profileVersion"]);
+function storedTaskTemplate(row: TaskRow, payload: Record<string, unknown>, profile: ProjectProfileSnapshot): { template: TaskTemplateSnapshot; valid: boolean } {
+  const raw = row.template_snapshot_json ?? payload.templateSnapshot;
+  try {
+    const template = parseTemplateSnapshot(typeof raw === "string" ? JSON.parse(raw) : raw);
+    const valid = template.repoId === String(row.repo_id)
+      && template.templateId === String(row.template_id)
+      && template.version === Number(row.template_version);
+    return { template, valid };
+  } catch {
+    const fallback = mergeTemplateWithProfile(snapshotTemplate(builtInTemplates(String(row.repo_id))[0]), profile);
+    return { template: fallback, valid: false };
+  }
+}
+const metadataKeys = new Set(["durationMs", "diffHash", "commitSha", "prNumber", "changedFileCount", "additions", "deletions", "profileId", "profileVersion", "templateId", "templateVersion"]);
 function validateMetadata(value: TaskEventMetadata | undefined) {
   if (!value) return undefined;
   for (const [key, item] of Object.entries(value)) {
@@ -689,6 +854,8 @@ function validateMetadata(value: TaskEventMetadata | undefined) {
     if (key === "commitSha" && (typeof item !== "string" || !/^[0-9a-f]{40,64}$/i.test(item))) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
     if (key === "profileId" && (typeof item !== "string" || !/^[A-Za-z0-9._-]{1,160}$/.test(item))) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
     if (key === "profileVersion" && (typeof item !== "number" || !Number.isSafeInteger(item) || item < 1)) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
+    if (key === "templateId" && (typeof item !== "string" || !/^[A-Za-z0-9._-]{1,100}$/.test(item))) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
+    if (key === "templateVersion" && (typeof item !== "number" || !Number.isSafeInteger(item) || item < 1)) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
   }
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as TaskEventMetadata;
 }
@@ -728,5 +895,6 @@ function rowToDashboardRow(row: TaskRow): DashboardRow {
     worktreeStatus: String(row.worktree_status), worktreeAvailable: Number(row.worktree_available) === 1,
     bucket: String(row.bucket) as TaskBucket, payload: parseObject(row.payload_json),
     profileId: optionalString(row.profile_id), profileVersion: optionalNumber(row.profile_version),
+    templateId: optionalString(row.template_id), templateVersion: optionalNumber(row.template_version),
   };
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { rejectNonHumanProfileMutation, rejectNonLocalRequest } from "./request-security";
+import { rejectNonHumanProfileMutation, rejectNonHumanTemplateMutation, rejectNonLocalRequest } from "./request-security";
 import { beginAgentExecution } from "./agent-execution-guard";
 
 describe("rejectNonLocalRequest", () => {
@@ -32,5 +32,17 @@ describe("rejectNonHumanProfileMutation", () => {
     const end = beginAgentExecution();
     expect(rejectNonHumanProfileMutation(humanUi)?.status).toBe(423);
     end();
+  });
+});
+
+describe("rejectNonHumanTemplateMutation", () => {
+  it("allows only the explicit same-origin template UI action and blocks agents", () => {
+    const agentLike = new Request("http://localhost:3000/api/repos/repo/templates", { method: "POST", headers: { host: "localhost:3000" } });
+    expect(rejectNonHumanTemplateMutation(agentLike)?.status).toBe(403);
+    const wrongSignal = new Request("http://localhost:3000/api/repos/repo/templates", { method: "POST", headers: { host: "localhost:3000", origin: "http://localhost:3000", "sec-fetch-site": "same-origin", "x-multiagents-human-action": "profile-save" } });
+    expect(rejectNonHumanTemplateMutation(wrongSignal)?.status).toBe(403);
+    const humanUi = new Request("http://localhost:3000/api/repos/repo/templates", { method: "POST", headers: { host: "localhost:3000", origin: "http://localhost:3000", "sec-fetch-site": "same-origin", "x-multiagents-human-action": "template-save" } });
+    expect(rejectNonHumanTemplateMutation(humanUi)).toBeUndefined();
+    const end = beginAgentExecution(); expect(rejectNonHumanTemplateMutation(humanUi)?.status).toBe(423); end();
   });
 });

@@ -9,6 +9,8 @@ import type { FlowEvent, FlowStep, ReviewRerunEvent } from "../agents/types";
 import { parseProfileSnapshot, safeDefaultSnapshot, type ProjectProfileSnapshot } from "../profiles/policy";
 import type { PrReviewIntake, PullRequestReview, ReworkFlowResult } from "./pr-review-types";
 import { getOrCreateRepoProfile, requireUsableTaskProfile, taskProfileSnapshot } from "./project-profiles";
+import { selectTaskTemplate } from "./task-templates";
+import { builtInTemplate, mergeTemplateWithProfile, parseTemplateSnapshot, taskExecutionPrompt, type TaskTemplateSnapshot } from "../templates/policy";
 
 export const WORKTREE_ROOT = join(homedir(), "code", ".multiagents-worktrees");
 export const TASK_BRANCH_PATTERN = /^multiagents\/[0-9a-f-]{36}$/;
@@ -47,7 +49,7 @@ export type TaskStatus =
 export type ApprovalState = "unavailable" | "pending" | "processing" | "invalidated" | "used";
 export type ApprovalPurpose = "create_pr" | "rework";
 export type RecoveryStatus = "recoverable" | "needs_attention" | "orphaned" | "invalid";
-export type WorktreeStatus = "available" | "missing" | "removed" | "invalid";
+export type WorktreeStatus = "available" | "not_required" | "missing" | "removed" | "invalid";
 export type ValidationCheck = { name: string; status: "pass" | "fail" | "skip"; detail?: string };
 export type SecretFinding = { path: string; kind: "filename" | "content" | "limit"; rule: string };
 
@@ -95,6 +97,8 @@ export type RepoTask = {
   worktreeStatus: WorktreeStatus;
   profile?: ProjectProfileSnapshot;
   profileSnapshotValid?: boolean;
+  template?: TaskTemplateSnapshot;
+  templateSnapshotValid?: boolean;
 };
 
 export type TaskDiff = {
@@ -148,13 +152,15 @@ const transitions: Record<TaskStatus, readonly TaskStatus[]> = {
   archived: [],
 };
 
-export async function createTask(repoId: string, options: { allowedRoot?: string; worktreeRoot?: string } = {}): Promise<RepoTask> {
+export async function createTask(repoId: string, options: { allowedRoot?: string; worktreeRoot?: string; templateId?: string; prompt?: string } = {}): Promise<RepoTask> {
   loadPersistedTasks();
   const allowedRoot = options.allowedRoot ?? ALLOWED_ROOT;
   const repo = await validateRepository(repoId, allowedRoot);
-  if (repo.dirty) throw new Error("Repository has uncommitted changes. Commit or stash them before creating a worktree.");
   const profile = taskProfileSnapshot(await getOrCreateRepoProfile(repoId, allowedRoot));
   requireUsableTaskProfile(profile, repoId);
+  const template = await selectTaskTemplate(repoId, options.templateId, profile, allowedRoot);
+  if (options.prompt !== undefined && (typeof options.prompt !== "string" || options.prompt.length > 20_000)) throw new Error("Task prompt is invalid");
+  if (repo.dirty && template.requireWorktree) throw new Error("Repository has uncommitted changes. Commit or stash them before creating a worktree.");
   const id = randomUUID();
   const branch = `multiagents/${id}`;
   const worktreeRoot = options.worktreeRoot ?? WORKTREE_ROOT;
@@ -163,23 +169,25 @@ export async function createTask(repoId: string, options: { allowedRoot?: string
   const baseSha = await runGit(repo.path, ["rev-parse", "HEAD"]);
   let originUrl: string | undefined;
   try { originUrl = await runGit(repo.path, ["remote", "get-url", "origin"]); } catch { /* approval reports a missing origin */ }
-  await mkdir(parent, { recursive: true });
-  await runGit(repo.path, ["worktree", "add", "-b", branch, worktreePath, "HEAD"]);
+  if (template.requireWorktree) {
+    await mkdir(parent, { recursive: true });
+    await runGit(repo.path, ["worktree", "add", "-b", branch, worktreePath, "HEAD"]);
+  }
   const task: RepoTask = {
     id,
     repoId: repo.id,
     repoName: repo.name,
     repoPath: repo.path,
     allowedRoot,
-    branch,
+    branch: template.requireWorktree ? branch : repo.branch,
     baseBranch: repo.branch,
     baseSha,
     originUrl,
-    worktreePath,
+    worktreePath: template.requireWorktree ? worktreePath : repo.path,
     worktreeRoot,
-    worktreeAvailable: true,
+    worktreeAvailable: template.requireWorktree,
     status: "draft",
-    prompt: "",
+    prompt: options.prompt?.trim() ?? "",
     reviewReady: false,
     approvalState: "unavailable",
     originalTaskAvailable: true,
@@ -188,9 +196,11 @@ export async function createTask(repoId: string, options: { allowedRoot?: string
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     recoveryStatus: "recoverable",
-    worktreeStatus: "available",
+    worktreeStatus: template.requireWorktree ? "available" : "not_required",
     profile,
     profileSnapshotValid: true,
+    template,
+    templateSnapshotValid: true,
   };
   tasks.set(id, task);
   const store = getStateStore();
@@ -198,7 +208,9 @@ export async function createTask(repoId: string, options: { allowedRoot?: string
     persistTask(task);
     store.appendTaskEvent(task.id, { type: "task_created", actor: "user", createdAt: task.createdAt, status: task.status });
     store.appendTaskEvent(task.id, { type: "profile_snapshot_created", actor: "user", createdAt: task.createdAt, status: "created", metadata: { profileId: profile.profileId, profileVersion: profile.version } });
+    store.appendTaskEvent(task.id, { type: "template_snapshot_created", actor: "user", createdAt: task.createdAt, status: "created", metadata: { templateId: template.templateId, templateVersion: template.version } });
     store.appendProfileAudit("profile_snapshot_created", task.repoId, profile.profileId, profile.version, task.id);
+    store.appendTemplateAudit("template_snapshot_created", task.repoId, template.templateId, template.version, task.id);
   });
   return task;
 }
@@ -222,6 +234,8 @@ export function transitionTask(task: RepoTask, next: TaskStatus) {
 }
 
 export function beginTaskReview(task: RepoTask, prompt: string) {
+  const template = requireTaskTemplate(task);
+  if (!template.readOnly && !task.worktreeAvailable) throw new Error("Managed task worktree is unavailable");
   if (task.commitSha || ["committing", "pushing", "creating_pr", "pr_created", "push_failed", "pr_failed"].includes(task.status)) {
     throw new Error("This task can no longer run a review flow");
   }
@@ -239,6 +253,8 @@ export function beginTaskReview(task: RepoTask, prompt: string) {
 }
 
 export function beginTaskRerun(task: RepoTask, prompt: string) {
+  const template = requireTaskTemplate(task);
+  if (!template.readOnly && !task.worktreeAvailable) throw new Error("Managed task worktree is unavailable");
   if (task.commitSha || ["committing", "pushing", "creating_pr", "pr_created", "push_failed", "pr_failed"].includes(task.status)) {
     throw new Error("This task can no longer rerun a review flow");
   }
@@ -257,7 +273,7 @@ export function completeTaskReview(task: RepoTask, finalReady: boolean) {
   if (task.status !== "draft") throw new Error("Review completion is not valid in the current task state");
   transitionTask(task, "reviewed");
   task.reviewReady = finalReady;
-  if (finalReady) transitionTask(task, "awaiting_approval");
+  if (finalReady && !requireTaskTemplate(task).readOnly) transitionTask(task, "awaiting_approval");
   persistTask(task);
 }
 
@@ -282,6 +298,8 @@ export function registerRecoveredTask(task: RepoTask) {
   task.worktreeStatus ||= task.worktreeAvailable ? "available" : "missing";
   task.profile ??= safeDefaultSnapshot(task.repoId);
   task.profileSnapshotValid = true;
+  task.template ??= mergeTemplateWithProfile(builtInTemplate(task.repoId, "bug_fix"), task.profile);
+  task.templateSnapshotValid = true;
   tasks.set(task.id, task);
   const store = getStateStore();
   store.transaction(() => {
@@ -325,6 +343,7 @@ export function publicTask(task: RepoTask) {
     recoveryMessage: task.recoveryMessage,
     worktreeStatus: task.worktreeStatus,
     profile: task.profile ?? safeDefaultSnapshot(task.repoId),
+    template: task.template ?? mergeTemplateWithProfile(builtInTemplate(task.repoId, "bug_fix"), task.profile ?? safeDefaultSnapshot(task.repoId)),
   };
 }
 
@@ -522,6 +541,7 @@ export async function resumeTask(id: string, options: { allowedRoot?: string; wo
   if (!task) return undefined;
   await recoverTask(task, options.allowedRoot ?? ALLOWED_ROOT, options.worktreeRoot ?? WORKTREE_ROOT);
   if (!task.profileSnapshotValid) throw new Error(task.recoveryMessage ?? "Task profile snapshot is invalid");
+  if (!task.templateSnapshotValid) throw new Error(task.recoveryMessage ?? "Task template snapshot is invalid");
   if (task.status === "archived") throw new Error("Archived tasks cannot be resumed");
   if (task.recoveryStatus === "invalid") throw new Error(task.recoveryMessage ?? "Task failed recovery validation");
   recordTaskEvent(task, "task_resumed", "user", { status: task.recoveryStatus });
@@ -533,12 +553,36 @@ async function recoverAllTasks(allowedRoot: string, worktreeRoot: string) {
 }
 
 async function recoverTask(task: RepoTask, allowedRoot: string, worktreeRoot: string) {
-  try { requireTaskProfile(task); }
+  let template: TaskTemplateSnapshot;
+  try { requireTaskProfile(task); template = requireTaskTemplate(task); }
   catch (error) {
     task.profileSnapshotValid = false;
+    task.templateSnapshotValid = false;
     task.recoveryStatus = "needs_attention";
     task.recoveryMessage = error instanceof Error ? error.message : "Task profile snapshot is invalid";
     getStateStore().markTaskProfileNeedsAttention(task.id, task.recoveryMessage);
+    return;
+  }
+  if (template.readOnly) {
+    try {
+      const expectedRoot = await realpath(allowedRoot);
+      const savedRoot = await realpath(task.allowedRoot);
+      if (savedRoot !== expectedRoot) throw new Error("Saved allowed root does not match the server allowed root");
+      const repo = await validateRepository(task.repoId, allowedRoot);
+      if (await realpath(task.repoPath) !== repo.path || await realpath(task.worktreePath) !== repo.path) throw new Error("Saved read-only task repository path does not match the allowed repository");
+      if (repo.branch !== task.baseBranch || await runGit(repo.path, ["rev-parse", "HEAD"]) !== task.baseSha) throw new Error("Base repository branch or HEAD changed after task creation");
+      task.worktreeAvailable = false;
+      task.worktreeStatus = "not_required";
+      task.recoveryStatus = "recoverable";
+      task.recoveryMessage = "Read-only template snapshot restored; no managed worktree, commit, push, or PR is permitted.";
+      persistTask(task);
+    } catch (error) {
+      task.worktreeAvailable = false;
+      task.worktreeStatus = "invalid";
+      task.recoveryStatus = "invalid";
+      task.recoveryMessage = error instanceof Error ? error.message : "Read-only task recovery validation failed";
+      persistTask(task);
+    }
     return;
   }
   if (task.status === "archived" && task.worktreeStatus === "removed") {
@@ -654,7 +698,7 @@ function loadPersistedTasks() {
     task.recoveryStatus = "needs_attention";
     task.recoveryMessage = "Pending startup recovery validation.";
     tasks.set(task.id, task);
-    if (task.profileSnapshotValid !== false) persistTask(task);
+    if (task.profileSnapshotValid !== false && task.templateSnapshotValid !== false) persistTask(task);
   }
 }
 
@@ -665,6 +709,25 @@ export function requireTaskProfile(task: RepoTask): ProjectProfileSnapshot {
   task.profile = profile;
   task.profileSnapshotValid = true;
   return profile;
+}
+
+export function requireTaskTemplate(task: RepoTask): TaskTemplateSnapshot {
+  if (task.templateSnapshotValid === false) throw new Error("Task template snapshot is inconsistent. Human attention is required.");
+  const template = parseTemplateSnapshot(task.template);
+  if (template.repoId !== task.repoId) throw new Error("Task template snapshot repository does not match the task");
+  const expected = mergeTemplateWithProfile({ ...builtInTemplate(task.repoId, template.templateId), version: template.version, enabled: template.enabled }, requireTaskProfile(task));
+  if (JSON.stringify(template) !== JSON.stringify(expected)) throw new Error("Task template snapshot is incompatible with its project profile snapshot");
+  task.template = template;
+  task.templateSnapshotValid = true;
+  return template;
+}
+
+export function executionPromptForTask(task: RepoTask, prompt: string) {
+  return taskExecutionPrompt(requireTaskTemplate(task), prompt);
+}
+
+export function executionRootForTask(task: RepoTask) {
+  return requireTaskTemplate(task).readOnly ? task.repoPath : task.worktreePath;
 }
 
 export function clearTasksForTests() {

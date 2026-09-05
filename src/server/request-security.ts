@@ -21,21 +21,29 @@ export function rejectNonLocalRequest(request: Request): Response | undefined {
 }
 
 export function rejectNonHumanProfileMutation(request: Request): Response | undefined {
+  return rejectNonHumanMutation(request, "profile-save", "Profile");
+}
+
+export function rejectNonHumanTemplateMutation(request: Request): Response | undefined {
+  return rejectNonHumanMutation(request, "template-save", "Task template");
+}
+
+function rejectNonHumanMutation(request: Request, expectedAction: string, label: string): Response | undefined {
   const local = rejectNonLocalRequest(request);
   if (local) return local;
-  if (isAgentExecutionActive()) return Response.json({ error: "Profile changes are blocked while an agent process is running" }, { status: 423 });
+  if (isAgentExecutionActive()) return Response.json({ error: `${label} changes are blocked while an agent process is running` }, { status: 423 });
   const origin = request.headers.get("origin");
   const fetchSite = request.headers.get("sec-fetch-site");
   const humanAction = request.headers.get("x-multiagents-human-action");
-  if (!origin || fetchSite !== "same-origin" || humanAction !== "profile-save") {
-    return Response.json({ error: "Profile changes require an explicit same-origin human UI action" }, { status: 403 });
+  if (!origin || fetchSite !== "same-origin" || humanAction !== expectedAction) {
+    return Response.json({ error: `${label} changes require an explicit same-origin human UI action` }, { status: 403 });
   }
   try {
     const originUrl = new URL(origin);
     const requestUrl = new URL(request.url);
     if (originUrl.origin !== requestUrl.origin || !LOOPBACK_HOSTS.has(originUrl.hostname)) throw new Error();
   } catch {
-    return Response.json({ error: "Profile changes require the localhost UI" }, { status: 403 });
+    return Response.json({ error: `${label} changes require the localhost UI` }, { status: 403 });
   }
 }
 

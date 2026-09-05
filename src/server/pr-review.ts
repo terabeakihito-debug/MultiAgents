@@ -19,7 +19,7 @@ import {
 import type { PullRequestCheck, PullRequestReview, PullRequestReviewItem, ReviewDisposition } from "./pr-review-types";
 import { ALLOWED_ROOT, validateRepository } from "./repositories";
 import { acquireTaskLock, isTaskLocked, releaseTaskLock } from "./task-lock";
-import { WORKTREE_ROOT, getTask, getTaskDiff, persistTask, publicTask, recordApprovalEvent, recordDiffVersion, recordTaskEvent, registerRecoveredTask, requireTaskProfile, transitionTask, type RepoTask } from "./tasks";
+import { WORKTREE_ROOT, getTask, getTaskDiff, persistTask, publicTask, recordApprovalEvent, recordDiffVersion, recordTaskEvent, registerRecoveredTask, requireTaskProfile, requireTaskTemplate, transitionTask, type RepoTask } from "./tasks";
 
 const MAX_REVIEW_BODY_CHARS = 10_000;
 const MAX_REVIEW_ITEMS = 200;
@@ -80,7 +80,7 @@ export async function fetchReviewIntake(taskId: string, dependencies: Partial<Pr
       const diff = await deps.fetchDiff(task);
       const intake = await deps.runIntake(task.prompt, diff, review, {
         agents,
-        roles: requireTaskProfile(task).roles,
+        roles: requireTaskTemplate(task).roles,
         cwd: task.worktreeAvailable ? task.worktreePath : task.repoPath,
         fingerprint: async () => reviewFingerprint(task),
       });
@@ -114,6 +114,8 @@ export async function applyReviewedFixes(taskId: string, input: { approved: true
   try {
     const task = requireTask(taskId);
     const profile = requireTaskProfile(task);
+    const template = requireTaskTemplate(task);
+    if (template.readOnly || !template.requireWorktree || !template.requireHumanApproval || !template.requirePr) throw new ApprovalError("Task template forbids implementation rework");
     if (!profile.approval.beforeRework) throw new ApprovalError("Task profile does not require the mandatory rework approval gate");
     if (input.approved !== true) throw new ApprovalError("Explicit human approval is required", 400);
     if (task.status !== "awaiting_rework_approval" || !task.prReview || !task.reviewIntake?.requiresRework) throw new ApprovalError("Reviewed fixes are not awaiting approval");
@@ -128,7 +130,7 @@ export async function applyReviewedFixes(taskId: string, input: { approved: true
       const diff = await deps.fetchDiff(task);
       result = await deps.runRework(task.prompt, diff, task.prReview, task.reviewIntake, {
         agents,
-        roles: profile.roles,
+        roles: template.roles,
         cwd: task.worktreePath,
         fingerprint: async () => (await createDiffSnapshot(task)).hash,
         getDiff: async () => {
@@ -178,6 +180,8 @@ export async function approveRework(taskId: string, input: ApprovalInput, depend
   try {
     const task = requireTask(taskId);
     const profile = requireTaskProfile(task);
+    const template = requireTaskTemplate(task);
+    if (template.readOnly || !template.requireWorktree || !template.requireHumanApproval || !template.requirePr) throw new ApprovalError("Task template forbids commit, push, and PR update");
     if (!profile.git.commitRequiresApproval || !profile.git.prRequired || !profile.approval.beforeCommit || !profile.approval.diffHashRequired || !profile.approval.secretScanRequired || !profile.approval.validationRequired || profile.git.mergeAllowedInApp || profile.git.forcePushAllowed || profile.git.deployAllowedInApp) {
       throw new ApprovalError("Task profile does not satisfy the enforced safe rework policy");
     }

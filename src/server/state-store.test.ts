@@ -72,9 +72,9 @@ describe("Phase 8 SQLite state and audit history", () => {
     const { task } = await repositoryTask();
     recordTaskEvent(task, "flow_started", "system", { createdAt: "2026-01-01T00:00:02.000Z", status: "running" });
     recordTaskEvent(task, "flow_completed", "system", { createdAt: "2026-01-01T00:00:01.000Z", status: "completed" });
-    expect(getTaskHistory(task.id).events.map((event) => event.type)).toEqual(["task_created", "profile_snapshot_created", "flow_started", "flow_completed"]);
+    expect(getTaskHistory(task.id).events.map((event) => event.type)).toEqual(["task_created", "profile_snapshot_created", "template_snapshot_created", "flow_started", "flow_completed"]);
     reloadTasksFromStoreForTests();
-    expect(getTaskHistory(task.id).events.map((event) => event.type)).toEqual(["task_created", "profile_snapshot_created", "flow_started", "flow_completed"]);
+    expect(getTaskHistory(task.id).events.map((event) => event.type)).toEqual(["task_created", "profile_snapshot_created", "template_snapshot_created", "flow_started", "flow_completed"]);
   });
 
   it("increments step versions on rerun and preserves the old output", async () => {
@@ -114,14 +114,14 @@ describe("Phase 8 SQLite state and audit history", () => {
       store.appendStepVersion(task.id, steps()[0]);
       throw new Error("rollback history");
     })).toThrow("rollback history");
-    expect(getTaskHistory(task.id)).toMatchObject({ events: [{ type: "task_created" }, { type: "profile_snapshot_created" }], stepVersions: [] });
+    expect(getTaskHistory(task.id)).toMatchObject({ events: [{ type: "task_created" }, { type: "profile_snapshot_created" }, { type: "template_snapshot_created" }], stepVersions: [] });
   });
 
   it("rejects forbidden or unknown event metadata", async () => {
     const { task } = await repositoryTask();
     expect(() => store.appendTaskEvent(task.id, { type: "flow_started", actor: "system", metadata: { token: "secret" } as never })).toThrow("forbidden");
     expect(() => store.appendTaskEvent(task.id, { type: "flow_started", actor: "system", metadata: { prompt: "full prompt" } as never })).toThrow("forbidden");
-    expect(getTaskHistory(task.id).events).toHaveLength(2);
+    expect(getTaskHistory(task.id).events).toHaveLength(3);
   });
 
   it("migrates a real v1 database transactionally without losing tasks", () => {
@@ -159,9 +159,9 @@ describe("Phase 8 SQLite state and audit history", () => {
     `);
     database.close();
     const migrated = new StateStore(path);
-    expect(migrated.schemaVersion()).toBe(3);
+    expect(migrated.schemaVersion()).toBe(SCHEMA_VERSION);
     expect(migrated.loadTasks()[0]).toMatchObject({ id: "11111111-1111-1111-1111-111111111111", prompt: "kept prompt", profile: { name: "safe_default", version: 1 } });
-    expect(migrated.loadTaskHistory("11111111-1111-1111-1111-111111111111")).toMatchObject({ events: [{ type: "task_created", actor: "system", status: "draft" }], stepVersions: [], diffVersions: [], approvalEvents: [] });
+    expect(migrated.loadTaskHistory("11111111-1111-1111-1111-111111111111")).toMatchObject({ events: [{ type: "task_created", actor: "system", status: "draft" }, { type: "template_snapshot_created", actor: "system", status: "created" }], stepVersions: [], diffVersions: [], approvalEvents: [] });
     migrated.close();
   });
 

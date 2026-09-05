@@ -47,6 +47,8 @@ export type DashboardTask = {
   worktreeStatus: string;
   profileName: string;
   profileVersion: number;
+  templateName: string;
+  templateVersion: number;
   nextAction: NextAction;
   nextActionLabel: string;
   attentionReason?: string;

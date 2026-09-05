@@ -42,7 +42,7 @@ describe("Phase 9 dashboard query", () => {
     const item = task("10111111-1111-4111-8111-111111111111", "draft", { worktreeAvailable: false, worktreeStatus: "missing" });
     store.saveTask(item);
     const result = await getDashboard(query(), new Date("2026-01-01T00:00:01.000Z"));
-    expect(result.tasks[0]).toMatchObject({ profileName: "safe_default", profileVersion: 1 });
+    expect(result.tasks[0]).toMatchObject({ profileName: "safe_default", profileVersion: 1, templateName: "Bug Fix", templateVersion: 1 });
   });
 
   it("classifies every dashboard bucket and returns counts", () => {

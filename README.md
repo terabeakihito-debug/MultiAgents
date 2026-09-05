@@ -188,13 +188,14 @@ is also manual.
 
 ## Local state persistence
 
-Phase 8 and Phase 10 use SQLite from Node.js itself; they do not add a database server or
+Phase 8, Phase 10, and Phase 11 use SQLite from Node.js itself; they do not add a database server or
 ORM. State is stored at `~/.multiagents/state.db`, outside every repository.
 The directory is forced to mode `0700` and the database file to `0600` when it
 is opened. Schema migrations are tracked in `schema_version`; the current
-schema is version 3. The v1→v2 and v2→v3 migrations run transactionally and
+schema is version 4. The v1→v2, v2→v3, and v3→v4 migrations run transactionally and
 preserve existing task and flow-step snapshots. Existing tasks receive a
-`safe_default` v1 profile snapshot during the v3 migration.
+`safe_default` v1 profile snapshot during the v3 migration and a compatible
+`Bug Fix` v1 template snapshot during the v4 migration.
 
 The database stores task/repository/worktree identity, the latest state-machine
 status, original prompt, current Review Flow steps and outputs, stale/rerun
@@ -271,6 +272,46 @@ are server-fixed: isolated worktrees, diff hashes, secret scan, validation,
 human approval, and a PR are required; dirty cleanup, direct-main writes,
 force-push, merge, and deploy remain forbidden. MultiAgents remains
 localhost-only.
+
+## Task Templates
+
+Phase 11 assigns each repository six server-defined execution presets: **Bug
+Fix**, **Feature**, **Refactor**, **Security Review**, **Documentation**, and
+**Investigation**. Project Settings can enable or disable these built-ins and
+choose the repository default. The task creation selector starts on that
+default and lets the user choose another enabled built-in. There is no custom
+template DSL, arbitrary command, timeout, Git operation, agent role, or prompt
+prefix input.
+
+A Project Profile remains the repository safety policy; a Task Template is only
+an execution preset. At task creation the server intersects the template with
+the current profile. Agent roles can be narrowed to `review_only` or
+`disabled`, never elevated, and template validation steps are limited to both
+the server's npm-script allowlist and the profile's allowed steps. Writable
+templates use Review Flow, an isolated worktree, explicit human approval, and a
+required PR. Documentation additionally limits approval to documentation paths
+and uses only existing `lint`, `typecheck`, and `build` scripts according to the
+profile's missing-script policy.
+
+**Security Review** and **Investigation** are read-only repository tasks. Codex,
+Cursor, and Claude receive read-only capabilities; no managed write worktree is
+created, and validation, commit, push, and PR creation are forbidden. Their
+fixed server prompts treat repository content as untrusted. Instructions in a
+repository such as requests to skip tests, disable reviewers, or push to main
+cannot change template selection or policy.
+
+Every task stores `templateId`, `templateVersion`, and an immutable effective
+template snapshot alongside its profile snapshot. Updating, disabling, or
+changing the repository default affects only new tasks; Resume validates and
+uses the saved version. Dashboard cards display both snapshot names and
+versions. Enable, disable, default-change, and snapshot events are audited in
+append-only SQLite tables.
+
+Template mutations require an explicit confirmed same-origin action from the
+localhost UI and are blocked while any agent process is running. Agents are
+instructed not to call template APIs, repository files are never template
+sources, and the server normalizes current definitions from built-in code. The
+application remains localhost-only.
 
 ## Verification
 
