@@ -12,6 +12,7 @@ import {
   getTask,
   getTaskDiff,
   invalidateApproval,
+  persistTask,
   publicTask,
   transitionTask,
   type RepoTask,
@@ -99,20 +100,24 @@ export async function prepareApproval(task: RepoTask) {
   const rework = task.status === "awaiting_final_approval" || (["validation_failed", "secret_scan_failed", "approval_invalidated", "commit_failed"].includes(task.status) && task.approvalPurpose === "rework");
   if (!task.reviewReady || (!rework && !["awaiting_approval", "reviewed", "validation_failed", "secret_scan_failed", "approval_invalidated", "commit_failed"].includes(task.status))) {
     invalidateApproval(task);
+    persistTask(task);
     return { diff, approval: undefined, task: publicTask(task) };
   }
   if (!diff.approvable) {
     invalidateApproval(task);
+    persistTask(task);
     return { diff, approval: { blockedReason: diff.blockedReason }, task: publicTask(task) };
   }
   let snapshot: DiffSnapshot;
   try { snapshot = await createDiffSnapshot(task); }
   catch (error) {
     invalidateApproval(task);
+    persistTask(task);
     return { diff, approval: { blockedReason: error instanceof Error ? error.message : "The diff cannot be safely approved." }, task: publicTask(task) };
   }
   if (snapshot.empty) {
     invalidateApproval(task);
+    persistTask(task);
     return { diff, approval: { blockedReason: "The final diff is empty." }, task: publicTask(task) };
   }
   if (task.status === "reviewed") transitionTask(task, "awaiting_approval");
@@ -128,6 +133,7 @@ export async function prepareApproval(task: RepoTask) {
       task.error = undefined;
     }
   }
+  persistTask(task);
   return {
     diff,
     approval: { diffHash: task.diffHash, approvalId: task.approvalId },
@@ -203,6 +209,7 @@ export async function approveAndCreatePullRequest(taskId: string, input: Approva
         await deps.commit(task, commitMessage(task.prompt));
         task.commitSha = await runGit(task.worktreePath, ["rev-parse", "HEAD"]);
         task.approvalState = "used";
+        persistTask(task);
       } catch (error) {
         if (error instanceof ApprovalError) throw error;
         task.approvalState = "invalidated";
@@ -245,6 +252,7 @@ export async function approveAndCreatePullRequest(taskId: string, input: Approva
       throw new ApprovalError(task.error ?? "Approve and create PR failed");
     }
   } finally {
+    const task = getTask(taskId); if (task) persistTask(task);
     releaseTaskLock(taskId);
   }
 }
@@ -255,6 +263,7 @@ export async function retryPullRequest(taskId: string, dependencies: Partial<App
   try {
     const task = getTask(taskId);
     if (!task) throw new ApprovalError("Task not found", 404);
+    if (task.prNumber && task.prUrl) return publicTask(task);
     if (task.status !== "pr_failed" || !task.commitSha || task.approvalState !== "used") throw new ApprovalError("PR retry is not available for this task");
     await validateCommittedTask(task);
     const remote = validateGitHubRemote(await runGit(task.worktreePath, ["remote", "get-url", "origin"]));
@@ -275,6 +284,7 @@ export async function retryPullRequest(taskId: string, dependencies: Partial<App
       throw new ApprovalError(task.error);
     }
   } finally {
+    const task = getTask(taskId); if (task) persistTask(task);
     releaseTaskLock(taskId);
   }
 }

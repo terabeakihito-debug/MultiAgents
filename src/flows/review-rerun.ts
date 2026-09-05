@@ -108,12 +108,12 @@ export async function rerunReviewStep(request: ReviewRerunRequest, options: Reru
   }
 }
 
-export function createReviewRerunStream(request: ReviewRerunRequest, requestSignal: AbortSignal, runner = rerunReviewStep, options: { cwd?: string; onComplete?: (result: ReviewRerunResult) => void } = {}) {
-  const { onComplete, ...runnerOptions } = options;
+export function createReviewRerunStream(request: ReviewRerunRequest, requestSignal: AbortSignal, runner = rerunReviewStep, options: { cwd?: string; onComplete?: (result: ReviewRerunResult) => void; onEvent?: (event: ReviewRerunEvent) => void } = {}) {
+  const { onComplete, onEvent, ...runnerOptions } = options;
   return createEventStream(requestSignal, async ({ signal, send }) => {
     const result = await runner(request, {
     signal,
-    onEvent: (event) => send(event),
+    onEvent: (event) => { onEvent?.(event); send(event); },
     log: (entry) => console.info("review_rerun", JSON.stringify(entry)),
     ...runnerOptions,
     });

@@ -22,6 +22,8 @@ type RepoTask = {
   id: string; repoId: string; repoName: string; branch: string; baseBranch: string; status: string; approvalState: string;
   approvalPurpose?: "create_pr" | "rework"; validation: ValidationCheck[]; secretFindings: SecretFinding[]; commitSha?: string; prUrl?: string; prNumber?: number;
   prReview?: PrReview; reviewIntake?: PrIntake; originalTaskAvailable: boolean; worktreeAvailable: boolean; latestPushedSha?: string; ciMessage?: string; error?: string;
+  prompt: string; createdAt: string; updatedAt: string; flowId?: string; flowStatus?: string; flowSteps: FlowStep[]; finalOutput?: string;
+  recoveryStatus: "recoverable" | "needs_attention" | "orphaned" | "invalid"; recoveryMessage?: string; worktreeStatus: "available" | "missing" | "removed" | "invalid";
 };
 type TaskDiff = {
   trackedFiles: string[]; untrackedFiles: string[]; stat: string; patch: string; untrackedPatch: string;
@@ -50,6 +52,7 @@ export default function Home() {
   const [repoId, setRepoId] = useState("");
   const [openPulls, setOpenPulls] = useState<OpenPull[]>([]);
   const [task, setTask] = useState<RepoTask | null>(null);
+  const [recentTasks, setRecentTasks] = useState<RepoTask[]>([]);
   const [taskDiff, setTaskDiff] = useState<TaskDiff | null>(null);
   const [approval, setApproval] = useState<Approval | null>(null);
   const [reviewedDiff, setReviewedDiff] = useState(false);
@@ -66,23 +69,30 @@ export default function Home() {
     setRepos(data.repos || []); setRepoId((current) => current || data.repos?.[0]?.id || "");
   }).catch((error) => setTaskError(message(error))); }, []);
 
-  useEffect(() => { void fetch("/api/tasks").then(async (response) => {
+  async function loadHistory() { await fetch("/api/tasks/history").then(async (response) => {
     const data = await response.json() as { tasks?: RepoTask[]; error?: string };
     if (!response.ok) throw new Error(data.error || "Could not restore tasks");
-    const active = data.tasks?.find((item) => item.status !== "pr_created") ?? data.tasks?.[0];
-    if (!active) return;
-    setTask(active);
-    setRepoId(active.repoId);
-    setMode("review");
-    if (!active.worktreeAvailable) return;
-    const detailResponse = await fetch(`/api/tasks/${active.id}`);
-    const detail = await detailResponse.json() as { diff?: TaskDiff; task?: RepoTask; approval?: Approval; error?: string };
-    if (!detailResponse.ok || !detail.diff) throw new Error(detail.error || "Could not restore task diff");
-    setTaskDiff(detail.diff);
-    if (detail.task) setTask(detail.task);
-    setApproval(detail.approval ?? null);
-    setReviewedDiff(false);
-  }).catch((error) => setTaskError(message(error))); }, []);
+    setRecentTasks(data.tasks ?? []);
+  }); }
+
+  useEffect(() => { void loadHistory().catch((error) => setTaskError(message(error))); }, []);
+
+  async function resumePersistedTask(taskId: string) {
+    setTaskError(""); setTaskDiff(null); setApproval(null); setReviewedDiff(false);
+    try {
+      const response = await fetch(`/api/tasks/${taskId}/resume`, { method: "POST" });
+      const data = await response.json() as { diff?: TaskDiff; task?: RepoTask; approval?: Approval; error?: string };
+      if (!data.task) throw new Error(data.error || "Task resume failed");
+      const restored = data.task;
+      setTask(restored); setRepoId(restored.repoId); setMode("review"); setPrompt(restored.prompt); setFlowPrompt(restored.prompt);
+      setSteps(restored.flowSteps?.length ? restored.flowSteps : initialSteps());
+      setFlowStatus((restored.flowStatus as ReviewFlowResult["status"] | "idle" | "running") ?? "idle");
+      setFinalOutput(restored.finalOutput ?? ""); currentFlowIdRef.current = restored.flowId ?? "";
+      setTaskDiff(data.diff ?? null); setApproval(data.approval ?? null);
+      if (data.error) setTaskError(data.error);
+      await loadHistory();
+    } catch (error) { setTaskError(message(error)); }
+  }
 
   async function createIsolatedTask() {
     setTaskError(""); setTaskDiff(null); setApproval(null); setReviewedDiff(false); setOpenPulls([]);
@@ -90,7 +100,7 @@ export default function Home() {
       const response = await fetch("/api/tasks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repoId }) });
       const data = await response.json() as { task?: RepoTask; error?: string };
       if (!response.ok || !data.task) throw new Error(data.error || "Task creation failed");
-      setTask(data.task); setMode("review");
+      setTask(data.task); setMode("review"); await loadHistory();
     } catch (error) { setTaskError(message(error)); }
   }
 
@@ -137,6 +147,7 @@ export default function Home() {
     const response = await fetch(`/api/tasks/${task.id}`, { method: "DELETE" });
     if (!response.ok) { const data = await response.json() as { error?: string }; setTaskError(data.error || "Cleanup failed"); return; }
     setTask(null); setTaskDiff(null); setApproval(null); setReviewedDiff(false);
+    await loadHistory();
   }
 
   async function submit(event: FormEvent) {
@@ -324,12 +335,13 @@ export default function Home() {
 
   return <main>
     <header><h1>MultiAgents</h1><p>Parallel answers or a fixed, reviewed response from local AI CLIs.</p></header>
-    <section className="repoPanel"><label htmlFor="repository">Repository</label><div className="repoControls"><select id="repository" value={repoId} disabled={sending || Boolean(task)} onChange={(event) => { setRepoId(event.target.value); setOpenPulls([]); }}>{repos.map((repo) => <option key={repo.id} value={repo.id}>{repo.name}{repo.dirty ? " (dirty)" : ""}</option>)}</select><button type="button" disabled={!repoId || sending || Boolean(task)} onClick={createIsolatedTask}>Create isolated task</button><button type="button" disabled={!repoId || sending || reviewProcessing || Boolean(task)} onClick={loadOpenPulls}>{reviewProcessing ? "Loading…" : "Find open PRs"}</button></div>{!task && openPulls.length > 0 && <div className="openPulls"><h3>Open PRs from this repository origin</h3>{openPulls.map((pull) => <div className="openPull" key={pull.number}><span>#{pull.number} {pull.title} · <code>{pull.head}</code></span><button type="button" disabled={reviewProcessing} onClick={() => recoverPull(pull.number)}>Open review intake</button></div>)}</div>}{task && <div className="taskReady"><div><strong>Repo:</strong> {task.repoName}</div><div><strong>Branch:</strong> <code>{task.branch}</code></div><div><strong>State:</strong> <code>{task.status}</code></div><div><strong>Worktree:</strong> {task.worktreeAvailable ? "ready" : "unavailable (review-only)"}</div><button type="button" className="delete" onClick={deleteWorktree} disabled={sending || approvalProcessing || reviewProcessing || Boolean(task.commitSha)}>Delete task worktree</button></div>}{taskError && <ErrorBlock error={taskError} />}</section>
+    <section className="historyPanel"><div className="cardHeader"><h2>Recent Tasks</h2><button type="button" className="rerun" onClick={() => void loadHistory().catch((error) => setTaskError(message(error)))}>Refresh</button></div>{recentTasks.length ? <div className="taskHistory">{recentTasks.map((item) => <article className="historyTask" key={item.id}><div><strong>{item.repoName}</strong>{item.prNumber ? <span> · PR #{item.prNumber}</span> : null}<div><code>{item.status}</code> · <span className={`recovery ${item.recoveryStatus}`}>{item.recoveryStatus}</span></div><small>{new Date(item.updatedAt).toLocaleString()}</small>{item.recoveryMessage && <p>{item.recoveryMessage}</p>}</div><button type="button" disabled={sending || approvalProcessing || reviewProcessing} onClick={() => void resumePersistedTask(item.id)}>Resume</button></article>)}</div> : <p className="muted">No persisted tasks yet.</p>}</section>
+    <section className="repoPanel"><label htmlFor="repository">Repository</label><div className="repoControls"><select id="repository" value={repoId} disabled={sending || Boolean(task)} onChange={(event) => { setRepoId(event.target.value); setOpenPulls([]); }}>{repos.map((repo) => <option key={repo.id} value={repo.id}>{repo.name}{repo.dirty ? " (dirty)" : ""}</option>)}</select><button type="button" disabled={!repoId || sending || Boolean(task)} onClick={createIsolatedTask}>Create isolated task</button><button type="button" disabled={!repoId || sending || reviewProcessing || Boolean(task)} onClick={loadOpenPulls}>{reviewProcessing ? "Loading…" : "Find open PRs"}</button></div>{!task && openPulls.length > 0 && <div className="openPulls"><h3>Open PRs from this repository origin</h3>{openPulls.map((pull) => <div className="openPull" key={pull.number}><span>#{pull.number} {pull.title} · <code>{pull.head}</code></span><button type="button" disabled={reviewProcessing} onClick={() => recoverPull(pull.number)}>Open review intake</button></div>)}</div>}{task && <><div className="taskReady"><div><strong>Repo:</strong> {task.repoName}</div><div><strong>Branch:</strong> <code>{task.branch}</code></div><div><strong>State:</strong> <code>{task.status}</code></div><div><strong>Worktree:</strong> {task.worktreeAvailable ? "ready" : "unavailable (review-only)"}</div><button type="button" className="delete" onClick={deleteWorktree} disabled={sending || approvalProcessing || reviewProcessing || Boolean(task.commitSha) || !task.worktreeAvailable}>Delete task worktree</button></div>{task.recoveryMessage && <p className="staleReason">{task.recoveryMessage}</p>}</>}{taskError && <ErrorBlock error={taskError} />}</section>
     <form onSubmit={submit}>
       <fieldset className="modes" disabled={sending}><legend>Mode</legend><label><input type="radio" checked={mode === "parallel"} onChange={() => setMode("parallel")} /> Parallel</label><label><input type="radio" checked={mode === "review"} onChange={() => setMode("review")} /> Review Flow</label></fieldset>
       <label htmlFor="prompt">Prompt</label>
       <textarea id="prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} maxLength={20_000} rows={6} placeholder="Ask Codex, Cursor, and Claude…" />
-      <div className="actions"><span>{prompt.length.toLocaleString()} / 20,000</span><div className="actionButtons">{sending && mode === "review" && <button className="cancel" type="button" onClick={cancelFlow}>Cancel</button>}<button type="submit" disabled={sending || !prompt.trim()}>{sending ? "Running…" : mode === "parallel" ? "Send to all" : "Run review flow"}</button></div></div>
+      <div className="actions"><span>{prompt.length.toLocaleString()} / 20,000</span><div className="actionButtons">{sending && mode === "review" && <button className="cancel" type="button" onClick={cancelFlow}>Cancel</button>}<button type="submit" disabled={sending || !prompt.trim() || (mode === "review" && Boolean(task) && !task?.worktreeAvailable)}>{sending ? "Running…" : mode === "parallel" ? "Send to all" : "Run review flow"}</button></div></div>
     </form>
     {mode === "parallel" ? <section className="cards" aria-label="Agent responses">{agentIds.map((id) => <AgentCard key={id} name={labels[id]} state={cards[id]} />)}</section> : <FlowTimeline steps={steps} status={flowStatus} finalOutput={finalOutput} sending={sending} activeRerun={activeRerun} onRerun={rerunStep} />}
     {taskDiff && <section className="diff card"><h2>Final Diff</h2><h3>Tracked changed files</h3><pre>{taskDiff.trackedFiles.join("\n") || "None."}</pre><h3>Untracked files</h3><pre>{taskDiff.untrackedFiles.join("\n") || "None."}</pre><h3>Changed lines</h3><pre>{taskDiff.stat || "No tracked changes."}</pre><details><summary>View full diff</summary><pre>{[taskDiff.patch, taskDiff.untrackedPatch].filter(Boolean).join("\n\n") || "No changes."}</pre></details>{taskDiff.blockedReason && <p className="staleReason">{taskDiff.blockedReason}</p>}

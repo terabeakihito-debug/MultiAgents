@@ -1,13 +1,15 @@
-import { createTask, listTasks, publicTask } from "@/server/tasks";
+import { createTask, initializeTaskRecovery, listTasks, publicTask } from "@/server/tasks";
 import { rejectNonLocalRequest } from "@/server/request-security";
 
 export const runtime = "nodejs";
 export async function GET(request: Request) {
   const rejection = rejectNonLocalRequest(request); if (rejection) return rejection;
+  await initializeTaskRecovery();
   return Response.json({ tasks: listTasks().map(publicTask) });
 }
 export async function POST(request: Request) {
   const rejection = rejectNonLocalRequest(request); if (rejection) return rejection;
+  await initializeTaskRecovery();
   let body: unknown; try { body = await request.json(); } catch { return Response.json({ error: "Request body must be valid JSON" }, { status: 400 }); }
   const repoId = (body as { repoId?: unknown })?.repoId;
   if (typeof repoId !== "string") return Response.json({ error: "Repository is required" }, { status: 400 });

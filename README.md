@@ -9,7 +9,7 @@ This is intentionally a small MVP. The browser calls Next.js server routes; only
 ## Requirements
 
 - WSL2 with Ubuntu 24.04 (or a compatible Linux environment)
-- Node.js 20.9 or newer and npm
+- Node.js 22.5 or newer and npm (the local state store uses the standard `node:sqlite` module)
 - Authenticated commands available on `PATH`:
   - `codex exec "..."`
   - `agent --trust --workspace <project-directory> -p "..."`
@@ -35,7 +35,7 @@ The review roles are: Codex creates the draft, Cursor reviews correctness and ri
 
 After a Review Flow finishes, **Re-run** is available for Cursor Review, Claude Review, and Codex Final. Codex Draft is intentionally not rerunnable. A successful Cursor rerun replaces only Cursor's latest result and marks Claude and Final as **STALE**; a successful Claude rerun replaces only Claude's result and marks Final stale. Downstream steps are never run automatically. Stale is not a failure: the prior output stays visible with a reason, and the user can explicitly rerun that step. Rerunning Final uses the latest available draft and review results.
 
-Rerun state and the original prompt are held only in browser memory. Reloading the page clears them; there is no database or persistent history. A rerun can be cancelled through the same **Cancel** control and process-group termination path. If it fails, is cancelled, or times out, the prior successful output is retained and the step reports the rerun failure.
+Rerun state, stale markers, the original prompt, and the latest step outputs are stored locally and restored by **Resume** after a reload or server restart. A rerun can be cancelled through the same **Cancel** control and process-group termination path. If it fails, is cancelled, or times out, the prior successful output is retained and the step reports the rerun failure.
 
 If the draft fails, every later step is skipped. If Cursor fails, Claude and final Codex continue with an explicit unavailable-review marker. If Claude fails, final Codex continues with the draft and available Cursor review. A final Codex failure leaves the prior timeline visible.
 
@@ -121,17 +121,18 @@ base branch. The final merge is always performed by a human outside this app.
 **Delete task worktree** uses `git worktree remove` only before a task has
 created a commit and only when the task worktree is clean. Dirty, committed, and
 pushed task worktrees are deliberately retained for explicit manual cleanup.
-Task, intake, and approval state live only in the server process. After a
-restart, **Find open PRs** lists only open PRs from the selected repository's
-validated GitHub origin. Recovery is allowed only when an already registered
+Task, intake, approval, and PR metadata are persisted locally. After a
+restart, **Recent Tasks** lists saved tasks and **Resume** revalidates them.
+**Find open PRs** also lists open PRs from the selected repository's validated
+GitHub origin. Recovery is allowed only when an already registered
 server-managed worktree, `multiagents/<UUID>` branch, clean local HEAD, PR head
 SHA, base, and origin all match. Recovery never creates a replacement
 worktree. If the worktree is missing, MultiAgents creates only an in-memory,
 read-only intake session against the selected repository and PR; it does not
-restore write capability. Because the original task prompt cannot be
-authenticated after a restart, every recovered session may fetch/display
-review data but automatic rework is disabled. A present but ambiguous or
-mismatched worktree stops recovery. Inspect or remove an orphan manually:
+restore write capability. Persisted original task context allows rework only
+when the managed worktree, repository, branch, origin, local HEAD, and PR
+metadata all pass recovery checks. A present but ambiguous or mismatched
+worktree stops recovery. Inspect or remove an orphan manually:
 
 ```bash
 git -C ~/code/REPOSITORY worktree list
@@ -141,6 +142,43 @@ git -C ~/code/REPOSITORY worktree prune
 
 Review the path and preserve any wanted changes before removal. Branch deletion
 is also manual.
+
+## Local state persistence
+
+Phase 7 uses SQLite from Node.js itself; it does not add a database server or
+ORM. State is stored at `~/.multiagents/state.db`, outside every repository.
+The directory is forced to mode `0700` and the database file to `0600` when it
+is opened. Schema migrations are tracked in `schema_version`; the current
+schema is version 1.
+
+The database stores task/repository/worktree identity, the latest state-machine
+status, original prompt, current Review Flow steps and outputs, stale/rerun
+state, diff hash, approval state, commit SHA, bounded PR metadata, review
+classification/counts, CI/readiness state, and recovery classification. It
+does not store API keys, GitHub tokens, CLI credentials, cookies,
+`Authorization` headers, environment variables, or shell history. GitHub
+review bodies are externally recoverable and are not retained in snapshots.
+
+Local state may contain prompts and agent outputs. Protect `~/.multiagents` as
+sensitive local application data. Prompt and output fields are bounded, and
+database contents are never dumped to the console.
+
+At startup each saved task is classified as `recoverable`, `needs_attention`,
+`orphaned`, or `invalid`. Recovery checks canonical repository/worktree paths,
+the `~/code` boundary, Git worktree registration, task branch, origin, and
+local HEAD. PR and CI state is marked for refresh. A missing worktree is never
+recreated automatically: local rework stops with manual recovery guidance,
+although an existing PR may still be inspected read-only. Removing an eligible
+task worktree archives the task record instead of deleting its history.
+
+Pending or processing approvals are invalidated whenever persisted state is
+loaded after a server restart. The old approval ID is discarded. The current
+diff must be reviewed again, and repository/worktree checks, diff hashing,
+secret scanning, and project validation run again before any commit. Persisted
+commit SHA and PR number act as idempotency barriers. Task snapshots and flow
+step updates use SQLite transactions.
+
+The server remains localhost-only and has no multi-user or remote-sync mode.
 
 ## Verification
 
@@ -189,6 +227,6 @@ Tests mock process spawning and never invoke the real AI CLIs.
 Draft reruns, downstream automatic reruns, old-result version history, free-form
 agent conversations, agent-selected or recursive handoffs, automatic retry
 loops, merges, remote cloning, recursive repository
-discovery, databases, persistent task history, long-term memory, token/cost
+discovery, versioned task/audit history, long-term memory, token/cost
 tracking, token-level streaming, production deployment, and Docker are not
 implemented.

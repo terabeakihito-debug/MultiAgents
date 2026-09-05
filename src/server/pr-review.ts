@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { lstat, realpath } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 import { agents } from "../agents";
@@ -19,7 +19,7 @@ import {
 import type { PullRequestCheck, PullRequestReview, PullRequestReviewItem, ReviewDisposition } from "./pr-review-types";
 import { ALLOWED_ROOT, validateRepository } from "./repositories";
 import { acquireTaskLock, isTaskLocked, releaseTaskLock } from "./task-lock";
-import { WORKTREE_ROOT, getTask, getTaskDiff, publicTask, registerRecoveredTask, transitionTask, type RepoTask } from "./tasks";
+import { WORKTREE_ROOT, getTask, getTaskDiff, persistTask, publicTask, registerRecoveredTask, transitionTask, type RepoTask } from "./tasks";
 
 const MAX_REVIEW_BODY_CHARS = 10_000;
 const MAX_REVIEW_ITEMS = 200;
@@ -80,8 +80,8 @@ export async function fetchReviewIntake(taskId: string, dependencies: Partial<Pr
       const diff = await deps.fetchDiff(task);
       const intake = await deps.runIntake(task.prompt, diff, review, {
         agents,
-        cwd: task.worktreePath,
-        fingerprint: async () => (await createDiffSnapshot(task)).hash,
+        cwd: task.worktreeAvailable ? task.worktreePath : task.repoPath,
+        fingerprint: async () => reviewFingerprint(task),
       });
       if (intake.status !== "completed") throw new Error("PR review intake did not complete");
       task.prReview = review;
@@ -98,6 +98,7 @@ export async function fetchReviewIntake(taskId: string, dependencies: Partial<Pr
       throw new ApprovalError(task.error);
     }
   } finally {
+    const task = getTask(taskId); if (task) persistTask(task);
     releaseTaskLock(taskId);
   }
 }
@@ -154,6 +155,7 @@ export async function applyReviewedFixes(taskId: string, input: { approved: true
     transitionTask(task, "awaiting_final_approval");
     return publicTask(task);
   } finally {
+    const task = getTask(taskId); if (task) persistTask(task);
     releaseTaskLock(taskId);
   }
 }
@@ -208,6 +210,7 @@ export async function approveRework(taskId: string, input: ApprovalInput, depend
       if (commitSha === task.reworkBaseSha) throw new Error("Rework commit was not appended");
       task.commitSha = commitSha;
       task.approvalState = "used";
+      persistTask(task);
 
       transitionTask(task, "pushing_rework");
       try { await deps.push(task); }
@@ -239,6 +242,7 @@ export async function approveRework(taskId: string, input: ApprovalInput, depend
       throw new ApprovalError(task.error ?? safeError(error, "Rework approval failed"));
     }
   } finally {
+    const task = getTask(taskId); if (task) persistTask(task);
     releaseTaskLock(taskId);
   }
 }
@@ -246,11 +250,12 @@ export async function approveRework(taskId: string, input: ApprovalInput, depend
 export async function fetchPullRequestReview(task: RepoTask): Promise<PullRequestReview> {
   if (!task.prNumber) throw new Error("Pull request number is unavailable");
   const repo = repositoryName(task);
+  const cwd = task.worktreeAvailable ? task.worktreePath : task.repoPath;
   const [viewResult, commentsResult, threadsResult, requiredResult] = await Promise.all([
-    checkedGh(["pr", "view", String(task.prNumber), "--repo", repo, "--json", "number,title,state,isDraft,baseRefName,headRefName,headRefOid,mergeable,mergeStateStatus,files,url,mergedAt,reviews,statusCheckRollup"], task.worktreePath),
-    checkedGh(["api", `repos/${repo}/pulls/${task.prNumber}/comments`, "--paginate"], task.worktreePath),
-    checkedGh(["api", "graphql", "-f", `query=${THREAD_QUERY}`, "-F", `owner=${repo.split("/")[0]}`, "-F", `repo=${repo.split("/")[1]}`, "-F", `number=${task.prNumber}`], task.worktreePath),
-    gh(["pr", "checks", String(task.prNumber), "--repo", repo, "--required"], task.worktreePath),
+    checkedGh(["pr", "view", String(task.prNumber), "--repo", repo, "--json", "number,title,state,isDraft,baseRefName,headRefName,headRefOid,mergeable,mergeStateStatus,files,url,mergedAt,reviews,statusCheckRollup"], cwd),
+    checkedGh(["api", `repos/${repo}/pulls/${task.prNumber}/comments`, "--paginate"], cwd),
+    checkedGh(["api", "graphql", "-f", `query=${THREAD_QUERY}`, "-F", `owner=${repo.split("/")[0]}`, "-F", `repo=${repo.split("/")[1]}`, "-F", `number=${task.prNumber}`], cwd),
+    gh(["pr", "checks", String(task.prNumber), "--repo", repo, "--required"], cwd),
   ]);
   return parsePullRequestReview(viewResult.stdout, commentsResult.stdout, threadsResult.stdout, requiredResult);
 }
@@ -289,10 +294,11 @@ export async function recoverExistingPullRequestTask(repoId: string, prNumber: n
     validateGitHubRemote(origin);
     const task: RepoTask = {
       id, repoId: repo.id, repoName: repo.name, repoPath: repo.path, allowedRoot, branch: pull.head, baseBranch: pull.base,
-      baseSha: await runGit(repo.path, ["rev-parse", "HEAD"]), originUrl: origin, worktreePath: repo.path, worktreeRoot,
+      baseSha: await runGit(repo.path, ["rev-parse", "HEAD"]), originUrl: origin, worktreePath: expectedWorktree, worktreeRoot,
       worktreeAvailable: false, status: "pr_created", prompt: "", reviewReady: false, approvalState: "unavailable",
       validation: [], secretFindings: [], commitSha: pull.headSha, prUrl: pull.url, prNumber: pull.number, originalTaskAvailable: false,
       error: "Task worktree is unavailable. Review intake is read-only; rework is disabled.",
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), recoveryStatus: "orphaned", worktreeStatus: "missing",
     };
     registerRecoveredTask(task);
     return publicTask(task);
@@ -314,6 +320,7 @@ export async function recoverExistingPullRequestTask(repoId: string, prNumber: n
     baseSha: await runGit(repo.path, ["rev-parse", "HEAD"]), originUrl: origin, worktreePath: worktree, worktreeRoot,
     worktreeAvailable: true, status: "pr_created", prompt: "", reviewReady: false, approvalState: "unavailable", validation: [], secretFindings: [],
     commitSha: pull.headSha, prUrl: pull.url, prNumber: pull.number, originalTaskAvailable: false,
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), recoveryStatus: "needs_attention", worktreeStatus: "available",
   };
   registerRecoveredTask(task);
   return publicTask(task);
@@ -321,7 +328,7 @@ export async function recoverExistingPullRequestTask(repoId: string, prNumber: n
 
 export async function fetchPullRequestDiff(task: RepoTask) {
   if (!task.prNumber) throw new Error("Pull request number is unavailable");
-  const result = await checkedGh(["pr", "diff", String(task.prNumber), "--repo", repositoryName(task), "--patch"], task.worktreePath);
+  const result = await checkedGh(["pr", "diff", String(task.prNumber), "--repo", repositoryName(task), "--patch"], task.worktreeAvailable ? task.worktreePath : task.repoPath);
   if (result.stdoutTruncated) throw new Error("PR diff exceeds the safe intake limit");
   return result.stdout;
 }
@@ -464,6 +471,15 @@ function repositoryName(task: RepoTask) {
   if (!task.originUrl) throw new Error("GitHub origin is unavailable");
   const remote = validateGitHubRemote(task.originUrl);
   return `${remote.owner}/${remote.repo}`;
+}
+
+async function reviewFingerprint(task: RepoTask) {
+  if (task.worktreeAvailable) return (await createDiffSnapshot(task)).hash;
+  const [head, status] = await Promise.all([
+    runGit(task.repoPath, ["rev-parse", "HEAD"]),
+    runGit(task.repoPath, ["status", "--porcelain=v1", "-z"]),
+  ]);
+  return createHash("sha256").update(head).update("\0").update(status).digest("hex");
 }
 
 async function getTaskDiffForReview(task: RepoTask) {

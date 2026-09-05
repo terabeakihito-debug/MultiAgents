@@ -4,6 +4,8 @@ import { homedir } from "node:os";
 import { join, relative, sep } from "node:path";
 import { runGit } from "./git";
 import { ALLOWED_ROOT, validateRepository } from "./repositories";
+import { getStateStore } from "./state-store";
+import type { FlowEvent, FlowStep, ReviewRerunEvent } from "../agents/types";
 import type { PrReviewIntake, PullRequestReview, ReworkFlowResult } from "./pr-review-types";
 
 export const WORKTREE_ROOT = join(homedir(), "code", ".multiagents-worktrees");
@@ -37,10 +39,13 @@ export type TaskStatus =
   | "approval_invalidated"
   | "commit_failed"
   | "push_failed"
-  | "pr_failed";
+  | "pr_failed"
+  | "archived";
 
 export type ApprovalState = "unavailable" | "pending" | "processing" | "invalidated" | "used";
 export type ApprovalPurpose = "create_pr" | "rework";
+export type RecoveryStatus = "recoverable" | "needs_attention" | "orphaned" | "invalid";
+export type WorktreeStatus = "available" | "missing" | "removed" | "invalid";
 export type ValidationCheck = { name: string; status: "pass" | "fail" | "skip"; detail?: string };
 export type SecretFinding = { path: string; kind: "filename" | "content" | "limit"; rule: string };
 
@@ -77,6 +82,15 @@ export type RepoTask = {
   latestPushedSha?: string;
   ciMessage?: string;
   error?: string;
+  createdAt: string;
+  updatedAt: string;
+  flowId?: string;
+  flowStatus?: string;
+  flowSteps?: FlowStep[];
+  finalOutput?: string;
+  recoveryStatus: RecoveryStatus;
+  recoveryMessage?: string;
+  worktreeStatus: WorktreeStatus;
 };
 
 export type TaskDiff = {
@@ -95,6 +109,8 @@ export const MAX_UNTRACKED_TOTAL_BYTES = 500_000;
 const MAX_UNTRACKED_FILES = 1_000;
 const EXCLUDED_PARTS = new Set([".git", ".next", "node_modules"]);
 const tasks = new Map<string, RepoTask>();
+let tasksLoaded = false;
+let recoveryPromise: Promise<void> | undefined;
 
 const transitions: Record<TaskStatus, readonly TaskStatus[]> = {
   draft: ["reviewed"],
@@ -125,9 +141,11 @@ const transitions: Record<TaskStatus, readonly TaskStatus[]> = {
   commit_failed: ["draft", "awaiting_approval", "awaiting_final_approval"],
   push_failed: ["pushing", "pushing_rework", "fetching_review"],
   pr_failed: ["creating_pr"],
+  archived: [],
 };
 
 export async function createTask(repoId: string, options: { allowedRoot?: string; worktreeRoot?: string } = {}): Promise<RepoTask> {
+  loadPersistedTasks();
   const allowedRoot = options.allowedRoot ?? ALLOWED_ROOT;
   const repo = await validateRepository(repoId, allowedRoot);
   if (repo.dirty) throw new Error("Repository has uncommitted changes. Commit or stash them before creating a worktree.");
@@ -161,24 +179,32 @@ export async function createTask(repoId: string, options: { allowedRoot?: string
     originalTaskAvailable: true,
     validation: [],
     secretFindings: [],
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    recoveryStatus: "recoverable",
+    worktreeStatus: "available",
   };
   tasks.set(id, task);
+  persistTask(task);
   return task;
 }
 
 export function getTask(id: string) {
+  loadPersistedTasks();
   if (!/^[0-9a-f-]{36}$/.test(id)) return undefined;
   return tasks.get(id);
 }
 
 export function listTasks() {
-  return [...tasks.values()];
+  loadPersistedTasks();
+  return [...tasks.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
 export function transitionTask(task: RepoTask, next: TaskStatus) {
   if (task.status === next) return;
   if (!transitions[task.status].includes(next)) throw new Error(`Invalid task transition: ${task.status} -> ${next}`);
   task.status = next;
+  persistTask(task);
 }
 
 export function beginTaskReview(task: RepoTask, prompt: string) {
@@ -192,6 +218,25 @@ export function beginTaskReview(task: RepoTask, prompt: string) {
   task.validation = [];
   task.secretFindings = [];
   task.error = undefined;
+  task.flowSteps = [];
+  task.flowStatus = "running";
+  task.finalOutput = "";
+  persistTask(task);
+}
+
+export function beginTaskRerun(task: RepoTask, prompt: string) {
+  if (task.commitSha || ["committing", "pushing", "creating_pr", "pr_created", "push_failed", "pr_failed"].includes(task.status)) {
+    throw new Error("This task can no longer rerun a review flow");
+  }
+  if (task.status !== "draft") transitionTask(task, "draft");
+  task.prompt = prompt;
+  task.reviewReady = false;
+  invalidateApproval(task);
+  task.validation = [];
+  task.secretFindings = [];
+  task.error = undefined;
+  task.flowStatus = "running";
+  persistTask(task);
 }
 
 export function completeTaskReview(task: RepoTask, finalReady: boolean) {
@@ -199,6 +244,7 @@ export function completeTaskReview(task: RepoTask, finalReady: boolean) {
   transitionTask(task, "reviewed");
   task.reviewReady = finalReady;
   if (finalReady) transitionTask(task, "awaiting_approval");
+  persistTask(task);
 }
 
 export function invalidateApproval(task: RepoTask) {
@@ -209,8 +255,15 @@ export function invalidateApproval(task: RepoTask) {
 }
 
 export function registerRecoveredTask(task: RepoTask) {
+  loadPersistedTasks();
   if (tasks.has(task.id)) throw new Error("Task is already registered");
+  const now = new Date().toISOString();
+  task.createdAt ||= now;
+  task.updatedAt ||= now;
+  task.recoveryStatus ||= task.worktreeAvailable ? "recoverable" : "orphaned";
+  task.worktreeStatus ||= task.worktreeAvailable ? "available" : "missing";
   tasks.set(task.id, task);
+  persistTask(task);
   return task;
 }
 
@@ -237,7 +290,41 @@ export function publicTask(task: RepoTask) {
     latestPushedSha: task.latestPushedSha,
     ciMessage: task.ciMessage,
     error: task.error,
+    prompt: task.prompt,
+    createdAt: task.createdAt,
+    updatedAt: task.updatedAt,
+    flowId: task.flowId,
+    flowStatus: task.flowStatus,
+    flowSteps: task.flowSteps ?? [],
+    finalOutput: task.finalOutput,
+    recoveryStatus: task.recoveryStatus,
+    recoveryMessage: task.recoveryMessage,
+    worktreeStatus: task.worktreeStatus,
   };
+}
+
+export function persistTask(task: RepoTask) { getStateStore().saveTask(task); }
+
+export function recordFlowEvent(task: RepoTask, event: FlowEvent | ReviewRerunEvent) {
+  if (event.type === "flow_started") {
+    task.flowId = event.flowId;
+    task.flowStatus = "running";
+  } else if (event.type === "rerun_started") {
+    task.flowId = event.flowId;
+    task.flowStatus = "running";
+  } else if ("step" in event) {
+    const steps = task.flowSteps ?? [];
+    const index = steps.findIndex((step) => step.id === event.step.id);
+    if (index >= 0) steps[index] = event.step;
+    else steps.push(event.step);
+    task.flowSteps = steps;
+  } else {
+    task.flowId = event.result.flowId;
+    task.flowStatus = event.result.status;
+    task.flowSteps = event.result.steps;
+    task.finalOutput = event.result.finalOutput;
+  }
+  persistTask(task);
 }
 
 export async function getTaskDiff(task: RepoTask): Promise<TaskDiff> {
@@ -320,7 +407,157 @@ export async function deleteTask(id: string) {
   const rel = relative(root, target);
   if (!rel || rel.startsWith(`..${sep}`) || rel === "..") throw new Error("Invalid worktree path");
   await runGit(task.repoPath, ["worktree", "remove", task.worktreePath]);
-  tasks.delete(id);
+  task.status = "archived";
+  task.worktreeAvailable = false;
+  task.worktreeStatus = "removed";
+  task.recoveryStatus = "recoverable";
+  task.recoveryMessage = "Task worktree was removed and the task was archived.";
+  invalidateApproval(task);
+  persistTask(task);
 }
 
-export function clearTasksForTests() { tasks.clear(); }
+export async function initializeTaskRecovery(options: { allowedRoot?: string; worktreeRoot?: string } = {}) {
+  loadPersistedTasks();
+  if (!recoveryPromise) recoveryPromise = recoverAllTasks(options.allowedRoot ?? ALLOWED_ROOT, options.worktreeRoot ?? WORKTREE_ROOT);
+  await recoveryPromise;
+}
+
+export async function resumeTask(id: string, options: { allowedRoot?: string; worktreeRoot?: string } = {}) {
+  loadPersistedTasks();
+  const task = tasks.get(id);
+  if (!task) return undefined;
+  await recoverTask(task, options.allowedRoot ?? ALLOWED_ROOT, options.worktreeRoot ?? WORKTREE_ROOT);
+  return task;
+}
+
+async function recoverAllTasks(allowedRoot: string, worktreeRoot: string) {
+  for (const task of tasks.values()) await recoverTask(task, allowedRoot, worktreeRoot);
+}
+
+async function recoverTask(task: RepoTask, allowedRoot: string, worktreeRoot: string) {
+  if (task.status === "archived" && task.worktreeStatus === "removed") {
+    task.worktreeAvailable = false;
+    task.recoveryStatus = "recoverable";
+    task.recoveryMessage = "Archived task; managed worktree was removed.";
+    persistTask(task);
+    return;
+  }
+  try {
+    const expectedRoot = await realpath(allowedRoot);
+    const savedRoot = await realpath(task.allowedRoot);
+    if (savedRoot !== expectedRoot) throw new Error("Saved allowed root does not match the server allowed root");
+    const expectedWorktreeRoot = await realpath(worktreeRoot);
+    const savedWorktreeRoot = await realpath(task.worktreeRoot);
+    if (savedWorktreeRoot !== expectedWorktreeRoot) throw new Error("Saved worktree root does not match the server-managed root");
+    const repo = await validateRepository(task.repoId, allowedRoot);
+    if (await realpath(task.repoPath) !== repo.path) throw new Error("Saved repository path does not match the allowed repository");
+    if (repo.branch !== task.baseBranch || await runGit(repo.path, ["rev-parse", "HEAD"]) !== task.baseSha) throw new Error("Base repository branch or HEAD changed after task creation");
+    const currentOrigin = await runGit(repo.path, ["remote", "get-url", "origin"]);
+    if (!task.originUrl || currentOrigin !== task.originUrl) throw new Error("Repository origin changed after task creation");
+
+    let worktreePath: string;
+    try { worktreePath = await realpath(task.worktreePath); }
+    catch {
+      task.worktreeAvailable = false;
+      task.worktreeStatus = "missing";
+      task.recoveryStatus = "orphaned";
+      task.recoveryMessage = task.prNumber
+        ? "PR review can be inspected, but local rework is unavailable because the managed worktree is missing."
+        : "Task worktree is missing. Manual recovery required.";
+      invalidateApprovalForRestart(task);
+      persistTask(task);
+      return;
+    }
+    const expectedPath = await realpath(join(expectedWorktreeRoot, task.repoId, task.id));
+    if (worktreePath !== expectedPath) throw new Error("Saved worktree path is not the server-managed task path");
+    const registered = (await runGit(repo.path, ["worktree", "list", "--porcelain"]))
+      .split("\n").some((line) => line === `worktree ${worktreePath}`);
+    if (!registered) throw new Error("Task worktree is not registered with Git");
+    if (await runGit(worktreePath, ["branch", "--show-current"]) !== task.branch) throw new Error("Task branch does not match the worktree");
+    if (await realpath(await runGit(worktreePath, ["rev-parse", "--show-toplevel"])) !== worktreePath) throw new Error("Invalid task worktree root");
+    if (await runGit(worktreePath, ["remote", "get-url", "origin"]) !== currentOrigin) throw new Error("Task worktree origin does not match the base repository");
+    const dotGit = await lstat(join(worktreePath, ".git"));
+    if (!dotGit.isFile() || dotGit.isSymbolicLink()) throw new Error("Unexpected .git entry in task worktree");
+    if (!TASK_BRANCH_PATTERN.test(task.branch) || task.branch !== `multiagents/${task.id}`) throw new Error("Invalid task branch");
+    const head = await runGit(worktreePath, ["rev-parse", "HEAD"]);
+    const expectedHead = task.commitSha ?? task.baseSha;
+    if (head !== expectedHead) throw new Error("Task branch HEAD does not match the persisted state");
+    if (task.prNumber) {
+      const coordinates = githubCoordinates(currentOrigin);
+      const expectedUrl = `https://github.com/${coordinates.owner}/${coordinates.repo}/pull/${task.prNumber}`;
+      if (task.prUrl !== expectedUrl) throw new Error("Persisted PR URL does not match the repository and PR number");
+      if (task.prReview && (task.prReview.number !== task.prNumber || task.prReview.base !== task.baseBranch || task.prReview.head !== task.branch)) {
+        throw new Error("Persisted PR metadata does not match the task");
+      }
+      const prHead = task.prReview?.headSha ?? task.latestPushedSha ?? task.commitSha;
+      if (prHead && task.commitSha && prHead !== task.commitSha) throw new Error("Persisted PR head SHA does not match the task commit");
+    }
+    task.worktreeAvailable = true;
+    task.worktreeStatus = "available";
+    const approvalWasInvalidated = invalidateApprovalForRestart(task)
+      || (task.approvalState === "invalidated" && ["approval_invalidated", "commit_failed"].includes(task.status));
+    task.recoveryStatus = approvalWasInvalidated || Boolean(task.prNumber) || ["ci_pending", "checking_ci", "fetching_review"].includes(task.status)
+      ? "needs_attention" : "recoverable";
+    task.recoveryMessage = approvalWasInvalidated
+      ? "Approval was invalidated after restart. Review the current diff and run validation again."
+      : task.prNumber ? "PR and CI state must be refreshed from GitHub." : undefined;
+    persistTask(task);
+  } catch (error) {
+    task.worktreeAvailable = false;
+    task.worktreeStatus = "invalid";
+    task.recoveryStatus = "invalid";
+    task.recoveryMessage = error instanceof Error ? error.message : "Task recovery validation failed";
+    invalidateApprovalForRestart(task);
+    persistTask(task);
+  }
+}
+
+function githubCoordinates(origin: string) {
+  const match = origin.match(/^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/)
+    ?? origin.match(/^git@github\.com:([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/);
+  if (!match) throw new Error("Persisted origin is not a supported GitHub repository");
+  return { owner: match[1], repo: match[2] };
+}
+
+function invalidateApprovalForRestart(task: RepoTask) {
+  const active = task.approvalState === "pending" || task.approvalState === "processing";
+  if (!active) return false;
+  task.approvalState = "invalidated";
+  task.approvalId = undefined;
+  if (["awaiting_approval", "validating"].includes(task.status)) task.status = "approval_invalidated";
+  else if (task.status === "awaiting_final_approval") task.status = "approval_invalidated";
+  else if (["committing", "committing_rework"].includes(task.status)) task.status = "commit_failed";
+  return true;
+}
+
+function loadPersistedTasks() {
+  if (tasksLoaded) return;
+  tasksLoaded = true;
+  for (const task of getStateStore().loadTasks()) {
+    if (task.flowStatus === "running") {
+      task.flowStatus = "aborted";
+      task.flowSteps = task.flowSteps?.map((step) => step.status === "running"
+        ? { ...step, status: "error", error: "Interrupted by server restart", completedAt: new Date().toISOString() }
+        : step);
+    }
+    invalidateApprovalForRestart(task);
+    task.recoveryStatus = "needs_attention";
+    task.recoveryMessage = "Pending startup recovery validation.";
+    tasks.set(task.id, task);
+    persistTask(task);
+  }
+}
+
+export function clearTasksForTests() {
+  tasks.clear();
+  tasksLoaded = true;
+  recoveryPromise = undefined;
+  getStateStore().clear();
+}
+
+export function reloadTasksFromStoreForTests() {
+  tasks.clear();
+  tasksLoaded = false;
+  recoveryPromise = undefined;
+  loadPersistedTasks();
+}
