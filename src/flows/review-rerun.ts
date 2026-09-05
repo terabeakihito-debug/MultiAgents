@@ -108,13 +108,18 @@ export async function rerunReviewStep(request: ReviewRerunRequest, options: Reru
   }
 }
 
-export function createReviewRerunStream(request: ReviewRerunRequest, requestSignal: AbortSignal, runner = rerunReviewStep, options: { cwd?: string } = {}) {
-  return createEventStream(requestSignal, ({ signal, send }) => runner(request, {
+export function createReviewRerunStream(request: ReviewRerunRequest, requestSignal: AbortSignal, runner = rerunReviewStep, options: { cwd?: string; onComplete?: (result: ReviewRerunResult) => void } = {}) {
+  const { onComplete, ...runnerOptions } = options;
+  return createEventStream(requestSignal, async ({ signal, send }) => {
+    const result = await runner(request, {
     signal,
     onEvent: (event) => send(event),
     log: (entry) => console.info("review_rerun", JSON.stringify(entry)),
-    ...options,
-  }), "review_rerun_event");
+    ...runnerOptions,
+    });
+    onComplete?.(result);
+    return result;
+  }, "review_rerun_event");
 }
 
 function buildRerunPrompt(prompt: string, stepId: RerunnableStepId, steps: FlowStep[]) {

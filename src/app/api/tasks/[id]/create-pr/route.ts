@@ -1,0 +1,16 @@
+import { ApprovalError, retryPullRequest } from "@/server/pull-request";
+import { rejectNonLocalRequest } from "@/server/request-security";
+
+export const runtime = "nodejs";
+
+export async function POST(request: Request, context: { params: Promise<{ id: string }> }) {
+  const rejection = rejectNonLocalRequest(request);
+  if (rejection) return rejection;
+  try {
+    const task = await retryPullRequest((await context.params).id);
+    return Response.json({ task });
+  } catch (error) {
+    const status = error instanceof ApprovalError ? error.statusCode : 409;
+    return Response.json({ error: error instanceof Error ? error.message : "PR retry failed" }, { status });
+  }
+}

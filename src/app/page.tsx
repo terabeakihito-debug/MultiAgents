@@ -10,8 +10,24 @@ const roleLabels = { draft: "Draft", review: "Review", final: "Final" } as const
 type Mode = "parallel" | "review";
 type CardState = { status: AgentStatus; output: string; error?: string };
 type Repo = { id: string; name: string; branch: string; dirty: boolean };
-type RepoTask = { id: string; repoId: string; repoName: string; branch: string };
-type TaskDiff = { trackedFiles: string[]; untrackedFiles: string[]; stat: string; patch: string; untrackedPatch: string; truncated: boolean };
+type OpenPull = { number: number; title: string; url: string; draft: boolean; base: string; head: string; headSha: string };
+type ValidationCheck = { name: string; status: "pass" | "fail" | "skip"; detail?: string };
+type SecretFinding = { path: string; kind: "filename" | "content" | "limit"; rule: string };
+type PrCheck = { name: string; state: string; bucket: "pass" | "fail" | "pending" | "skipping" | "unknown"; required: boolean; workflow?: string; link?: string };
+type PrItem = { id: string; kind: "review" | "comment" | "thread" | "check"; author: string; body: string; state?: string; path?: string; line?: number; url?: string; resolved?: boolean; disposition: "informational" | "action_required" | "blocking" | "resolved"; reason: string; potentiallyAddressed?: boolean };
+type PrStep = { id: string; agent: AgentId; status: "completed" | "error" | "skipped"; output: string; error?: string };
+type PrReview = { number: number; title: string; url: string; state: string; draft: boolean; merged: boolean; base: string; head: string; headSha: string; mergeable: string; mergeStateStatus: string; changedFiles: Array<{ path: string; additions: number; deletions: number }>; checks: PrCheck[]; items: PrItem[]; reviewCount: number; unresolvedCount: number; fetchedAt: string };
+type PrIntake = { status: "completed" | "error"; steps: PrStep[]; requiresRework: boolean; readyForHumanMerge: boolean };
+type RepoTask = {
+  id: string; repoId: string; repoName: string; branch: string; baseBranch: string; status: string; approvalState: string;
+  approvalPurpose?: "create_pr" | "rework"; validation: ValidationCheck[]; secretFindings: SecretFinding[]; commitSha?: string; prUrl?: string; prNumber?: number;
+  prReview?: PrReview; reviewIntake?: PrIntake; originalTaskAvailable: boolean; worktreeAvailable: boolean; latestPushedSha?: string; ciMessage?: string; error?: string;
+};
+type TaskDiff = {
+  trackedFiles: string[]; untrackedFiles: string[]; stat: string; patch: string; untrackedPatch: string;
+  truncated: boolean; approvable: boolean; blockedReason?: string;
+};
+type Approval = { diffHash?: string; approvalId?: string; blockedReason?: string };
 const initialCards = (): Record<AgentId, CardState> => ({ codex: { status: "idle", output: "" }, cursor: { status: "idle", output: "" }, claude: { status: "idle", output: "" } });
 const initialSteps = (): FlowStep[] => [
   { id: "codex_draft", agent: "codex", role: "draft", status: "idle", output: "" },
@@ -32,8 +48,13 @@ export default function Home() {
   const [sending, setSending] = useState(false);
   const [repos, setRepos] = useState<Repo[]>([]);
   const [repoId, setRepoId] = useState("");
+  const [openPulls, setOpenPulls] = useState<OpenPull[]>([]);
   const [task, setTask] = useState<RepoTask | null>(null);
   const [taskDiff, setTaskDiff] = useState<TaskDiff | null>(null);
+  const [approval, setApproval] = useState<Approval | null>(null);
+  const [reviewedDiff, setReviewedDiff] = useState(false);
+  const [approvalProcessing, setApprovalProcessing] = useState(false);
+  const [reviewProcessing, setReviewProcessing] = useState(false);
   const [taskError, setTaskError] = useState("");
   const sendingRef = useRef(false);
   const flowAbortRef = useRef<AbortController | null>(null);
@@ -45,8 +66,26 @@ export default function Home() {
     setRepos(data.repos || []); setRepoId((current) => current || data.repos?.[0]?.id || "");
   }).catch((error) => setTaskError(message(error))); }, []);
 
+  useEffect(() => { void fetch("/api/tasks").then(async (response) => {
+    const data = await response.json() as { tasks?: RepoTask[]; error?: string };
+    if (!response.ok) throw new Error(data.error || "Could not restore tasks");
+    const active = data.tasks?.find((item) => item.status !== "pr_created") ?? data.tasks?.[0];
+    if (!active) return;
+    setTask(active);
+    setRepoId(active.repoId);
+    setMode("review");
+    if (!active.worktreeAvailable) return;
+    const detailResponse = await fetch(`/api/tasks/${active.id}`);
+    const detail = await detailResponse.json() as { diff?: TaskDiff; task?: RepoTask; approval?: Approval; error?: string };
+    if (!detailResponse.ok || !detail.diff) throw new Error(detail.error || "Could not restore task diff");
+    setTaskDiff(detail.diff);
+    if (detail.task) setTask(detail.task);
+    setApproval(detail.approval ?? null);
+    setReviewedDiff(false);
+  }).catch((error) => setTaskError(message(error))); }, []);
+
   async function createIsolatedTask() {
-    setTaskError(""); setTaskDiff(null);
+    setTaskError(""); setTaskDiff(null); setApproval(null); setReviewedDiff(false); setOpenPulls([]);
     try {
       const response = await fetch("/api/tasks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repoId }) });
       const data = await response.json() as { task?: RepoTask; error?: string };
@@ -55,12 +94,41 @@ export default function Home() {
     } catch (error) { setTaskError(message(error)); }
   }
 
+  async function loadOpenPulls() {
+    if (!repoId || reviewProcessing) return;
+    setReviewProcessing(true); setTaskError("");
+    try {
+      const response = await fetch(`/api/repos/${encodeURIComponent(repoId)}/pulls`);
+      const data = await response.json() as { pulls?: OpenPull[]; error?: string };
+      if (!response.ok) throw new Error(data.error || "Could not list pull requests");
+      setOpenPulls(data.pulls ?? []);
+    } catch (error) { setTaskError(message(error)); }
+    finally { setReviewProcessing(false); }
+  }
+
+  async function recoverPull(prNumber: number) {
+    if (!repoId || reviewProcessing) return;
+    setReviewProcessing(true); setTaskError("");
+    try {
+      const response = await fetch("/api/tasks/recover-pr", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repoId, prNumber }) });
+      const data = await response.json() as { task?: RepoTask; error?: string };
+      if (!response.ok || !data.task) throw new Error(data.error || "PR task recovery failed");
+      setTask(data.task); setMode("review"); setOpenPulls([]); if (data.task.worktreeAvailable) await refreshDiff(data.task);
+    } catch (error) { setTaskError(message(error)); }
+    finally { setReviewProcessing(false); }
+  }
+
   async function refreshDiff(activeTask = task) {
     if (!activeTask) return;
     const response = await fetch(`/api/tasks/${activeTask.id}`);
-    const data = await response.json() as { diff?: TaskDiff; error?: string };
+    const data = await response.json() as { diff?: TaskDiff; task?: RepoTask; approval?: Approval; error?: string };
     if (!response.ok || !data.diff) throw new Error(data.error || "Could not load diff");
+    const previousHash = approval?.diffHash;
+    const previousApprovalId = approval?.approvalId;
     setTaskDiff(data.diff);
+    if (data.task) setTask(data.task);
+    setApproval(data.approval ?? null);
+    if (!data.approval?.diffHash || data.approval.diffHash !== previousHash || data.approval.approvalId !== previousApprovalId) setReviewedDiff(false);
   }
 
   async function deleteWorktree() {
@@ -68,7 +136,7 @@ export default function Home() {
     setTaskError("");
     const response = await fetch(`/api/tasks/${task.id}`, { method: "DELETE" });
     if (!response.ok) { const data = await response.json() as { error?: string }; setTaskError(data.error || "Cleanup failed"); return; }
-    setTask(null); setTaskDiff(null);
+    setTask(null); setTaskDiff(null); setApproval(null); setReviewedDiff(false);
   }
 
   async function submit(event: FormEvent) {
@@ -149,6 +217,7 @@ export default function Home() {
         for (const streamEvent of parser.push(decoder.decode(value, { stream: !done }))) applyRerunEvent(streamEvent as ReviewRerunEvent);
         if (done) break;
       }
+      if (task) await refreshDiff(task);
     } catch (error) {
       const aborted = abortController.signal.aborted;
       setSteps((current) => current.map((step) => step.id === stepId
@@ -185,17 +254,112 @@ export default function Home() {
 
   function cancelFlow() { flowAbortRef.current?.abort(new Error("Cancelled by user")); }
 
+  async function approveFinalDiff() {
+    if (!task || !reviewedDiff || !approval?.diffHash || !approval.approvalId || approvalProcessing) return;
+    setApprovalProcessing(true);
+    setTaskError("");
+    const poll = setInterval(() => {
+      void fetch(`/api/tasks/${task.id}`).then(async (response) => {
+        const data = await response.json() as { task?: RepoTask };
+        if (response.ok && data.task) setTask(data.task);
+      }).catch(() => undefined);
+    }, 1_000);
+    try {
+      const rework = task.approvalPurpose === "rework";
+      const response = await fetch(`/api/tasks/${task.id}/${rework ? "approve-rework" : "approve"}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ approved: true, diffHash: approval.diffHash, approvalId: approval.approvalId }),
+      });
+      const data = await response.json() as { task?: RepoTask; error?: string };
+      if (!response.ok || !data.task) throw new Error(data.error || (rework ? "Rework approval failed" : "Approve and create PR failed"));
+      setTask(data.task);
+      setApproval(null);
+      setReviewedDiff(false);
+    } catch (error) {
+      setTaskError(message(error));
+      try { await refreshDiff(task); } catch { /* retain the operation error */ }
+    } finally {
+      clearInterval(poll);
+      setApprovalProcessing(false);
+    }
+  }
+
+  async function fetchPrReview() {
+    if (!task || reviewProcessing) return;
+    setReviewProcessing(true); setTaskError("");
+    try {
+      const response = await fetch(`/api/tasks/${task.id}/fetch-review`, { method: "POST" });
+      const data = await response.json() as { task?: RepoTask; error?: string };
+      if (!response.ok || !data.task) throw new Error(data.error || "PR review fetch failed");
+      setTask(data.task); setReviewedDiff(false);
+    } catch (error) { setTaskError(message(error)); }
+    finally { setReviewProcessing(false); }
+  }
+
+  async function applyReviewFixes() {
+    if (!task || reviewProcessing) return;
+    setReviewProcessing(true); setTaskError("");
+    try {
+      const response = await fetch(`/api/tasks/${task.id}/apply-review`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ approved: true }) });
+      const data = await response.json() as { task?: RepoTask; error?: string };
+      if (!response.ok || !data.task) throw new Error(data.error || "PR rework failed");
+      setTask(data.task); await refreshDiff(data.task);
+    } catch (error) { setTaskError(message(error)); }
+    finally { setReviewProcessing(false); }
+  }
+
+  async function retryPr() {
+    if (!task || approvalProcessing) return;
+    setApprovalProcessing(true);
+    setTaskError("");
+    try {
+      const response = await fetch(`/api/tasks/${task.id}/create-pr`, { method: "POST" });
+      const data = await response.json() as { task?: RepoTask; error?: string };
+      if (!response.ok || !data.task) throw new Error(data.error || "PR retry failed");
+      setTask(data.task);
+    } catch (error) { setTaskError(message(error)); }
+    finally { setApprovalProcessing(false); }
+  }
+
   return <main>
     <header><h1>MultiAgents</h1><p>Parallel answers or a fixed, reviewed response from local AI CLIs.</p></header>
-    <section className="repoPanel"><label htmlFor="repository">Repository</label><div className="repoControls"><select id="repository" value={repoId} disabled={sending || Boolean(task)} onChange={(event) => setRepoId(event.target.value)}>{repos.map((repo) => <option key={repo.id} value={repo.id}>{repo.name}{repo.dirty ? " (dirty)" : ""}</option>)}</select><button type="button" disabled={!repoId || sending || Boolean(task)} onClick={createIsolatedTask}>Create isolated task</button></div>{task && <div className="taskReady"><div><strong>Repo:</strong> {task.repoName}</div><div><strong>Branch:</strong> <code>{task.branch}</code></div><div><strong>Worktree:</strong> ready</div><button type="button" className="delete" onClick={deleteWorktree} disabled={sending}>Delete task worktree</button></div>}{taskError && <ErrorBlock error={taskError} />}</section>
+    <section className="repoPanel"><label htmlFor="repository">Repository</label><div className="repoControls"><select id="repository" value={repoId} disabled={sending || Boolean(task)} onChange={(event) => { setRepoId(event.target.value); setOpenPulls([]); }}>{repos.map((repo) => <option key={repo.id} value={repo.id}>{repo.name}{repo.dirty ? " (dirty)" : ""}</option>)}</select><button type="button" disabled={!repoId || sending || Boolean(task)} onClick={createIsolatedTask}>Create isolated task</button><button type="button" disabled={!repoId || sending || reviewProcessing || Boolean(task)} onClick={loadOpenPulls}>{reviewProcessing ? "Loading…" : "Find open PRs"}</button></div>{!task && openPulls.length > 0 && <div className="openPulls"><h3>Open PRs from this repository origin</h3>{openPulls.map((pull) => <div className="openPull" key={pull.number}><span>#{pull.number} {pull.title} · <code>{pull.head}</code></span><button type="button" disabled={reviewProcessing} onClick={() => recoverPull(pull.number)}>Open review intake</button></div>)}</div>}{task && <div className="taskReady"><div><strong>Repo:</strong> {task.repoName}</div><div><strong>Branch:</strong> <code>{task.branch}</code></div><div><strong>State:</strong> <code>{task.status}</code></div><div><strong>Worktree:</strong> {task.worktreeAvailable ? "ready" : "unavailable (review-only)"}</div><button type="button" className="delete" onClick={deleteWorktree} disabled={sending || approvalProcessing || reviewProcessing || Boolean(task.commitSha)}>Delete task worktree</button></div>}{taskError && <ErrorBlock error={taskError} />}</section>
     <form onSubmit={submit}>
       <fieldset className="modes" disabled={sending}><legend>Mode</legend><label><input type="radio" checked={mode === "parallel"} onChange={() => setMode("parallel")} /> Parallel</label><label><input type="radio" checked={mode === "review"} onChange={() => setMode("review")} /> Review Flow</label></fieldset>
       <label htmlFor="prompt">Prompt</label>
       <textarea id="prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} maxLength={20_000} rows={6} placeholder="Ask Codex, Cursor, and Claude…" />
       <div className="actions"><span>{prompt.length.toLocaleString()} / 20,000</span><div className="actionButtons">{sending && mode === "review" && <button className="cancel" type="button" onClick={cancelFlow}>Cancel</button>}<button type="submit" disabled={sending || !prompt.trim()}>{sending ? "Running…" : mode === "parallel" ? "Send to all" : "Run review flow"}</button></div></div>
     </form>
-    {mode === "parallel" ? <section className="cards" aria-label="Agent responses">{agentIds.map((id) => <AgentCard key={id} name={labels[id]} state={cards[id]} />)}</section> : <FlowTimeline steps={steps} status={flowStatus} finalOutput={finalOutput} sending={sending} activeRerun={activeRerun} onRerun={rerunStep} />}{taskDiff && <section className="diff card"><h2>Task diff</h2><h3>Tracked changed files</h3><pre>{taskDiff.trackedFiles.join("\n") || "None."}</pre><h3>Untracked files</h3><pre>{taskDiff.untrackedFiles.join("\n") || "None."}</pre><h3>Changed lines</h3><pre>{taskDiff.stat || "No tracked changes."}</pre><h3>Diff / body</h3><pre>{[taskDiff.patch, taskDiff.untrackedPatch].filter(Boolean).join("\n\n") || "No changes."}</pre>{taskDiff.truncated && <p className="staleReason">Untracked content was truncated at the safe display limit.</p>}</section>}
+    {mode === "parallel" ? <section className="cards" aria-label="Agent responses">{agentIds.map((id) => <AgentCard key={id} name={labels[id]} state={cards[id]} />)}</section> : <FlowTimeline steps={steps} status={flowStatus} finalOutput={finalOutput} sending={sending} activeRerun={activeRerun} onRerun={rerunStep} />}
+    {taskDiff && <section className="diff card"><h2>Final Diff</h2><h3>Tracked changed files</h3><pre>{taskDiff.trackedFiles.join("\n") || "None."}</pre><h3>Untracked files</h3><pre>{taskDiff.untrackedFiles.join("\n") || "None."}</pre><h3>Changed lines</h3><pre>{taskDiff.stat || "No tracked changes."}</pre><details><summary>View full diff</summary><pre>{[taskDiff.patch, taskDiff.untrackedPatch].filter(Boolean).join("\n\n") || "No changes."}</pre></details>{taskDiff.blockedReason && <p className="staleReason">{taskDiff.blockedReason}</p>}
+      {(task?.validation.length || approvalProcessing) && <div className="validation"><h3>Pre-PR Validation</h3>{task?.validation.map((check, index) => <div className="validationRow" key={`${check.name}-${index}`}><span>{check.name}</span><Status value={check.status} /><span>{check.detail}</span></div>)}{approvalProcessing && <p>Server-side checks and PR creation are running…</p>}</div>}
+      {task?.secretFindings.length ? <div className="error"><strong>Secret scan findings</strong><ul>{task.secretFindings.map((finding, index) => <li key={`${finding.path}-${finding.rule}-${index}`}><code>{finding.path}</code>: {finding.rule}</li>)}</ul></div> : null}
+      {approval?.diffHash && approval.approvalId && <div className="approval"><p><strong>Diff hash:</strong> <code>{approval.diffHash}</code></p><label><input type="checkbox" checked={reviewedDiff} disabled={sending || approvalProcessing} onChange={(event) => setReviewedDiff(event.target.checked)} /> {task?.approvalPurpose === "rework" ? "I reviewed the revised final diff" : "I reviewed the final diff"}</label><button type="button" disabled={!reviewedDiff || sending || approvalProcessing} onClick={approveFinalDiff}>{approvalProcessing ? "Validating…" : task?.approvalPurpose === "rework" ? "Approve & Update Existing PR" : "Approve & Create PR"}</button></div>}
+      {approval?.blockedReason && <p className="staleReason">{approval.blockedReason}</p>}
+      {task?.status === "pr_failed" && <button type="button" className="rerun" disabled={approvalProcessing} onClick={retryPr}>Retry PR creation</button>}
+      {task?.status === "pr_created" && task.prUrl && <div className="prCreated"><h3>PR CREATED</h3><p><strong>Branch:</strong> <code>{task.branch}</code></p><p><strong>Commit:</strong> <code>{task.commitSha}</code></p><p><strong>Pull Request:</strong> #{task.prNumber} <a href={task.prUrl} target="_blank" rel="noreferrer">{task.prUrl}</a></p><p>The task worktree is retained. No merge was attempted.</p></div>}
+    </section>}
+    {task?.prNumber && <PrReviewPanel task={task} processing={reviewProcessing} onFetch={fetchPrReview} onApply={applyReviewFixes} />}
   </main>;
+}
+
+function PrReviewPanel({ task, processing, onFetch, onApply }: { task: RepoTask; processing: boolean; onFetch: () => void; onApply: () => void }) {
+  const review = task.prReview;
+  const actionable = review?.items.filter((item) => item.disposition === "action_required").length ?? 0;
+  const blocking = review?.items.filter((item) => item.disposition === "blocking").length ?? 0;
+  const informational = review?.items.filter((item) => item.disposition === "informational").length ?? 0;
+  return <section className="card prReview"><div className="cardHeader"><h2>PR Review Intake</h2><button type="button" disabled={processing || ["reworking", "reviewing_rework", "validating", "committing_rework", "pushing_rework", "checking_ci"].includes(task.status)} onClick={onFetch}>{processing ? "Working…" : review ? "Refresh review" : "Fetch review"}</button></div>
+    {review && <><h3>Pull Request #{review.number}</h3><p><a href={review.url} target="_blank" rel="noreferrer">{review.title}</a></p><div className="prGrid"><span><strong>{review.state}</strong>{review.draft ? " · DRAFT" : ""}</span><span>Base: <code>{review.base}</code></span><span>Head: <code>{review.head}</code></span><span>SHA: <code>{review.headSha.slice(0, 12)}</code></span><span>Mergeable: {review.mergeable} / {review.mergeStateStatus}</span><span>Unresolved threads: {review.unresolvedCount}</span></div>
+      <h3>Checks</h3>{review.checks.length ? review.checks.map((check) => <div className="validationRow" key={`${check.name}-${check.state}`}><span>{check.name}{check.required ? " (required)" : ""}</span><Status value={check.bucket} /><span>{check.state}</span></div>) : <p>No checks reported.</p>}
+      <h3>Changed files</h3><pre>{review.changedFiles.map((file) => `${file.path}  +${file.additions} -${file.deletions}`).join("\n") || "None."}</pre>
+      <h3>Reviews and findings</h3><p>Action required: {actionable} · Blocking: {blocking} · Informational: {informational}</p>{review.items.length ? review.items.map((item) => <article className="reviewItem" key={item.id}><div><Status value={item.disposition} /> <strong>{item.author}</strong> · {item.kind}{item.state ? ` · ${item.state}` : ""}{item.path ? <> · <code>{item.path}{item.line ? `:${item.line}` : ""}</code></> : null}</div><p>{item.reason}{item.potentiallyAddressed ? " · Potentially addressed; resolve manually on GitHub." : ""}</p>{item.body && <pre>{item.body}</pre>}</article>) : <p>No review comments.</p>}
+    </>}
+    {task.reviewIntake && <div className="intake"><h3>Fixed intake flow</h3>{task.reviewIntake.steps.map((step, index) => <article className="reviewItem" key={step.id}><div><strong>{index + 1}. {labels[step.agent]}</strong> — {step.id.replaceAll("_", " ")} <Status value={step.status} /></div>{step.error && <ErrorBlock error={step.error} />}<pre>{step.output || "No output."}</pre></article>)}</div>}
+    {task.status === "awaiting_rework_approval" && <div className="approval"><p><strong>Confirmed/actionable issues:</strong> {actionable + blocking}</p><p>Rework starts only after this human gate. Review text remains untrusted data.</p><button type="button" disabled={processing || !task.originalTaskAvailable || !task.worktreeAvailable} onClick={onApply}>{processing ? "Running rework…" : "Apply reviewed fixes"}</button>{(!task.originalTaskAvailable || !task.worktreeAvailable) && <p className="staleReason">Original task context or the managed worktree was lost after restart; automatic rework is disabled.</p>}</div>}
+    {task.ciMessage && <p className={task.status === "ci_failed" ? "error" : "staleReason"}>{task.ciMessage}</p>}
+    {task.status === "ready_for_human_merge" && <div className="prCreated"><h3>READY_FOR_HUMAN_MERGE</h3><p>Ready for human merge. Open PR on GitHub.</p><p>No merge, auto-merge, approval, thread resolution, branch deletion, or deploy was attempted.</p></div>}
+  </section>;
 }
 
 function AgentCard({ name, state }: { name: string; state: CardState }) { return <article className="card"><div className="cardHeader"><h2>{name}</h2><Status value={state.status} /></div>{state.error && <ErrorBlock error={state.error} />}<pre className="output">{state.output || fallback(state.status)}</pre></article>; }

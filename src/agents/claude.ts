@@ -6,11 +6,18 @@ import { workspaceDirectory } from "./workspace";
 const CLAUDE_HOME = process.env.HOME || homedir();
 const CLAUDE_BINARY = join(CLAUDE_HOME, ".local", "bin", "claude");
 
+export function claudeArgs(prompt: string, _cwd: string, repositoryTask: boolean, writeAccess: boolean) {
+  return [
+    ...(repositoryTask && !writeAccess ? ["--permission-mode", "plan", "--tools", "Read,Glob,Grep"] : []),
+    "-p", prompt,
+  ];
+}
+
 export const claudeAgent = createAgentAdapter({
   id: "claude",
   name: "Claude",
   binary: CLAUDE_BINARY,
-  args: (prompt) => ["-p", prompt],
+  args: claudeArgs,
 }, {
   cwd: workspaceDirectory,
   env: {

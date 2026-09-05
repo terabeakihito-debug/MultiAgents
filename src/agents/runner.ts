@@ -28,7 +28,7 @@ function runProcess(
   definition: AgentDefinition,
   prompt: string,
   options: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number; spawnProcess?: SpawnLike },
-  runOptions?: { signal?: AbortSignal; cwd?: string },
+  runOptions?: { signal?: AbortSignal; cwd?: string; writeAccess?: boolean },
 ): Promise<AgentResult> {
   return new Promise((resolve) => {
     const spawnProcess = options.spawnProcess ?? spawn;
@@ -44,7 +44,9 @@ function runProcess(
 
     let child;
     try {
-      child = spawnProcess(definition.binary, definition.args(prompt, cwd), spawnOptions);
+      // A per-run cwd is supplied only after a server-side repository task lookup.
+      // It is intentionally a boolean capability, not a client-selectable sandbox value.
+      child = spawnProcess(definition.binary, definition.args(prompt, cwd, Boolean(runOptions?.cwd), runOptions?.writeAccess ?? Boolean(runOptions?.cwd)), spawnOptions);
     } catch (error) {
       resolve(errorResult(definition.id, error));
       return;

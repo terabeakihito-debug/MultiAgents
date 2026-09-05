@@ -14,10 +14,10 @@ export type AgentDefinition = {
   id: AgentId;
   name: string;
   binary: string;
-  args: (prompt: string, cwd: string) => string[];
+  args: (prompt: string, cwd: string, repositoryTask: boolean, writeAccess: boolean) => string[];
 };
 
-export type AgentRunOptions = { signal?: AbortSignal; cwd?: string };
+export type AgentRunOptions = { signal?: AbortSignal; cwd?: string; writeAccess?: boolean };
 
 export type AgentAdapter = {
   id: AgentId;

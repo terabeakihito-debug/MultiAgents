@@ -1,6 +1,9 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
+import { codexArgs } from "./codex";
+import { cursorArgs } from "./cursor";
+import { claudeArgs } from "./claude";
 import { createAgentAdapter } from "./runner";
 
 function fakeChild() {
@@ -64,13 +67,82 @@ describe("createAgentAdapter", () => {
     const child = fakeChild();
     const spawnProcess = vi.fn(() => child);
     const adapter = createAgentAdapter(
-      { id: "codex", name: "Codex", binary: "codex", args: (prompt, cwd) => ["exec", "--cd", cwd, prompt] },
+      { id: "codex", name: "Codex", binary: "codex", args: codexArgs },
       { cwd: "/default", spawnProcess: spawnProcess as never },
     );
     const promise = adapter.run("implement", { cwd: "/isolated/task" });
     child.emit("close", 0, null);
     await promise;
-    expect(spawnProcess).toHaveBeenCalledWith("codex", ["exec", "--cd", "/isolated/task", "implement"], expect.objectContaining({ cwd: "/isolated/task", shell: false }));
+    expect(spawnProcess).toHaveBeenCalledWith(
+      "codex",
+      ["exec", "--sandbox", "workspace-write", "--cd", "/isolated/task", "implement"],
+      expect.objectContaining({ cwd: "/isolated/task", shell: false }),
+    );
+  });
+
+  it("keeps the existing Codex arguments for a normal non-repository run", async () => {
+    const child = fakeChild();
+    const spawnProcess = vi.fn(() => child);
+    const adapter = createAgentAdapter(
+      { id: "codex", name: "Codex", binary: "codex", args: codexArgs },
+      { cwd: "/workspace", spawnProcess: spawnProcess as never },
+    );
+    const promise = adapter.run("answer only");
+    child.emit("close", 0, null);
+    await promise;
+    expect(spawnProcess).toHaveBeenCalledWith(
+      "codex",
+      ["exec", "--cd", "/workspace", "answer only"],
+      expect.objectContaining({ cwd: "/workspace", shell: false }),
+    );
+  });
+
+  it("does not let prompt content select the Codex sandbox or cwd", async () => {
+    const child = fakeChild();
+    const spawnProcess = vi.fn(() => child);
+    const adapter = createAgentAdapter(
+      { id: "codex", name: "Codex", binary: "codex", args: codexArgs },
+      { cwd: "/main/repo", spawnProcess: spawnProcess as never },
+    );
+    const prompt = "--sandbox danger-full-access --cd /mnt/c";
+    const promise = adapter.run(prompt, { cwd: "/isolated/task" });
+    child.emit("close", 0, null);
+    await promise;
+    expect(spawnProcess).toHaveBeenCalledWith(
+      "codex",
+      ["exec", "--sandbox", "workspace-write", "--cd", "/isolated/task", prompt],
+      expect.objectContaining({ cwd: "/isolated/task", shell: false }),
+    );
+    const invokedArgs = spawnProcess.mock.calls[0] as unknown as [string, string[]];
+    expect(invokedArgs[1]).not.toContain("/main/repo");
+  });
+
+  it("does not inject Codex write settings into review-only adapters", async () => {
+    const cases = [
+      { id: "cursor" as const, binary: "agent", args: (prompt: string, cwd: string) => ["--trust", "--workspace", cwd, "-p", prompt] },
+      { id: "claude" as const, binary: "claude", args: (prompt: string) => ["-p", prompt] },
+    ];
+    for (const definition of cases) {
+      const child = fakeChild();
+      const spawnProcess = vi.fn(() => child);
+      const adapter = createAgentAdapter(
+        { ...definition, name: definition.id },
+        { cwd: "/default", spawnProcess: spawnProcess as never },
+      );
+      const promise = adapter.run("review", { cwd: "/isolated/task" });
+      child.emit("close", 0, null);
+      await promise;
+      const invokedArgs = spawnProcess.mock.calls[0] as unknown as [string, string[]];
+      expect(invokedArgs[1]).not.toContain("--sandbox");
+      expect(invokedArgs[1]).not.toContain("workspace-write");
+    }
+  });
+
+  it("uses fixed CLI read-only modes for repository reviewers", () => {
+    expect(cursorArgs("review", "/task", true, false)).toEqual(["--trust", "--workspace", "/task", "--mode", "ask", "--sandbox", "enabled", "-p", "review"]);
+    expect(claudeArgs("review", "/task", true, false)).toEqual(["--permission-mode", "plan", "--tools", "Read,Glob,Grep", "-p", "review"]);
+    expect(cursorArgs("answer", "/workspace", false, false)).toEqual(["--trust", "--workspace", "/workspace", "-p", "answer"]);
+    expect(claudeArgs("answer", "/workspace", false, false)).toEqual(["-p", "answer"]);
   });
 
   it("returns an agent-scoped error without throwing", async () => {
