@@ -192,7 +192,7 @@ Phase 8, Phase 10, and Phase 11 use SQLite from Node.js itself; they do not add 
 ORM. State is stored at `~/.multiagents/state.db`, outside every repository.
 The directory is forced to mode `0700` and the database file to `0600` when it
 is opened. Schema migrations are tracked in `schema_version`; the current
-schema is version 5. The v1→v2, v2→v3, v3→v4, and v4→v5 migrations run transactionally and
+schema is version 6. The v1→v2, v2→v3, v3→v4, v4→v5, and v5→v6 migrations run transactionally and
 preserve existing task and flow-step snapshots. Existing tasks receive a
 `safe_default` v1 profile snapshot during the v3 migration and a compatible
 `Bug Fix` v1 template snapshot during the v4 migration.
@@ -350,6 +350,51 @@ task. A per-finding server lock plus a SQLite unique constraint prevents a
 second implementation task. Converted findings cannot be reopened in this
 phase. No extraction, acceptance, dismissal, or conversion operation performs
 a GitHub write.
+
+## Remediation Queue
+
+The dashboard's **Findings** tab is a cross-repository Remediation Queue backed
+directly by SQLite. By default it includes open, accepted, and converted
+findings and excludes dismissed and human-resolved findings. Rows contain only
+bounded operational fields: finding title/category/affected paths, repository,
+source template, status, linked implementation state, validated PR metadata,
+age, remediation stage, and next action. Finding summaries, evidence, full
+agent output, review bodies, credentials, and tokens are not returned by the
+queue endpoint.
+
+Recommended ordering is deterministic server policy, never an AI decision. It
+sorts lexicographically by human priority (`urgent`, `high`, `normal`, `low`),
+severity (`critical`, `high`, `medium`, `low`, `info`), stage urgency
+(accepted without a task, needs attention, untriaged, active implementation,
+awaiting approval, PR open, ready for human merge, merged candidate), oldest
+creation time, and finding ID. Thus stage cannot promote a lower-severity row
+over a higher-severity row at the same human priority. Human Priority defaults
+to `normal`; only a confirmed same-origin localhost UI action can change it,
+and each change appends a `finding_priority_changed` event. Agents and finding
+content cannot set or modify it.
+
+The server derives remediation stage and next action from the finding, source
+task, implementation task, recovery/worktree state, and persisted PR state.
+Missing or inconsistent links, invalid snapshots, unavailable worktrees, and
+failed recovery states become **Needs Attention** with `manual_recovery`.
+Repository, severity, human priority, finding status, stage, PR presence,
+conversion presence, dismissed/resolved inclusion, bounded search, sorting,
+limit, and offset are all applied in SQLite. Search covers title, category,
+repository name, affected path, and PR number.
+
+The queue never polls GitHub. It displays stored PR state; **Refresh PR** is an
+explicit finding-scoped action routed through the linked task's existing
+read-only PR refresh. An open, merge-ready PR still requires a human merge on
+GitHub. A persisted merged PR produces `resolved_candidate`, not automatic
+resolution. **Mark resolved** is a separate confirmed same-origin human action
+and is accepted only when the exact linked implementation task has a PR whose
+stored state confirms `MERGED`. It appends `finding_resolved`; there is no
+automatic priority change, conversion, remediation, resolution, merge, deploy,
+notification, or GitHub mutation from queue display.
+
+All Remediation Queue routes remain localhost-only. Mutation routes are blocked
+while an agent process is active, reject arbitrary priorities and linkage, and
+require the exact same-origin human-action signal.
 
 ## Verification
 

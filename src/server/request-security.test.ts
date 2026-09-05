@@ -60,4 +60,15 @@ describe("rejectNonHumanFindingMutation", () => {
     expect(rejectNonHumanFindingMutation(humanUi, "finding-convert")?.status).toBe(423);
     end();
   });
+
+  it("requires distinct human signals for priority and resolution", () => {
+    const headers = { host: "localhost:3000", origin: "http://localhost:3000", "sec-fetch-site": "same-origin" };
+    const priorityUrl = "http://localhost:3000/api/findings/11111111-1111-4111-8111-111111111111/priority";
+    const wrong = new Request(priorityUrl, { method: "POST", headers: { ...headers, "x-multiagents-human-action": "finding-resolve" } });
+    expect(rejectNonHumanFindingMutation(wrong, "finding-priority")?.status).toBe(403);
+    const priority = new Request(priorityUrl, { method: "POST", headers: { ...headers, "x-multiagents-human-action": "finding-priority" } });
+    expect(rejectNonHumanFindingMutation(priority, "finding-priority")).toBeUndefined();
+    const resolve = new Request(priorityUrl.replace("priority", "resolve"), { method: "POST", headers: { ...headers, "x-multiagents-human-action": "finding-resolve" } });
+    expect(rejectNonHumanFindingMutation(resolve, "finding-resolve")).toBeUndefined();
+  });
 });

@@ -28,7 +28,7 @@ export function rejectNonHumanTemplateMutation(request: Request): Response | und
   return rejectNonHumanMutation(request, "template-save", "Task template");
 }
 
-export function rejectNonHumanFindingMutation(request: Request, action: "finding-extract" | "finding-accept" | "finding-dismiss" | "finding-convert"): Response | undefined {
+export function rejectNonHumanFindingMutation(request: Request, action: "finding-extract" | "finding-accept" | "finding-dismiss" | "finding-convert" | "finding-priority" | "finding-resolve"): Response | undefined {
   return rejectNonHumanMutation(request, action, "Finding");
 }
 

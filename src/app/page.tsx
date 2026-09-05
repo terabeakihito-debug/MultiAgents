@@ -7,7 +7,7 @@ import { acquireRunLock, releaseRunLock } from "./run-lock";
 import { TaskDashboard } from "./task-dashboard";
 import { agentRoles, validationSteps, type ProjectProfile, type ProjectProfileSnapshot, type RolePolicy, type ValidationPolicy, type ValidationStep } from "@/profiles/policy";
 import type { RepoTemplateSettings, TaskTemplate, TaskTemplateSnapshot } from "@/templates/policy";
-import type { Finding } from "@/findings/types";
+import { humanPriorities, type Finding, type FindingEvent, type HumanPriority, type RemediationQueueItem } from "@/findings/types";
 
 const labels: Record<AgentId, string> = { codex: "Codex", cursor: "Cursor", claude: "Claude" };
 const roleLabels = { draft: "Draft", review: "Review", final: "Final" } as const;
@@ -43,6 +43,7 @@ type StepVersion = { id: string; taskId: string; stepId: FlowStep["id"]; version
 type DiffVersion = { id: string; taskId: string; version: number; diffHash: string; changedFileCount: number; additions: number; deletions: number; createdAt: string };
 type ApprovalEvent = { id: string; sequence: number; taskId: string; approvalId: string; type: string; purpose: string; diffHash: string; createdAt: string; status?: string };
 type TaskHistory = { events: TaskEvent[]; stepVersions: StepVersion[]; diffVersions: DiffVersion[]; approvalEvents: ApprovalEvent[] };
+type FindingDetail = Finding & { remediation?: RemediationQueueItem; history?: FindingEvent[] };
 const emptyHistory = (): TaskHistory => ({ events: [], stepVersions: [], diffVersions: [], approvalEvents: [] });
 const initialCards = (): Record<AgentId, CardState> => ({ codex: { status: "idle", output: "" }, cursor: { status: "idle", output: "" }, claude: { status: "idle", output: "" } });
 const initialSteps = (): FlowStep[] => [
@@ -76,7 +77,7 @@ export default function Home() {
   const [taskError, setTaskError] = useState("");
   const [taskHistory, setTaskHistory] = useState<TaskHistory>(emptyHistory);
   const [historyTitle, setHistoryTitle] = useState("");
-  const [findings, setFindings] = useState<Finding[]>([]);
+  const [findings, setFindings] = useState<FindingDetail[]>([]);
   const sendingRef = useRef(false);
   const flowAbortRef = useRef<AbortController | null>(null);
   const currentFlowIdRef = useRef("");
@@ -98,7 +99,7 @@ export default function Home() {
 
   async function loadTaskFindings(taskId: string) {
     const response = await fetch(`/api/tasks/${taskId}/findings`);
-    const data = await response.json() as { findings?: Finding[]; error?: string };
+    const data = await response.json() as { findings?: FindingDetail[]; error?: string };
     if (!response.ok || !data.findings) throw new Error(data.error || "Could not load findings");
     setFindings(data.findings);
   }
@@ -401,9 +402,9 @@ export default function Home() {
 function FindingsPanel({ task, templates, findings, busy, onFindings, onOpenTask, onHistoryRefresh, onDashboardRefresh, onError }: {
   task: RepoTask;
   templates: TaskTemplate[];
-  findings: Finding[];
+  findings: FindingDetail[];
   busy: boolean;
-  onFindings: (findings: Finding[]) => void;
+  onFindings: (findings: FindingDetail[]) => void;
   onOpenTask: (taskId: string) => void;
   onHistoryRefresh: () => void;
   onDashboardRefresh: () => void;
@@ -414,12 +415,13 @@ function FindingsPanel({ task, templates, findings, busy, onFindings, onOpenTask
   const [conversion, setConversion] = useState<Finding | null>(null);
   const [conversionTemplate, setConversionTemplate] = useState("bug_fix");
   const [objective, setObjective] = useState("");
+  const [priorityDrafts, setPriorityDrafts] = useState<Record<string, HumanPriority>>({});
 
   async function extract() {
     setProcessing("extract"); onError("");
     try {
       const response = await fetch(`/api/tasks/${task.id}/findings/extract`, { method: "POST", headers: { "Content-Type": "application/json", "X-MultiAgents-Human-Action": "finding-extract" }, body: JSON.stringify({ confirmed: true }) });
-      const data = await response.json() as { findings?: Finding[]; error?: string };
+      const data = await response.json() as { findings?: FindingDetail[]; error?: string };
       if (!response.ok || !data.findings) throw new Error(data.error || "Finding extraction failed");
       onFindings(data.findings); onHistoryRefresh();
     } catch (error) { onError(message(error)); }
@@ -440,9 +442,9 @@ function FindingsPanel({ task, templates, findings, busy, onFindings, onOpenTask
         headers: { "Content-Type": "application/json", "X-MultiAgents-Human-Action": `finding-${action}` },
         body: JSON.stringify(action === "accept" ? { confirmed: true } : { confirmed: true, reason }),
       });
-      const data = await response.json() as { finding?: Finding; error?: string };
+      const data = await response.json() as { finding?: Finding; remediation?: RemediationQueueItem; history?: FindingEvent[]; error?: string };
       if (!response.ok || !data.finding) throw new Error(data.error || `Finding ${action} failed`);
-      onFindings(findings.map((item) => item.findingId === data.finding!.findingId ? data.finding! : item)); onHistoryRefresh();
+      onFindings(findings.map((item) => item.findingId === data.finding!.findingId ? { ...data.finding!, remediation: data.remediation, history: data.history } : item)); onHistoryRefresh();
     } catch (error) { onError(message(error)); }
     finally { setProcessing(""); }
   }
@@ -463,10 +465,42 @@ function FindingsPanel({ task, templates, findings, busy, onFindings, onOpenTask
         headers: { "Content-Type": "application/json", "X-MultiAgents-Human-Action": "finding-convert" },
         body: JSON.stringify({ confirmed: true, templateId: conversionTemplate, objective }),
       });
-      const data = await response.json() as { finding?: Finding; task?: RepoTask; error?: string };
+      const data = await response.json() as { finding?: Finding; task?: RepoTask; remediation?: RemediationQueueItem; history?: FindingEvent[]; error?: string };
       if (!response.ok || !data.finding || !data.task) throw new Error(data.error || "Finding conversion failed");
-      onFindings(findings.map((item) => item.findingId === data.finding!.findingId ? data.finding! : item));
+      onFindings(findings.map((item) => item.findingId === data.finding!.findingId ? { ...data.finding!, remediation: data.remediation, history: data.history } : item));
       setConversion(null); onHistoryRefresh(); onDashboardRefresh();
+    } catch (error) { onError(message(error)); }
+    finally { setProcessing(""); }
+  }
+
+  async function savePriority(finding: FindingDetail) {
+    const priority = priorityDrafts[finding.findingId] ?? finding.humanPriority;
+    setProcessing(finding.findingId); onError("");
+    try {
+      const response = await fetch(`/api/findings/${finding.findingId}/priority`, {
+        method: "POST", headers: { "Content-Type": "application/json", "X-MultiAgents-Human-Action": "finding-priority" },
+        body: JSON.stringify({ confirmed: true, priority }),
+      });
+      const data = await response.json() as { finding?: Finding; remediation?: RemediationQueueItem; history?: FindingEvent[]; error?: string };
+      if (!response.ok || !data.finding) throw new Error(data.error || "Finding priority update failed");
+      onFindings(findings.map((item) => item.findingId === finding.findingId ? { ...data.finding!, remediation: data.remediation, history: data.history } : item));
+      onDashboardRefresh();
+    } catch (error) { onError(message(error)); }
+    finally { setProcessing(""); }
+  }
+
+  async function resolveFinding(finding: FindingDetail) {
+    if (!window.confirm("Mark this finding resolved after its merged PR?")) return;
+    setProcessing(finding.findingId); onError("");
+    try {
+      const response = await fetch(`/api/findings/${finding.findingId}/resolve`, {
+        method: "POST", headers: { "Content-Type": "application/json", "X-MultiAgents-Human-Action": "finding-resolve" },
+        body: JSON.stringify({ confirmed: true }),
+      });
+      const data = await response.json() as { finding?: Finding; remediation?: RemediationQueueItem; history?: FindingEvent[]; error?: string };
+      if (!response.ok || !data.finding) throw new Error(data.error || "Finding resolution failed");
+      onFindings(findings.map((item) => item.findingId === finding.findingId ? { ...data.finding!, remediation: data.remediation, history: data.history } : item));
+      onDashboardRefresh();
     } catch (error) { onError(message(error)); }
     finally { setProcessing(""); }
   }
@@ -480,11 +514,18 @@ function FindingsPanel({ task, templates, findings, busy, onFindings, onOpenTask
       {finding.category ? <p><strong>Category:</strong> {finding.category}</p> : null}
       {finding.affectedPaths?.length ? <div><strong>Affected (hints):</strong><ul>{finding.affectedPaths.map((path) => <li key={path}><code>{path}</code></li>)}</ul></div> : null}
       {finding.evidence ? <details><summary>Evidence</summary><pre>{finding.evidence}</pre></details> : null}
+      <div className="findingRemediation">
+        <label>Human Priority<select value={priorityDrafts[finding.findingId] ?? finding.humanPriority} disabled={busy || Boolean(processing) || Boolean(finding.resolvedAt)} onChange={(event) => setPriorityDrafts((current) => ({ ...current, [finding.findingId]: event.target.value as HumanPriority }))}>{humanPriorities.map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
+        <button type="button" className="secondary compactButton" disabled={busy || Boolean(processing) || (priorityDrafts[finding.findingId] ?? finding.humanPriority) === finding.humanPriority || Boolean(finding.resolvedAt)} onClick={() => void savePriority(finding)}>Save priority</button>
+        {finding.remediation ? <dl><div><dt>Stage</dt><dd>{finding.remediation.remediationStage}</dd></div><div><dt>Next action</dt><dd>{finding.remediation.nextAction}</dd></div><div><dt>Linked task</dt><dd>{finding.remediation.implementationTaskId ? <code>{finding.remediation.implementationTaskId}</code> : "Not created"}</dd></div><div><dt>Linked PR</dt><dd>{finding.remediation.prNumber ? `#${finding.remediation.prNumber} · ${finding.remediation.prState || "stored"}` : "None"}</dd></div></dl> : null}
+      </div>
       <div className="findingActions">
         {finding.status === "open" ? <><button type="button" disabled={busy || Boolean(processing)} onClick={() => void changeStatus(finding, "accept")}>Accept</button><button type="button" className="secondary" disabled={busy || Boolean(processing)} onClick={() => void changeStatus(finding, "dismiss")}>Dismiss</button></> : null}
         {["open", "accepted"].includes(finding.status) ? <button type="button" disabled={busy || Boolean(processing) || safeTemplates.length === 0} onClick={() => openConversion(finding)}>Create implementation task</button> : null}
         {finding.convertedTaskId ? <button type="button" className="secondary" onClick={() => onOpenTask(finding.convertedTaskId!)}>Open implementation task</button> : null}
+        {finding.remediation?.nextAction === "mark_resolved" ? <button type="button" disabled={busy || Boolean(processing)} onClick={() => void resolveFinding(finding)}>Mark resolved</button> : null}
       </div>
+      {finding.history?.length ? <details className="findingHistory"><summary>Finding history ({finding.history.length})</summary><ol>{finding.history.map((event) => <li key={event.id}><time>{new Date(event.createdAt).toLocaleString()}</time> · {event.type} · {event.actor}{event.previousHumanPriority && event.humanPriority ? ` · ${event.previousHumanPriority} → ${event.humanPriority}` : ""}</li>)}</ol></details> : null}
     </article>)}</div> : <p className="muted">Run and complete the read-only review, then explicitly extract structured findings.</p>}
     {conversion ? <div className="dialogBackdrop" role="presentation"><section className="cleanupDialog conversionDialog" role="dialog" aria-modal="true" aria-labelledby="conversion-title"><span className="eyebrow">Human approval required</span><h2 id="conversion-title">Create implementation task?</h2><dl><div><dt>Finding</dt><dd>{conversion.title}</dd></div><div><dt>Severity</dt><dd>{conversion.severity.toUpperCase()}</dd></div><div><dt>Repository</dt><dd>{task.repoName}</dd></div></dl><label>Target template<select value={conversionTemplate} onChange={(event) => setConversionTemplate(event.target.value)}>{safeTemplates.map((template) => <option key={template.templateId} value={template.templateId}>{template.name}</option>)}</select></label><label>Human-approved objective<textarea rows={4} maxLength={20_000} value={objective} onChange={(event) => setObjective(event.target.value)} /></label><p>This creates a new isolated task in the same repository. The finding text is wrapped as untrusted context, and the current project profile is re-evaluated.</p><div className="dialogActions"><button type="button" className="secondary" disabled={Boolean(processing)} onClick={() => setConversion(null)}>Cancel</button><button type="button" disabled={Boolean(processing) || !conversionTemplate || !objective.trim()} onClick={() => void convert()}>{processing ? "Creating…" : "Create task"}</button></div></section></div> : null}
   </section>;

@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { taskBuckets, type DashboardCounts, type DashboardResponse, type DashboardTask, type TaskBucket } from "@/dashboard/types";
+import { RemediationQueue } from "./remediation-queue";
 
 type Repo = { id: string; name: string };
 type Props = {
@@ -30,7 +31,18 @@ const taskStatuses = [
   "pr_failed", "archived",
 ] as const;
 
-export function TaskDashboard({ repos, busy, refreshToken, onResume, onHistory, onError }: Props) {
+export function TaskDashboard(props: Props) {
+  const [view, setView] = useState<"tasks" | "findings">("tasks");
+  return <section className="dashboardShell">
+    <div className="dashboardTabs" role="tablist" aria-label="Operations dashboard">
+      <button type="button" role="tab" aria-selected={view === "tasks"} className={view === "tasks" ? "selected" : ""} onClick={() => setView("tasks")}>Tasks</button>
+      <button type="button" role="tab" aria-selected={view === "findings"} className={view === "findings" ? "selected" : ""} onClick={() => setView("findings")}>Findings</button>
+    </div>
+    {view === "tasks" ? <TaskDashboardContent {...props} /> : <RemediationQueue repos={props.repos} busy={props.busy} refreshToken={props.refreshToken} onOpenTask={props.onResume} onHistory={props.onHistory} onError={props.onError} />}
+  </section>;
+}
+
+function TaskDashboardContent({ repos, busy, refreshToken, onResume, onHistory, onError }: Props) {
   const [tasks, setTasks] = useState<DashboardTask[]>([]);
   const [counts, setCounts] = useState<DashboardCounts>(emptyCounts);
   const [bucket, setBucket] = useState<TaskBucket | "">("");

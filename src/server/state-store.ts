@@ -8,11 +8,22 @@ import type { DashboardCounts, DashboardSort, PrFilter, TaskBucket } from "../da
 import { parseProfileSnapshot, safeDefaultSnapshot, type ProjectProfile, type ProjectProfileSnapshot } from "../profiles/policy";
 import { builtInTemplates, mergeTemplateWithProfile, parseTemplateSnapshot, snapshotTemplate, type RepoTemplateSettings, type TaskTemplate, type TaskTemplateSnapshot } from "../templates/policy";
 import type { RepoTask } from "./tasks";
-import { findingEventTypes, type Finding, type FindingEvent, type FindingEventType } from "../findings/types";
+import {
+  findingEventTypes,
+  type Finding,
+  type FindingEvent,
+  type FindingEventType,
+  type HumanPriority,
+  type RemediationPresenceFilter,
+  type RemediationQueueCounts,
+  type RemediationQueueItem,
+  type RemediationQueueSort,
+  type RemediationStage,
+} from "../findings/types";
 
 export const STATE_DIRECTORY = join(homedir(), ".multiagents");
 export const STATE_DATABASE = join(STATE_DIRECTORY, "state.db");
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 const MAX_STORED_PROMPT_CHARS = 20_000;
 const MAX_STORED_OUTPUT_CHARS = 1_000_000;
 
@@ -127,6 +138,23 @@ export type DashboardRow = {
   sourceTaskId?: string;
 };
 
+export type RemediationQueueQuery = {
+  repo?: string;
+  severity?: Finding["severity"];
+  priority?: HumanPriority;
+  status?: Finding["status"];
+  stage?: RemediationStage;
+  pr: RemediationPresenceFilter;
+  converted: RemediationPresenceFilter;
+  search?: string;
+  sort: RemediationQueueSort;
+  includeDismissed: boolean;
+  includeResolved: boolean;
+  limit: number;
+  offset: number;
+  findingId?: string;
+};
+
 export type ProfileAuditEventType = "profile_created" | "profile_updated" | "profile_assigned" | "profile_snapshot_created";
 export type ProjectProfileVersion = { profileId: string; version: number; changedAt: string; changedFields: string[]; actor: "user"; snapshot: ProjectProfileSnapshot };
 export type TemplateAuditEventType = "template_enabled" | "template_disabled" | "default_template_changed" | "template_snapshot_created";
@@ -159,6 +187,50 @@ const DASHBOARD_BUCKET_SQL = `CASE
     OR flow_status = 'running' THEN 'active'
   ELSE 'needs_attention'
 END`;
+
+const SAFE_IMPLEMENTATION_PR_REVIEW_SQL = "CASE WHEN json_valid(i.payload_json) THEN json_extract(i.payload_json, '$.prReview') ELSE NULL END";
+const REMEDIATION_STAGE_SQL = `CASE
+  WHEN f.resolved_at IS NOT NULL THEN 'resolved'
+  WHEN f.status = 'dismissed' THEN 'dismissed'
+  WHEN s.task_id IS NULL THEN 'needs_attention'
+  WHEN s.template_id IS NULL OR s.template_version IS NULL OR NOT json_valid(s.template_snapshot_json) THEN 'needs_attention'
+  WHEN f.status = 'converted' AND (f.converted_task_id IS NULL OR i.task_id IS NULL) THEN 'needs_attention'
+  WHEN i.task_id IS NOT NULL AND (i.source_finding_id IS NULL OR i.source_finding_id <> f.finding_id OR i.source_task_id <> f.source_task_id) THEN 'needs_attention'
+  WHEN i.task_id IS NOT NULL AND (${SAFE_IMPLEMENTATION_PR_REVIEW_SQL} IS NOT NULL)
+    AND (COALESCE(json_extract(${SAFE_IMPLEMENTATION_PR_REVIEW_SQL}, '$.merged'), 0) = 1 OR upper(COALESCE(json_extract(${SAFE_IMPLEMENTATION_PR_REVIEW_SQL}, '$.state'), '')) = 'MERGED')
+    THEN 'resolved_candidate'
+  WHEN i.task_id IS NOT NULL AND (
+    i.recovery_status IN ('needs_attention','orphaned','invalid') OR i.worktree_status IN ('missing','invalid')
+    OR i.status IN ('review_fetch_failed','rework_failed','ci_failed','validation_failed','secret_scan_failed','approval_invalidated','commit_failed','push_failed','pr_failed')
+    OR (i.pr_number IS NOT NULL AND upper(COALESCE(json_extract(${SAFE_IMPLEMENTATION_PR_REVIEW_SQL}, '$.state'), 'OPEN')) = 'CLOSED')
+    OR i.template_id IS NULL OR i.template_version IS NULL OR NOT json_valid(i.template_snapshot_json)
+  ) THEN 'needs_attention'
+  WHEN f.status = 'accepted' AND i.task_id IS NULL THEN 'implementation_not_created'
+  WHEN f.status = 'open' AND i.task_id IS NULL THEN 'untriaged'
+  WHEN f.status = 'accepted' THEN 'accepted'
+  WHEN i.merge_readiness = 'ready_for_human_merge' AND i.pr_number IS NOT NULL THEN 'ready_for_human_merge'
+  WHEN i.pr_number IS NOT NULL THEN 'pr_open'
+  WHEN i.status IN ('awaiting_approval','awaiting_final_approval') THEN 'awaiting_approval'
+  WHEN i.task_id IS NOT NULL THEN 'implementation_active'
+  ELSE 'needs_attention'
+END`;
+
+const REMEDIATION_BASE_SQL = `WITH remediation_base AS (
+  SELECT
+    f.*, s.repo_id, s.repo_name, s.template_version AS source_template_version,
+    CASE WHEN json_valid(s.template_snapshot_json) THEN json_extract(s.template_snapshot_json, '$.name') END AS source_template_name,
+    s.origin_url AS source_origin_url,
+    i.task_id AS implementation_task_id, i.status AS implementation_task_status,
+    i.recovery_status AS implementation_recovery_status, i.recovery_message AS implementation_recovery_message,
+    i.worktree_status AS implementation_worktree_status, i.source_finding_id AS implementation_source_finding_id,
+    i.source_task_id AS implementation_source_task_id,
+    i.pr_number, i.pr_url, i.origin_url AS implementation_origin_url, i.merge_readiness,
+    CASE WHEN json_valid(i.payload_json) THEN json_extract(i.payload_json, '$.prReview.state') END AS pr_state,
+    ${REMEDIATION_STAGE_SQL} AS remediation_stage
+  FROM findings f
+  LEFT JOIN tasks s ON s.task_id = f.source_task_id
+  LEFT JOIN tasks i ON i.task_id = f.converted_task_id
+)`;
 
 export class StateStore {
   readonly path: string;
@@ -316,6 +388,62 @@ export class StateStore {
     return { rows: raw.map(rowToDashboardRow), counts };
   }
 
+  queryRemediationQueue(input: RemediationQueueQuery, now = new Date()): { rows: RemediationQueueItem[]; counts: RemediationQueueCounts } {
+    const filters: string[] = [];
+    const values: Array<string | number> = [];
+    if (!input.includeDismissed) filters.push("remediation_stage <> 'dismissed'");
+    if (!input.includeResolved) filters.push("remediation_stage <> 'resolved'");
+    if (input.findingId) { filters.push("finding_id = ?"); values.push(input.findingId); }
+    if (input.repo) { filters.push("repo_id = ?"); values.push(input.repo); }
+    if (input.severity) { filters.push("severity = ?"); values.push(input.severity); }
+    if (input.priority) { filters.push("human_priority = ?"); values.push(input.priority); }
+    if (input.status) { filters.push("status = ?"); values.push(input.status); }
+    if (input.stage) { filters.push("remediation_stage = ?"); values.push(input.stage); }
+    if (input.pr === "yes") filters.push("pr_number IS NOT NULL");
+    if (input.pr === "no") filters.push("pr_number IS NULL");
+    if (input.converted === "yes") filters.push("converted_task_id IS NOT NULL");
+    if (input.converted === "no") filters.push("converted_task_id IS NULL");
+    if (input.search) {
+      const pattern = `%${escapeLike(input.search.toLocaleLowerCase("en-US"))}%`;
+      const prPattern = `%${escapeLike(input.search.replace(/^#/, ""))}%`;
+      filters.push("(lower(title) LIKE ? ESCAPE '\\' OR lower(COALESCE(category, '')) LIKE ? ESCAPE '\\' OR lower(COALESCE(repo_name, '')) LIKE ? ESCAPE '\\' OR lower(COALESCE(affected_paths_json, '')) LIKE ? ESCAPE '\\' OR CAST(pr_number AS TEXT) LIKE ? ESCAPE '\\')");
+      values.push(pattern, pattern, pattern, pattern, prPattern);
+    }
+    const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+    const humanOrder = "CASE human_priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END";
+    const severityOrder = "CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END";
+    const stageOrder = "CASE remediation_stage WHEN 'implementation_not_created' THEN 0 WHEN 'needs_attention' THEN 1 WHEN 'untriaged' THEN 2 WHEN 'accepted' THEN 3 WHEN 'implementation_active' THEN 4 WHEN 'awaiting_approval' THEN 5 WHEN 'pr_open' THEN 6 WHEN 'ready_for_human_merge' THEN 7 WHEN 'resolved_candidate' THEN 8 WHEN 'resolved' THEN 9 ELSE 10 END";
+    const order = input.sort === "severity"
+      ? `${severityOrder}, ${humanOrder}, created_at ASC, finding_id ASC`
+      : input.sort === "age"
+        ? "created_at ASC, finding_id ASC"
+        : input.sort === "updated"
+          ? "updated_at DESC, finding_id ASC"
+          : input.sort === "repo"
+            ? `repo_name COLLATE NOCASE ASC, ${humanOrder}, ${severityOrder}, created_at ASC, finding_id ASC`
+            : `${humanOrder}, ${severityOrder}, ${stageOrder}, created_at ASC, finding_id ASC`;
+    const count = this.database.prepare(`${REMEDIATION_BASE_SQL}
+      SELECT COUNT(*) AS total,
+        COALESCE(SUM(CASE WHEN severity = 'critical' THEN 1 ELSE 0 END), 0) AS critical,
+        COALESCE(SUM(CASE WHEN severity = 'high' THEN 1 ELSE 0 END), 0) AS high,
+        COALESCE(SUM(CASE WHEN remediation_stage = 'implementation_not_created' THEN 1 ELSE 0 END), 0) AS accepted_not_converted,
+        COALESCE(SUM(CASE WHEN remediation_stage = 'needs_attention' THEN 1 ELSE 0 END), 0) AS needs_attention,
+        COALESCE(SUM(CASE WHEN remediation_stage = 'ready_for_human_merge' THEN 1 ELSE 0 END), 0) AS ready_for_merge
+      FROM remediation_base ${where}
+    `).get(...values) as Record<string, unknown>;
+    const raw = this.database.prepare(`${REMEDIATION_BASE_SQL}
+      SELECT * FROM remediation_base ${where} ORDER BY ${order} LIMIT ? OFFSET ?
+    `).all(...values, input.limit, input.offset) as TaskRow[];
+    return {
+      rows: raw.map((row) => rowToRemediationQueueItem(row, now)),
+      counts: {
+        total: Number(count.total), critical: Number(count.critical), high: Number(count.high),
+        acceptedNotConverted: Number(count.accepted_not_converted), needsAttention: Number(count.needs_attention),
+        readyForMerge: Number(count.ready_for_merge),
+      },
+    };
+  }
+
   clearForTests() {
     this.transaction(() => {
       this.dropAppendOnlyTriggers();
@@ -377,13 +505,14 @@ export class StateStore {
 
   createFindings(findings: Finding[]) {
     const insert = this.database.prepare(`
-      INSERT INTO findings (finding_id, source_task_id, title, summary, severity, category, affected_paths_json, evidence, status, created_at, updated_at, converted_task_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO findings (finding_id, source_task_id, title, summary, severity, category, affected_paths_json, evidence, status, human_priority, created_at, updated_at, converted_task_id, resolved_at, resolved_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     for (const finding of findings) insert.run(
       finding.findingId, finding.sourceTaskId, finding.title, finding.summary, finding.severity,
       finding.category ?? null, finding.affectedPaths ? JSON.stringify(finding.affectedPaths) : null,
-      finding.evidence ?? null, finding.status, finding.createdAt, finding.updatedAt, finding.convertedTaskId ?? null,
+      finding.evidence ?? null, finding.status, finding.humanPriority ?? "normal", finding.createdAt, finding.updatedAt,
+      finding.convertedTaskId ?? null, finding.resolvedAt ?? null, finding.resolvedBy ?? null,
     );
   }
 
@@ -404,17 +533,31 @@ export class StateStore {
     return this.loadFinding(findingId)!;
   }
 
-  appendFindingEvent(finding: Pick<Finding, "findingId" | "sourceTaskId">, input: { type: FindingEventType; actor: FindingEvent["actor"]; createdAt?: string; reason?: string; convertedTaskId?: string }) {
+  updateFindingPriority(findingId: string, priority: HumanPriority) {
+    const result = this.database.prepare("UPDATE findings SET human_priority = ?, updated_at = ? WHERE finding_id = ? AND resolved_at IS NULL")
+      .run(priority, new Date().toISOString(), findingId);
+    if (Number(result.changes) !== 1) throw new Error("Finding priority cannot be changed");
+    return this.loadFinding(findingId)!;
+  }
+
+  resolveFinding(findingId: string, resolvedAt: string) {
+    const result = this.database.prepare("UPDATE findings SET resolved_at = ?, resolved_by = 'user', updated_at = ? WHERE finding_id = ? AND resolved_at IS NULL")
+      .run(resolvedAt, resolvedAt, findingId);
+    if (Number(result.changes) !== 1) throw new Error("Finding is already resolved or unavailable");
+    return this.loadFinding(findingId)!;
+  }
+
+  appendFindingEvent(finding: Pick<Finding, "findingId" | "sourceTaskId">, input: { type: FindingEventType; actor: FindingEvent["actor"]; createdAt?: string; reason?: string; convertedTaskId?: string; previousHumanPriority?: HumanPriority; humanPriority?: HumanPriority }) {
     if (!findingEventTypes.includes(input.type)) throw new Error("Finding event type is invalid");
     if (!['user', 'system'].includes(input.actor)) throw new Error("Finding event actor is invalid");
     if (input.reason !== undefined && (typeof input.reason !== "string" || input.reason.length > 1_000)) throw new Error("Finding dismissal reason is invalid");
     const id = randomUUID();
     const createdAt = input.createdAt ?? new Date().toISOString();
     const result = this.database.prepare(`
-      INSERT INTO finding_events (event_id, finding_id, source_task_id, event_type, actor, created_at, reason, converted_task_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(id, finding.findingId, finding.sourceTaskId, input.type, input.actor, createdAt, input.reason?.trim() || null, input.convertedTaskId ?? null);
-    return { id, sequence: Number(result.lastInsertRowid), findingId: finding.findingId, sourceTaskId: finding.sourceTaskId, type: input.type, actor: input.actor, createdAt, reason: input.reason?.trim() || undefined, convertedTaskId: input.convertedTaskId } satisfies FindingEvent;
+      INSERT INTO finding_events (event_id, finding_id, source_task_id, event_type, actor, created_at, reason, converted_task_id, previous_human_priority, human_priority)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, finding.findingId, finding.sourceTaskId, input.type, input.actor, createdAt, input.reason?.trim() || null, input.convertedTaskId ?? null, input.previousHumanPriority ?? null, input.humanPriority ?? null);
+    return { id, sequence: Number(result.lastInsertRowid), findingId: finding.findingId, sourceTaskId: finding.sourceTaskId, type: input.type, actor: input.actor, createdAt, reason: input.reason?.trim() || undefined, convertedTaskId: input.convertedTaskId, previousHumanPriority: input.previousHumanPriority, humanPriority: input.humanPriority } satisfies FindingEvent;
   }
 
   loadFindingEvents(findingId: string): FindingEvent[] {
@@ -857,6 +1000,42 @@ export class StateStore {
       `);
       this.database.prepare("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)").run(5, new Date().toISOString());
     });
+    if (version < 5) version = 5;
+    if (version < 6) this.transaction(() => {
+      this.database.exec(`
+        DROP TRIGGER IF EXISTS finding_events_no_update;
+        DROP TRIGGER IF EXISTS finding_events_no_delete;
+        ALTER TABLE findings ADD COLUMN human_priority TEXT NOT NULL DEFAULT 'normal'
+          CHECK(human_priority IN ('urgent','high','normal','low'));
+        ALTER TABLE findings ADD COLUMN resolved_at TEXT;
+        ALTER TABLE findings ADD COLUMN resolved_by TEXT CHECK(resolved_by IS NULL OR resolved_by = 'user');
+        ALTER TABLE finding_events RENAME TO finding_events_v5;
+        CREATE TABLE finding_events (
+          sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+          event_id TEXT NOT NULL UNIQUE,
+          finding_id TEXT NOT NULL REFERENCES findings(finding_id),
+          source_task_id TEXT NOT NULL REFERENCES tasks(task_id),
+          event_type TEXT NOT NULL CHECK(event_type IN ('finding_created','finding_accepted','finding_dismissed','finding_conversion_requested','implementation_task_created','finding_priority_changed','finding_resolved')),
+          actor TEXT NOT NULL CHECK(actor IN ('user','system')),
+          created_at TEXT NOT NULL,
+          reason TEXT,
+          converted_task_id TEXT REFERENCES tasks(task_id),
+          previous_human_priority TEXT CHECK(previous_human_priority IS NULL OR previous_human_priority IN ('urgent','high','normal','low')),
+          human_priority TEXT CHECK(human_priority IS NULL OR human_priority IN ('urgent','high','normal','low'))
+        );
+        INSERT INTO finding_events(sequence, event_id, finding_id, source_task_id, event_type, actor, created_at, reason, converted_task_id)
+          SELECT sequence, event_id, finding_id, source_task_id, event_type, actor, created_at, reason, converted_task_id FROM finding_events_v5;
+        DROP TABLE finding_events_v5;
+        CREATE INDEX finding_events_finding_order_idx ON finding_events(finding_id, sequence);
+        CREATE INDEX findings_status_idx ON findings(status);
+        CREATE INDEX findings_severity_idx ON findings(severity);
+        CREATE INDEX findings_human_priority_idx ON findings(human_priority);
+        CREATE INDEX findings_created_at_idx ON findings(created_at);
+        CREATE INDEX findings_converted_task_idx ON findings(converted_task_id);
+        CREATE INDEX findings_resolved_at_idx ON findings(resolved_at);
+      `);
+      this.database.prepare("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)").run(6, new Date().toISOString());
+    });
     this.createAppendOnlyTriggers();
   }
 
@@ -976,8 +1155,10 @@ function rowToFinding(row: TaskRow): Finding {
   return {
     findingId: String(row.finding_id), sourceTaskId: String(row.source_task_id), title: String(row.title), summary: String(row.summary),
     severity: String(row.severity) as Finding["severity"], category: optionalString(row.category), affectedPaths,
-    evidence: optionalString(row.evidence), status: String(row.status) as Finding["status"], createdAt: String(row.created_at),
+    evidence: optionalString(row.evidence), status: String(row.status) as Finding["status"],
+    humanPriority: (optionalString(row.human_priority) ?? "normal") as Finding["humanPriority"], createdAt: String(row.created_at),
     updatedAt: String(row.updated_at), convertedTaskId: optionalString(row.converted_task_id),
+    resolvedAt: optionalString(row.resolved_at), resolvedBy: optionalString(row.resolved_by) as Finding["resolvedBy"],
   };
 }
 function rowToFindingEvent(row: TaskRow): FindingEvent {
@@ -985,6 +1166,8 @@ function rowToFindingEvent(row: TaskRow): FindingEvent {
     id: String(row.event_id), sequence: Number(row.sequence), findingId: String(row.finding_id), sourceTaskId: String(row.source_task_id),
     type: String(row.event_type) as FindingEventType, actor: String(row.actor) as FindingEvent["actor"], createdAt: String(row.created_at),
     reason: optionalString(row.reason), convertedTaskId: optionalString(row.converted_task_id),
+    previousHumanPriority: optionalString(row.previous_human_priority) as FindingEvent["previousHumanPriority"],
+    humanPriority: optionalString(row.human_priority) as FindingEvent["humanPriority"],
   };
 }
 function parseJson(value: unknown): unknown { try { return JSON.parse(String(value)); } catch { return undefined; } }
@@ -1010,4 +1193,57 @@ function rowToDashboardRow(row: TaskRow): DashboardRow {
     templateId: optionalString(row.template_id), templateVersion: optionalNumber(row.template_version),
     sourceFindingId: optionalString(row.source_finding_id), sourceTaskId: optionalString(row.source_task_id),
   };
+}
+
+function rowToRemediationQueueItem(row: TaskRow, now: Date): RemediationQueueItem {
+  const stage = String(row.remediation_stage) as RemediationQueueItem["remediationStage"];
+  const status = optionalString(row.implementation_task_status);
+  const prNumber = optionalNumber(row.pr_number);
+  const rawPrUrl = optionalString(row.pr_url);
+  const originUrl = optionalString(row.implementation_origin_url) ?? optionalString(row.source_origin_url);
+  const prUrl = validatedStoredPrUrl(originUrl, prNumber, rawPrUrl);
+  const createdAt = String(row.created_at);
+  return {
+    findingId: String(row.finding_id), title: String(row.title), category: optionalString(row.category),
+    affectedPaths: row.affected_paths_json === null || row.affected_paths_json === undefined
+      ? undefined : array(parseJson(row.affected_paths_json)).filter((item): item is string => typeof item === "string"),
+    severity: String(row.severity) as Finding["severity"], humanPriority: String(row.human_priority) as HumanPriority,
+    repoId: optionalString(row.repo_id) ?? "", repoName: optionalString(row.repo_name) ?? "Missing source task",
+    sourceTaskId: String(row.source_task_id), sourceTemplateName: optionalString(row.source_template_name),
+    sourceTemplateVersion: optionalNumber(row.source_template_version), findingStatus: String(row.status) as Finding["status"],
+    remediationStage: stage, implementationTaskId: optionalString(row.implementation_task_id), implementationTaskStatus: status,
+    prNumber, prUrl, prState: optionalString(row.pr_state), mergeReadiness: optionalString(row.merge_readiness),
+    createdAt, updatedAt: String(row.updated_at), ageMs: Math.max(0, now.getTime() - Date.parse(createdAt)),
+    nextAction: remediationNextAction(stage, status), attentionReason: remediationAttentionReason(row, stage),
+    resolvedAt: optionalString(row.resolved_at), resolvedBy: optionalString(row.resolved_by) as Finding["resolvedBy"],
+  };
+}
+
+function remediationNextAction(stage: RemediationStage, taskStatus?: string): RemediationQueueItem["nextAction"] {
+  if (stage === "untriaged") return "accept_or_dismiss";
+  if (stage === "accepted" || stage === "implementation_not_created") return "create_implementation_task";
+  if (stage === "needs_attention") return "manual_recovery";
+  if (stage === "awaiting_approval") return "review_diff";
+  if (stage === "ready_for_human_merge") return "human_merge";
+  if (stage === "resolved_candidate") return "mark_resolved";
+  if (stage === "pr_open") return taskStatus === "pr_failed" ? "open_pr" : "fetch_pr_review";
+  if (stage === "implementation_active") return taskStatus === "reviewed" ? "review_diff" : "resume_implementation";
+  return "none";
+}
+
+function remediationAttentionReason(row: TaskRow, stage: RemediationStage): string | undefined {
+  if (stage !== "needs_attention") return undefined;
+  if (!row.repo_id) return "The source task is missing.";
+  if (row.status === "converted" && !row.implementation_task_id) return "The converted implementation task is missing.";
+  if (row.implementation_source_finding_id !== row.finding_id || row.implementation_source_task_id !== row.source_task_id) return "The implementation task linkage is invalid.";
+  if (row.implementation_worktree_status === "missing" || row.implementation_worktree_status === "invalid") return "The implementation task worktree is unavailable.";
+  return optionalString(row.implementation_recovery_message) ?? "The linked remediation state requires manual recovery.";
+}
+
+function validatedStoredPrUrl(originUrl?: string, prNumber?: number, prUrl?: string) {
+  if (!originUrl || !prNumber || !prUrl) return undefined;
+  const match = originUrl.match(/^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/)
+    ?? originUrl.match(/^git@github\.com:([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/);
+  const expected = match ? `https://github.com/${match[1]}/${match[2]}/pull/${prNumber}` : undefined;
+  return expected === prUrl ? expected : undefined;
 }

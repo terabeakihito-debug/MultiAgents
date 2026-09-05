@@ -3,7 +3,7 @@ import { lstat, realpath } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { codexAgent } from "../agents/codex";
 import type { AgentAdapter } from "../agents/types";
-import { findingSeverities, type Finding, type FindingCandidate, type FindingStatus } from "../findings/types";
+import { findingSeverities, humanPriorities, type Finding, type FindingCandidate, type FindingStatus, type HumanPriority } from "../findings/types";
 import { getOrCreateRepoProfile, requireUsableTaskProfile, taskProfileSnapshot } from "./project-profiles";
 import { createDiffSnapshot } from "./pull-request";
 import { getStateStore } from "./state-store";
@@ -76,7 +76,7 @@ export async function extractTaskFindings(taskId: string, agent: AgentAdapter = 
   const candidates = parseFindingExtraction(result.output);
   for (const candidate of candidates) for (const path of candidate.affectedPaths ?? []) await validateAffectedPath(task.repoPath, path);
   const now = new Date().toISOString();
-  const findings: Finding[] = candidates.map((candidate) => ({ ...candidate, findingId: randomUUID(), sourceTaskId: task.id, status: "open", createdAt: now, updatedAt: now }));
+  const findings: Finding[] = candidates.map((candidate) => ({ ...candidate, findingId: randomUUID(), sourceTaskId: task.id, status: "open", humanPriority: "normal", createdAt: now, updatedAt: now }));
   store.transaction(() => {
     store.createFindings(findings);
     for (const finding of findings) {
@@ -100,6 +100,44 @@ export function dismissFinding(findingId: string, reason?: string) {
   if (reason !== undefined && (typeof reason !== "string" || reason.length > 1_000)) throw new Error("Dismissal reason must be 1000 characters or fewer");
   if (reason?.trim()) assertNoSecrets([reason], "Finding dismissal reason");
   return transitionFinding(findingId, ["open"], "dismissed", "finding_dismissed", reason);
+}
+
+export function changeFindingPriority(findingId: string, priority: HumanPriority) {
+  if (!humanPriorities.includes(priority)) throw new Error("Finding priority is invalid");
+  const store = getStateStore();
+  const finding = requireFinding(findingId);
+  if (finding.resolvedAt) throw new Error("Resolved finding priority cannot be changed");
+  if (finding.humanPriority === priority) return finding;
+  return store.transaction(() => {
+    const updated = store.updateFindingPriority(finding.findingId, priority);
+    store.appendFindingEvent(updated, {
+      type: "finding_priority_changed", actor: "user",
+      previousHumanPriority: finding.humanPriority, humanPriority: priority,
+    });
+    return updated;
+  });
+}
+
+export function markFindingResolved(findingId: string) {
+  const store = getStateStore();
+  const finding = requireFinding(findingId);
+  if (finding.status !== "converted" || !finding.convertedTaskId) throw new Error("Only a converted finding can be resolved");
+  if (finding.resolvedAt) throw new Error("Finding is already resolved");
+  const implementation = getTask(finding.convertedTaskId);
+  if (!implementation) throw new Error("Linked implementation task is missing");
+  if (implementation.sourceFindingId !== finding.findingId || implementation.sourceTaskId !== finding.sourceTaskId) throw new Error("Linked implementation task does not match the finding");
+  if (!implementation.prNumber || !implementation.prReview?.merged || implementation.prReview.state !== "MERGED") throw new Error("The linked pull request must be confirmed merged before resolution");
+  const now = new Date().toISOString();
+  return store.transaction(() => {
+    const updated = store.resolveFinding(finding.findingId, now);
+    store.appendFindingEvent(updated, { type: "finding_resolved", actor: "user", createdAt: now, convertedTaskId: implementation.id });
+    return updated;
+  });
+}
+
+export function findingHistory(findingId: string) {
+  requireFinding(findingId);
+  return getStateStore().loadFindingEvents(findingId);
 }
 
 export function implementationTaskPrompt(finding: Finding, objective: string) {
