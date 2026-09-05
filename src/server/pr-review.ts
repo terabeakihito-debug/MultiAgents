@@ -282,6 +282,40 @@ export async function fetchPullRequestReview(task: RepoTask): Promise<PullReques
   return parsePullRequestReview(viewResult.stdout, commentsResult.stdout, threadsResult.stdout, requiredResult);
 }
 
+export async function refreshPullRequestStatus(taskId: string, dependencies: { fetchReview?: (task: RepoTask) => Promise<PullRequestReview> } = {}) {
+  if (!acquireTaskLock(taskId)) throw new ApprovalError("This task is already being processed", 409);
+  try {
+    const task = requireTask(taskId);
+    if (!task.prNumber || !task.prUrl) throw new ApprovalError("Task does not have an existing pull request");
+    const review = await (dependencies.fetchReview ?? fetchPullRequestReview)(task);
+    await validatePullRequestIdentity(task, review, { allowClosed: true, allowDirty: true });
+    task.prReview = review;
+    const validationPassed = task.validation.some((check) => check.status === "pass") && !task.validation.some((check) => check.status === "fail");
+    const requiredChecksPassed = !review.checks.some((check) => check.required && check.bucket !== "pass");
+    const ready = review.state === "OPEN" && !review.merged && validationPassed && requiredChecksPassed
+      && !hasRequiredAction(review) && pullRequestCanBeMergedByHuman(review);
+    if (review.state !== "OPEN" || review.merged) {
+      task.recoveryStatus = "needs_attention";
+      task.recoveryMessage = review.merged ? "The pull request was merged outside MultiAgents." : "The pull request is closed.";
+    } else if (task.worktreeStatus === "available") {
+      task.recoveryStatus = "recoverable";
+      task.recoveryMessage = undefined;
+    }
+    if (ready) task.status = "ready_for_human_merge";
+    else if (task.status === "ready_for_human_merge") {
+      if (review.checks.some((check) => check.required && check.bucket === "fail")) task.status = "ci_failed";
+      else if (review.checks.some((check) => check.required && ["pending", "unknown"].includes(check.bucket))) task.status = "ci_pending";
+      else task.status = "review_ready";
+    }
+    persistTask(task);
+    recordTaskEvent(task, "pr_status_refreshed", "user", { status: review.state.toLowerCase(), metadata: { prNumber: review.number } });
+    return publicTask(task);
+  } finally {
+    const task = getTask(taskId); if (task) persistTask(task);
+    releaseTaskLock(taskId);
+  }
+}
+
 export async function listOpenPullRequests(repoId: string, allowedRoot = ALLOWED_ROOT): Promise<OpenPullRequest[]> {
   const repo = await validateRepository(repoId, allowedRoot);
   const origin = await runGit(repo.path, ["remote", "get-url", "origin"]);
@@ -441,10 +475,15 @@ export function parsePullRequestReview(viewJson: string, commentsJson: string, t
 }
 
 export async function validateExistingPullRequest(task: RepoTask, review: PullRequestReview, options: { allowDirty?: boolean } = {}) {
+  await validatePullRequestIdentity(task, review, options);
+  if (review.merged || review.state !== "OPEN") throw new Error("Merged or closed pull requests cannot enter review intake");
+}
+
+async function validatePullRequestIdentity(task: RepoTask, review: PullRequestReview, options: { allowDirty?: boolean; allowClosed?: boolean } = {}) {
   const remote = await validateOrigin(task);
   const expectedUrl = `https://github.com/${remote.owner}/${remote.repo}/pull/${task.prNumber}`;
   if (review.number !== task.prNumber || review.url !== expectedUrl || task.prUrl !== expectedUrl) throw new Error("Pull request repository or number does not match the task");
-  if (review.merged || review.state !== "OPEN") throw new Error("Merged or closed pull requests cannot enter review intake");
+  if (!options.allowClosed && (review.merged || review.state !== "OPEN")) throw new Error("Merged or closed pull requests cannot enter review intake");
   if (review.base !== task.baseBranch) throw new Error("Pull request base branch does not match the task");
   if (review.head !== task.branch || !/^multiagents\/[0-9a-f-]{36}$/.test(review.head)) throw new Error("Pull request head branch does not match the task");
   if (!task.worktreeAvailable) {

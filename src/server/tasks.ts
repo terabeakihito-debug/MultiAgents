@@ -469,10 +469,12 @@ export async function getTaskDiff(task: RepoTask): Promise<TaskDiff> {
   };
 }
 
-export async function deleteTask(id: string) {
+export async function deleteTask(id: string, input: { confirmedPrCleanup?: boolean } = {}) {
   const task = getTask(id);
   if (!task) throw new Error("Task not found");
-  if (task.commitSha) throw new Error("A pushed or committed task worktree requires explicit manual cleanup");
+  recordTaskEvent(task, "worktree_cleanup_requested", "user", { status: "requested", metadata: task.prNumber ? { prNumber: task.prNumber } : undefined });
+  if (!task.worktreeAvailable || task.worktreeStatus !== "available") throw new Error("Managed task worktree is unavailable");
+  if (task.prNumber && input.confirmedPrCleanup !== true) throw new Error("Explicit confirmation is required before removing a PR task worktree");
   if (await runGit(task.worktreePath, ["status", "--porcelain"])) throw new Error("Task worktree has uncommitted changes and cannot be deleted");
   const root = await realpath(task.worktreeRoot);
   const target = await realpath(task.worktreePath);
@@ -488,6 +490,7 @@ export async function deleteTask(id: string) {
     task.recoveryMessage = "Task worktree was removed and the task was archived.";
     invalidateApproval(task);
     persistTask(task);
+    store.appendTaskEvent(task.id, { type: "worktree_removed", actor: "system", status: "removed", metadata: task.prNumber ? { prNumber: task.prNumber } : undefined });
     store.appendTaskEvent(task.id, { type: "task_archived", actor: "user", status: "archived" });
   });
 }
@@ -503,6 +506,9 @@ export async function resumeTask(id: string, options: { allowedRoot?: string; wo
   const task = tasks.get(id);
   if (!task) return undefined;
   await recoverTask(task, options.allowedRoot ?? ALLOWED_ROOT, options.worktreeRoot ?? WORKTREE_ROOT);
+  if (task.status === "archived") throw new Error("Archived tasks cannot be resumed");
+  if (task.recoveryStatus === "invalid") throw new Error(task.recoveryMessage ?? "Task failed recovery validation");
+  recordTaskEvent(task, "task_resumed", "user", { status: task.recoveryStatus });
   return task;
 }
 

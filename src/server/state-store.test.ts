@@ -206,13 +206,15 @@ describe("Phase 8 SQLite state and audit history", () => {
     const { allowedRoot, task } = await repositoryTask();
     await runGit(task.worktreePath, ["switch", "-c", "wrong-branch"]);
     reloadTasksFromStoreForTests();
-    expect(await resumeTask(task.id, { allowedRoot, worktreeRoot: task.worktreeRoot })).toMatchObject({ recoveryStatus: "invalid", worktreeStatus: "invalid" });
+    await expect(resumeTask(task.id, { allowedRoot, worktreeRoot: task.worktreeRoot })).rejects.toThrow("Task branch does not match");
+    expect(getTask(task.id)).toMatchObject({ recoveryStatus: "invalid", worktreeStatus: "invalid" });
 
     const second = await repositoryTask("project2");
     second.task.repoPath = testRoot;
     persistTask(second.task);
     reloadTasksFromStoreForTests();
-    expect(await resumeTask(second.task.id, { allowedRoot: second.allowedRoot, worktreeRoot: second.task.worktreeRoot })).toMatchObject({ recoveryStatus: "invalid" });
+    await expect(resumeTask(second.task.id, { allowedRoot: second.allowedRoot, worktreeRoot: second.task.worktreeRoot })).rejects.toThrow();
+    expect(getTask(second.task.id)).toMatchObject({ recoveryStatus: "invalid" });
   });
 
   it("retains a PR-only orphan for read-only review and persists archive cleanup", async () => {
@@ -230,6 +232,17 @@ describe("Phase 8 SQLite state and audit history", () => {
     reloadTasksFromStoreForTests();
     expect(getTask(archived.task.id)).toMatchObject({ status: "archived", worktreeStatus: "removed" });
     expect(getTaskHistory(archived.task.id).events.at(-1)?.type).toBe("task_archived");
+  });
+
+  it("requires explicit PR cleanup confirmation, removes only a clean worktree, and preserves audit history", async () => {
+    const { task } = await repositoryTask();
+    task.prNumber = 9; task.prUrl = "https://github.com/example/project/pull/9"; task.commitSha = task.baseSha;
+    persistTask(task);
+    await expect(deleteTask(task.id)).rejects.toThrow("Explicit confirmation");
+    expect(getTaskHistory(task.id).events.at(-1)?.type).toBe("worktree_cleanup_requested");
+    await deleteTask(task.id, { confirmedPrCleanup: true });
+    expect(getTask(task.id)).toMatchObject({ status: "archived", worktreeStatus: "removed", prNumber: 9 });
+    expect(getTaskHistory(task.id).events.slice(-3).map((event) => event.type)).toEqual(["worktree_cleanup_requested", "worktree_removed", "task_archived"]);
   });
 
   it("rolls back a task insert when a flow-step write fails", async () => {

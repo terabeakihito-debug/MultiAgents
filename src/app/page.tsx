@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import { agentIds, flowStepIds, rerunnableStepIds, type AgentId, type AgentResult, type AgentStatus, type FlowEvent, type FlowStep, type RerunnableStepId, type ReviewFlowResult, type ReviewRerunEvent } from "@/agents/types";
 import { FlowEventParser } from "@/flows/sse";
 import { acquireRunLock, releaseRunLock } from "./run-lock";
+import { TaskDashboard } from "./task-dashboard";
 
 const labels: Record<AgentId, string> = { codex: "Codex", cursor: "Cursor", claude: "Claude" };
 const roleLabels = { draft: "Draft", review: "Review", final: "Final" } as const;
@@ -58,7 +59,7 @@ export default function Home() {
   const [repoId, setRepoId] = useState("");
   const [openPulls, setOpenPulls] = useState<OpenPull[]>([]);
   const [task, setTask] = useState<RepoTask | null>(null);
-  const [recentTasks, setRecentTasks] = useState<RepoTask[]>([]);
+  const [dashboardRefresh, setDashboardRefresh] = useState(0);
   const [taskDiff, setTaskDiff] = useState<TaskDiff | null>(null);
   const [approval, setApproval] = useState<Approval | null>(null);
   const [reviewedDiff, setReviewedDiff] = useState(false);
@@ -66,6 +67,7 @@ export default function Home() {
   const [reviewProcessing, setReviewProcessing] = useState(false);
   const [taskError, setTaskError] = useState("");
   const [taskHistory, setTaskHistory] = useState<TaskHistory>(emptyHistory);
+  const [historyTitle, setHistoryTitle] = useState("");
   const sendingRef = useRef(false);
   const flowAbortRef = useRef<AbortController | null>(null);
   const currentFlowIdRef = useRef("");
@@ -76,19 +78,17 @@ export default function Home() {
     setRepos(data.repos || []); setRepoId((current) => current || data.repos?.[0]?.id || "");
   }).catch((error) => setTaskError(message(error))); }, []);
 
-  async function loadHistory() { await fetch("/api/tasks/history").then(async (response) => {
-    const data = await response.json() as { tasks?: RepoTask[]; error?: string };
-    if (!response.ok) throw new Error(data.error || "Could not restore tasks");
-    setRecentTasks(data.tasks ?? []);
-  }); }
-
-  useEffect(() => { void loadHistory().catch((error) => setTaskError(message(error))); }, []);
-
   async function loadTaskHistory(taskId: string) {
     const response = await fetch(`/api/tasks/${taskId}/history`);
     const data = await response.json() as { history?: TaskHistory; error?: string };
     if (!response.ok || !data.history) throw new Error(data.error || "Could not load task history");
     setTaskHistory(data.history);
+  }
+
+  async function openDashboardHistory(taskId: string, label: string) {
+    setTaskError("");
+    try { await loadTaskHistory(taskId); setHistoryTitle(label); }
+    catch (error) { setTaskError(message(error)); }
   }
 
   async function resumePersistedTask(taskId: string) {
@@ -104,7 +104,7 @@ export default function Home() {
       setFinalOutput(restored.finalOutput ?? ""); currentFlowIdRef.current = restored.flowId ?? "";
       setTaskDiff(data.diff ?? null); setApproval(data.approval ?? null);
       if (data.error) setTaskError(data.error);
-      await Promise.all([loadHistory(), loadTaskHistory(restored.id)]);
+      await loadTaskHistory(restored.id); setHistoryTitle(""); setDashboardRefresh((value) => value + 1);
     } catch (error) { setTaskError(message(error)); }
   }
 
@@ -114,7 +114,7 @@ export default function Home() {
       const response = await fetch("/api/tasks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repoId }) });
       const data = await response.json() as { task?: RepoTask; error?: string };
       if (!response.ok || !data.task) throw new Error(data.error || "Task creation failed");
-      setTask(data.task); setMode("review"); await Promise.all([loadHistory(), loadTaskHistory(data.task.id)]);
+      setTask(data.task); setMode("review"); await loadTaskHistory(data.task.id); setDashboardRefresh((value) => value + 1);
     } catch (error) { setTaskError(message(error)); }
   }
 
@@ -162,7 +162,7 @@ export default function Home() {
     const response = await fetch(`/api/tasks/${task.id}`, { method: "DELETE" });
     if (!response.ok) { const data = await response.json() as { error?: string }; setTaskError(data.error || "Cleanup failed"); return; }
     setTask(null); setTaskDiff(null); setApproval(null); setReviewedDiff(false); setTaskHistory(emptyHistory());
-    await loadHistory();
+    setDashboardRefresh((value) => value + 1);
   }
 
   async function submit(event: FormEvent) {
@@ -351,7 +351,8 @@ export default function Home() {
 
   return <main>
     <header><h1>MultiAgents</h1><p>Parallel answers or a fixed, reviewed response from local AI CLIs.</p></header>
-    <section className="historyPanel"><div className="cardHeader"><h2>Recent Tasks</h2><button type="button" className="rerun" onClick={() => void loadHistory().catch((error) => setTaskError(message(error)))}>Refresh</button></div>{recentTasks.length ? <div className="taskHistory">{recentTasks.map((item) => <article className="historyTask" key={item.id}><div><strong>{item.repoName}</strong>{item.prNumber ? <span> · PR #{item.prNumber}</span> : null}<div><code>{item.status}</code> · <span className={`recovery ${item.recoveryStatus}`}>{item.recoveryStatus}</span></div><small>{new Date(item.updatedAt).toLocaleString()}</small>{item.recoveryMessage && <p>{item.recoveryMessage}</p>}</div><button type="button" disabled={sending || approvalProcessing || reviewProcessing} onClick={() => void resumePersistedTask(item.id)}>Resume</button></article>)}</div> : <p className="muted">No persisted tasks yet.</p>}</section>
+    <TaskDashboard repos={repos} busy={sending || approvalProcessing || reviewProcessing} refreshToken={dashboardRefresh} onResume={(id) => void resumePersistedTask(id)} onHistory={(id, label) => void openDashboardHistory(id, label)} onError={setTaskError} />
+    {historyTitle ? <section className="dashboardHistory"><div className="cardHeader"><div><span className="eyebrow">Dashboard history</span><h2>{historyTitle}</h2></div><button type="button" className="secondary" onClick={() => { setHistoryTitle(""); setTaskHistory(emptyHistory()); }}>Close</button></div><TaskHistoryPanel history={taskHistory} /></section> : null}
     <section className="repoPanel"><label htmlFor="repository">Repository</label><div className="repoControls"><select id="repository" value={repoId} disabled={sending || Boolean(task)} onChange={(event) => { setRepoId(event.target.value); setOpenPulls([]); }}>{repos.map((repo) => <option key={repo.id} value={repo.id}>{repo.name}{repo.dirty ? " (dirty)" : ""}</option>)}</select><button type="button" disabled={!repoId || sending || Boolean(task)} onClick={createIsolatedTask}>Create isolated task</button><button type="button" disabled={!repoId || sending || reviewProcessing || Boolean(task)} onClick={loadOpenPulls}>{reviewProcessing ? "Loading…" : "Find open PRs"}</button></div>{!task && openPulls.length > 0 && <div className="openPulls"><h3>Open PRs from this repository origin</h3>{openPulls.map((pull) => <div className="openPull" key={pull.number}><span>#{pull.number} {pull.title} · <code>{pull.head}</code></span><button type="button" disabled={reviewProcessing} onClick={() => recoverPull(pull.number)}>Open review intake</button></div>)}</div>}{task && <><div className="taskReady"><div><strong>Repo:</strong> {task.repoName}</div><div><strong>Branch:</strong> <code>{task.branch}</code></div><div><strong>State:</strong> <code>{task.status}</code></div><div><strong>Worktree:</strong> {task.worktreeAvailable ? "ready" : "unavailable (review-only)"}</div><button type="button" className="delete" onClick={deleteWorktree} disabled={sending || approvalProcessing || reviewProcessing || Boolean(task.commitSha) || !task.worktreeAvailable}>Delete task worktree</button></div>{task.recoveryMessage && <p className="staleReason">{task.recoveryMessage}</p>}</>}{taskError && <ErrorBlock error={taskError} />}</section>
     <form onSubmit={submit}>
       <fieldset className="modes" disabled={sending}><legend>Mode</legend><label><input type="radio" checked={mode === "parallel"} onChange={() => setMode("parallel")} /> Parallel</label><label><input type="radio" checked={mode === "review"} onChange={() => setMode("review")} /> Review Flow</label></fieldset>
@@ -405,7 +406,7 @@ function TaskHistoryPanel({ history }: { history: TaskHistory }) {
 }
 
 const eventLabels: Record<string, string> = {
-  task_created: "Task created", flow_started: "Review flow started", step_started: "Step started", step_completed: "Step completed", step_failed: "Step failed", step_rerun: "Step re-run started", step_stale: "Step marked stale", flow_completed: "Review flow completed", flow_aborted: "Review flow aborted", approval_issued: "Approval issued", approval_invalidated: "Approval invalidated", approval_accepted: "Approval accepted", approval_failed: "Approval failed", validation_started: "Validation started", validation_passed: "Validation passed", validation_failed: "Validation failed", diff_generated: "Diff generated", commit_created: "Commit created", branch_pushed: "Branch pushed", pr_created: "Pull request created", pr_review_fetched: "PR review fetched", rework_started: "Rework started", rework_completed: "Rework completed", ready_for_human_merge: "Ready for human merge", task_archived: "Task archived",
+  task_created: "Task created", flow_started: "Review flow started", step_started: "Step started", step_completed: "Step completed", step_failed: "Step failed", step_rerun: "Step re-run started", step_stale: "Step marked stale", flow_completed: "Review flow completed", flow_aborted: "Review flow aborted", approval_issued: "Approval issued", approval_invalidated: "Approval invalidated", approval_accepted: "Approval accepted", approval_failed: "Approval failed", validation_started: "Validation started", validation_passed: "Validation passed", validation_failed: "Validation failed", diff_generated: "Diff generated", commit_created: "Commit created", branch_pushed: "Branch pushed", pr_created: "Pull request created", pr_review_fetched: "PR review fetched", rework_started: "Rework started", rework_completed: "Rework completed", ready_for_human_merge: "Ready for human merge", task_resumed: "Task resumed", worktree_cleanup_requested: "Worktree cleanup requested", worktree_removed: "Worktree removed", pr_status_refreshed: "PR status refreshed", task_archived: "Task archived",
 };
 function eventLabel(event: TaskEvent) { return eventLabels[event.type] ?? event.type.replaceAll("_", " "); }
 function metadataLabel(metadata: Record<string, string | number>) { return Object.entries(metadata).map(([key, value]) => `${key}: ${typeof value === "string" && value.length > 16 ? value.slice(0, 12) : value}`).join(" · "); }

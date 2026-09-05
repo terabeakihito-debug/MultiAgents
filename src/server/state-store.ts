@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { FlowStep } from "../agents/types";
+import type { DashboardCounts, DashboardSort, PrFilter, TaskBucket } from "../dashboard/types";
 import type { RepoTask } from "./tasks";
 
 export const STATE_DIRECTORY = join(homedir(), ".multiagents");
@@ -17,6 +18,7 @@ export const taskEventTypes = [
   "flow_completed", "flow_aborted", "approval_issued", "approval_invalidated", "approval_accepted", "approval_failed",
   "validation_started", "validation_passed", "validation_failed", "diff_generated", "commit_created", "branch_pushed",
   "pr_created", "pr_review_fetched", "rework_started", "rework_completed", "ready_for_human_merge", "task_archived",
+  "task_resumed", "worktree_cleanup_requested", "worktree_removed", "pr_status_refreshed",
 ] as const;
 export type TaskEventType = (typeof taskEventTypes)[number];
 export type TaskEventActor = "user" | "system" | "codex" | "cursor" | "claude";
@@ -76,6 +78,65 @@ export type TaskHistory = { events: TaskEvent[]; stepVersions: StepVersion[]; di
 
 type TaskRow = Record<string, unknown>;
 type FlowStepRow = Record<string, unknown>;
+
+export type DashboardQuery = {
+  bucket?: TaskBucket;
+  repo?: string;
+  status?: string;
+  pr: PrFilter;
+  search?: string;
+  sort: DashboardSort;
+  includeArchived: boolean;
+  limit: number;
+};
+
+export type DashboardRow = {
+  taskId: string;
+  repoId: string;
+  repoName: string;
+  branch: string;
+  baseBranch: string;
+  status: string;
+  originalPrompt: string;
+  createdAt: string;
+  updatedAt: string;
+  prNumber?: number;
+  prUrl?: string;
+  recoveryStatus: string;
+  recoveryMessage?: string;
+  worktreeStatus: string;
+  worktreeAvailable: boolean;
+  bucket: TaskBucket;
+  payload: Record<string, unknown>;
+};
+
+const DASHBOARD_BUCKET_SQL = `CASE
+  WHEN status = 'archived' OR worktree_status = 'removed' THEN 'archived'
+  WHEN merge_readiness = 'ready_for_human_merge'
+    AND pr_number IS NOT NULL
+    AND recovery_status NOT IN ('orphaned', 'invalid')
+    AND worktree_status = 'available'
+    AND json_extract(payload_json, '$.prReview.state') = 'OPEN'
+    AND COALESCE(json_extract(payload_json, '$.prReview.merged'), 0) = 0
+    AND json_array_length(COALESCE(json_extract(payload_json, '$.validation'), '[]')) > 0
+    AND NOT EXISTS (SELECT 1 FROM json_each(payload_json, '$.validation') WHERE json_extract(value, '$.status') = 'fail')
+    AND NOT EXISTS (SELECT 1 FROM json_each(payload_json, '$.prReview.items') WHERE json_extract(value, '$.disposition') IN ('blocking', 'action_required'))
+    AND NOT EXISTS (SELECT 1 FROM json_each(payload_json, '$.prReview.checks') WHERE json_extract(value, '$.required') = 1 AND json_extract(value, '$.bucket') <> 'pass')
+    THEN 'ready_for_human_merge'
+  WHEN recovery_status IN ('orphaned', 'invalid') OR worktree_status IN ('missing', 'invalid')
+    OR status IN ('review_fetch_failed', 'rework_failed', 'ci_failed', 'ci_pending', 'validation_failed', 'secret_scan_failed', 'approval_invalidated', 'commit_failed', 'push_failed', 'pr_failed')
+    OR flow_status IN ('aborted', 'timed_out', 'error')
+    OR (pr_number IS NOT NULL AND json_extract(payload_json, '$.prReview.state') IN ('CLOSED', 'MERGED'))
+    THEN 'needs_attention'
+  WHEN status IN ('awaiting_approval', 'awaiting_final_approval') THEN 'ready_for_approval'
+  WHEN pr_number IS NOT NULL
+    AND COALESCE(json_extract(payload_json, '$.prReview.state'), 'OPEN') = 'OPEN'
+    AND COALESCE(json_extract(payload_json, '$.prReview.merged'), 0) = 0
+    THEN 'pr_open'
+  WHEN status IN ('draft', 'reviewed', 'validating', 'committing', 'pushing', 'creating_pr', 'fetching_review', 'reworking', 'reviewing_rework', 'committing_rework', 'pushing_rework', 'checking_ci')
+    OR flow_status = 'running' THEN 'active'
+  ELSE 'needs_attention'
+END`;
 
 export class StateStore {
   readonly path: string;
@@ -173,6 +234,39 @@ export class StateStore {
     const rows = this.database.prepare("SELECT * FROM tasks ORDER BY updated_at DESC").all() as TaskRow[];
     const stepStatement = this.database.prepare("SELECT * FROM flow_steps WHERE task_id = ? ORDER BY ordinal");
     return rows.map((row) => this.rowToTask(row, stepStatement.all(String(row.task_id)) as FlowStepRow[]));
+  }
+
+  queryDashboard(input: DashboardQuery): { rows: DashboardRow[]; counts: DashboardCounts } {
+    const filters: string[] = [];
+    const values: Array<string | number> = [];
+    if (input.repo) { filters.push("repo_id = ?"); values.push(input.repo); }
+    if (input.status) { filters.push("status = ?"); values.push(input.status); }
+    if (input.pr === "with_pr") filters.push("pr_number IS NOT NULL");
+    if (input.pr === "without_pr") filters.push("pr_number IS NULL");
+    if (input.search) {
+      const pattern = `%${escapeLike(input.search.toLocaleLowerCase("en-US"))}%`;
+      const prPattern = `%${escapeLike(input.search.replace(/^#/, ""))}%`;
+      filters.push("(lower(repo_name) LIKE ? ESCAPE '\\' OR lower(task_branch) LIKE ? ESCAPE '\\' OR CAST(pr_number AS TEXT) LIKE ? ESCAPE '\\' OR lower(replace(replace(original_prompt, char(10), ' '), char(13), ' ')) LIKE ? ESCAPE '\\')");
+      values.push(pattern, pattern, prPattern, pattern);
+    }
+    const baseWhere = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+    const countRows = this.database.prepare(`SELECT bucket, COUNT(*) AS count FROM (SELECT ${DASHBOARD_BUCKET_SQL} AS bucket FROM tasks ${baseWhere}) GROUP BY bucket`).all(...values) as Array<{ bucket: TaskBucket; count: number }>;
+    const counts: DashboardCounts = { active: 0, needs_attention: 0, ready_for_approval: 0, pr_open: 0, ready_for_human_merge: 0, archived: 0 };
+    for (const row of countRows) counts[row.bucket] = Number(row.count);
+
+    const listFilters = [...filters];
+    const listValues = [...values];
+    if (!input.includeArchived && input.bucket !== "archived") listFilters.push("status <> 'archived' AND worktree_status <> 'removed'");
+    if (input.bucket) { listFilters.push(`(${DASHBOARD_BUCKET_SQL}) = ?`); listValues.push(input.bucket); }
+    const where = listFilters.length ? `WHERE ${listFilters.join(" AND ")}` : "";
+    const order = input.sort === "created_desc" ? "created_at DESC" : input.sort === "repo_name" ? "repo_name COLLATE NOCASE ASC, updated_at DESC" : "updated_at DESC";
+    const raw = this.database.prepare(`
+      SELECT task_id, repo_id, repo_name, task_branch, base_branch, status, original_prompt,
+        created_at, updated_at, pr_number, pr_url, recovery_status, recovery_message,
+        worktree_status, worktree_available, payload_json, ${DASHBOARD_BUCKET_SQL} AS bucket
+      FROM tasks ${where} ORDER BY ${order} LIMIT ?
+    `).all(...listValues, input.limit) as TaskRow[];
+    return { rows: raw.map(rowToDashboardRow), counts };
   }
 
   clearForTests() {
@@ -427,6 +521,7 @@ export function replaceStateStoreForTests(replacement?: StateStore) {
 }
 
 function bounded(value: string, limit: number) { return value.length <= limit ? value : value.slice(0, limit); }
+function escapeLike(value: string) { return value.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_"); }
 function optionalString(value: unknown) { return typeof value === "string" && value.length ? value : undefined; }
 function optionalNumber(value: unknown) { return typeof value === "number" ? value : value === null || value === undefined ? undefined : Number(value); }
 function array(value: unknown) { return Array.isArray(value) ? value : []; }
@@ -471,5 +566,17 @@ function rowToFlowStep(row: FlowStepRow): FlowStep {
     role: String(row.role) as FlowStep["role"], status: String(row.status) as FlowStep["status"],
     output: String(row.output), error: optionalString(row.error), durationMs: optionalNumber(row.duration_ms),
     startedAt: optionalString(row.started_at), completedAt: optionalString(row.completed_at),
+  };
+}
+
+function rowToDashboardRow(row: TaskRow): DashboardRow {
+  return {
+    taskId: String(row.task_id), repoId: String(row.repo_id), repoName: String(row.repo_name),
+    branch: String(row.task_branch), baseBranch: String(row.base_branch), status: String(row.status),
+    originalPrompt: String(row.original_prompt), createdAt: String(row.created_at), updatedAt: String(row.updated_at),
+    prNumber: optionalNumber(row.pr_number), prUrl: optionalString(row.pr_url),
+    recoveryStatus: String(row.recovery_status), recoveryMessage: optionalString(row.recovery_message),
+    worktreeStatus: String(row.worktree_status), worktreeAvailable: Number(row.worktree_available) === 1,
+    bucket: String(row.bucket) as TaskBucket, payload: parseObject(row.payload_json),
   };
 }

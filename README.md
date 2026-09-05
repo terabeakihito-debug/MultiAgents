@@ -33,6 +33,44 @@ Open <http://localhost:3000>, enter a prompt, and choose a mode:
 
 The review roles are: Codex creates the draft, Cursor reviews correctness and risks, Claude independently reviews both earlier results, and Codex produces the final user-facing answer.
 
+## Operational task dashboard
+
+The home page starts with a server-classified task dashboard instead of a
+client-built recent-task list. SQLite remains the source of truth. Tasks are
+placed into exactly one operational bucket: **Active**, **Needs Attention**,
+**Ready for Approval**, **PR Open**, **Ready for Human Merge**, or
+**Archived**. Bucket counts and selected rows are calculated on the server; the
+browser cannot assign or move a task to a bucket.
+
+Each card shows only a whitespace-normalized, credential-redacted summary of at
+most 120 characters, plus repository, state, branch, validated PR number/link,
+recovery/worktree state, last update, and a deterministic next action. Full
+prompts, agent output, review bodies, diffs, credentials, tokens, and environment
+data are not returned by the dashboard API. A task without an update for three
+days is marked **INACTIVE**; this is an age indicator and is separate from the
+Review Flow's `stale` step state.
+
+Dashboard queries support repository, bucket, exact status, PR presence, and
+archived filters; bounded search covers repository name, task summary source,
+branch, and PR number. Results can be ordered by latest update, creation time,
+or repository name and are limited to at most 100 rows. Filtering, sorting, and
+classification are performed in SQLite rather than by downloading every task
+to the client. Archived tasks are hidden by default.
+
+**Needs Attention** cards include a concrete server-derived reason and recovery
+action. **Ready for Human Merge** requires a currently open, unmerged PR, a
+passed latest validation, no blocking or action-required finding, passed
+required checks, and persisted `READY_FOR_HUMAN_MERGE` readiness. An open PR by
+itself is only **PR Open**. The dashboard displays persisted PR state and never
+polls GitHub in the background; **Refresh PR status** refreshes only the selected
+task and does not run the agent review-intake flow.
+
+**Resume** always calls the server recovery path again before restoring task
+details; it never trusts a client cache. **History** opens the existing Phase 8
+append-only timeline. **Diff** is available only for a recoverable managed
+worktree. GitHub links are emitted only when the stored PR URL exactly matches
+the task's validated GitHub origin and PR number.
+
 After a Review Flow finishes, **Re-run** is available for Cursor Review, Claude Review, and Codex Final. Codex Draft is intentionally not rerunnable. A successful Cursor rerun replaces only Cursor's latest result and marks Claude and Final as **STALE**; a successful Claude rerun replaces only Claude's result and marks Final stale. Downstream steps are never run automatically. Stale is not a failure: the prior output stays visible with a reason, and the user can explicitly rerun that step. Rerunning Final uses the latest available draft and review results.
 
 Rerun state, stale markers, the original prompt, and the latest step outputs are stored locally and restored by **Resume** after a reload or server restart. A rerun can be cancelled through the same **Cancel** control and process-group termination path. If it fails, is cancelled, or times out, the prior successful output is retained and the step reports the rerun failure.
@@ -120,11 +158,14 @@ and has no merge or auto-merge button. It never submits a GitHub approval,
 deletes a branch, deploys, closes an issue, or pushes/merges directly to the
 base branch. The final merge is always performed by a human outside this app.
 
-**Delete task worktree** uses `git worktree remove` only before a task has
-created a commit and only when the task worktree is clean. Dirty, committed, and
-pushed task worktrees are deliberately retained for explicit manual cleanup.
+**Delete task worktree** uses `git worktree remove` only when the server has
+revalidated the managed path and verified that the worktree is clean. Dirty
+worktrees are rejected with no override. A task with an open PR can be cleaned
+up, but only after an explicit per-task confirmation; the warning is stronger
+for **Ready for Human Merge**. Cleanup never deletes the GitHub branch or PR,
+and bulk cleanup is intentionally unavailable.
 Task, intake, approval, and PR metadata are persisted locally. After a
-restart, **Recent Tasks** lists saved tasks and **Resume** revalidates them.
+restart, the **Task Dashboard** lists saved tasks and **Resume** revalidates them.
 **Find open PRs** also lists open PRs from the selected repository's validated
 GitHub origin. Recovery is allowed only when an already registered
 server-managed worktree, `multiagents/<UUID>` branch, clean local HEAD, PR head
@@ -183,7 +224,10 @@ the `~/code` boundary, Git worktree registration, task branch, origin, and
 local HEAD. PR and CI state is marked for refresh. A missing worktree is never
 recreated automatically: local rework stops with manual recovery guidance,
 although an existing PR may still be inspected read-only. Removing an eligible
-task worktree archives the task record instead of deleting its history.
+task worktree archives the task record with `worktreeStatus = removed` instead
+of deleting its task, step, diff, approval, or audit history. Cleanup request,
+worktree removal, task archive, task resume, and explicit PR refresh operations
+are audited; passive dashboard browsing and searches are not.
 
 Pending or processing approvals are invalidated whenever persisted state is
 loaded after a server restart. The old approval ID is discarded. The current

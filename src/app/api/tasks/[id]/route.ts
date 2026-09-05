@@ -19,6 +19,17 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
 export async function DELETE(request: Request, context: { params: Promise<{ id: string }> }) {
   const rejection = rejectNonLocalRequest(request); if (rejection) return rejection;
   await initializeTaskRecovery();
-  try { await deleteTask((await context.params).id); return new Response(null, { status: 204 }); }
+  let input: { confirmedPrCleanup?: boolean } = {};
+  try {
+    const body = await request.text();
+    if (body) {
+      const parsed = JSON.parse(body) as Record<string, unknown>;
+      if (Object.keys(parsed).some((key) => key !== "confirmedPrCleanup") || (parsed.confirmedPrCleanup !== undefined && typeof parsed.confirmedPrCleanup !== "boolean")) {
+        return Response.json({ error: "Invalid cleanup request" }, { status: 400 });
+      }
+      input = { confirmedPrCleanup: parsed.confirmedPrCleanup === true };
+    }
+  } catch { return Response.json({ error: "Invalid cleanup request" }, { status: 400 }); }
+  try { await deleteTask((await context.params).id, input); return new Response(null, { status: 204 }); }
   catch (error) { return Response.json({ error: error instanceof Error ? error.message : "Cleanup failed" }, { status: 409 }); }
 }

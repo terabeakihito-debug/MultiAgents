@@ -12,11 +12,12 @@ import {
   isPrReviewLockedForTests,
   parsePullRequestReview,
   recoverExistingPullRequestTask,
+  refreshPullRequestStatus,
   type PrReviewDependencies,
 } from "./pr-review";
 import type { PrReviewIntake, PullRequestReview, ReworkFlowResult } from "./pr-review-types";
 import { clearTaskLocksForTests } from "./task-lock";
-import { clearTasksForTests, createTask, transitionTask, type RepoTask } from "./tasks";
+import { clearTasksForTests, createTask, getTaskHistory, transitionTask, type RepoTask } from "./tasks";
 
 const roots: string[] = [];
 async function root() { const value = await mkdtemp(join(tmpdir(), "multiagents-phase6-")); roots.push(value); return value; }
@@ -65,6 +66,16 @@ describe("Phase 6 PR review intake", () => {
     const result = await fetchReviewIntake(task.id, fetchDeps(reviewFor(task)));
     expect(result.status).toBe("ready_for_human_merge");
     expect(result.prNumber).toBe(1);
+  });
+
+  it("refreshes only persisted PR status and audits readiness without running intake agents", async () => {
+    const { task } = await existingPrTask();
+    task.validation = [{ name: "validation", status: "pass" }];
+    const fetchReview = vi.fn(async () => reviewFor(task, { checks: [{ name: "required", state: "SUCCESS", bucket: "pass", required: true }] }));
+    const result = await refreshPullRequestStatus(task.id, { fetchReview });
+    expect(fetchReview).toHaveBeenCalledOnce();
+    expect(result.status).toBe("ready_for_human_merge");
+    expect(getTaskHistory(task.id).events.at(-1)).toMatchObject({ type: "pr_status_refreshed", actor: "user", metadata: { prNumber: 1 } });
   });
 
   it.each([
