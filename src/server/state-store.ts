@@ -5,11 +5,12 @@ import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { FlowStep } from "../agents/types";
 import type { DashboardCounts, DashboardSort, PrFilter, TaskBucket } from "../dashboard/types";
+import { parseProfileSnapshot, safeDefaultSnapshot, type ProjectProfile, type ProjectProfileSnapshot } from "../profiles/policy";
 import type { RepoTask } from "./tasks";
 
 export const STATE_DIRECTORY = join(homedir(), ".multiagents");
 export const STATE_DATABASE = join(STATE_DIRECTORY, "state.db");
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 const MAX_STORED_PROMPT_CHARS = 20_000;
 const MAX_STORED_OUTPUT_CHARS = 1_000_000;
 
@@ -19,6 +20,7 @@ export const taskEventTypes = [
   "validation_started", "validation_passed", "validation_failed", "diff_generated", "commit_created", "branch_pushed",
   "pr_created", "pr_review_fetched", "rework_started", "rework_completed", "ready_for_human_merge", "task_archived",
   "task_resumed", "worktree_cleanup_requested", "worktree_removed", "pr_status_refreshed",
+  "profile_snapshot_created",
 ] as const;
 export type TaskEventType = (typeof taskEventTypes)[number];
 export type TaskEventActor = "user" | "system" | "codex" | "cursor" | "claude";
@@ -30,6 +32,8 @@ export type TaskEventMetadata = Partial<{
   changedFileCount: number;
   additions: number;
   deletions: number;
+  profileId: string;
+  profileVersion: number;
 }>;
 export type TaskEvent = {
   id: string;
@@ -108,7 +112,12 @@ export type DashboardRow = {
   worktreeAvailable: boolean;
   bucket: TaskBucket;
   payload: Record<string, unknown>;
+  profileId?: string;
+  profileVersion?: number;
 };
+
+export type ProfileAuditEventType = "profile_created" | "profile_updated" | "profile_assigned" | "profile_snapshot_created";
+export type ProjectProfileVersion = { profileId: string; version: number; changedAt: string; changedFields: string[]; actor: "user"; snapshot: ProjectProfileSnapshot };
 
 const DASHBOARD_BUCKET_SQL = `CASE
   WHEN status = 'archived' OR worktree_status = 'removed' THEN 'archived'
@@ -169,6 +178,9 @@ export class StateStore {
     const review = task.prReview;
     const reviewDisposition = task.reviewIntake?.readyForHumanMerge ? "ready" : task.reviewIntake?.requiresRework ? "action_required" : undefined;
     const ciStatus = task.status === "ci_failed" ? "fail" : task.status === "ci_pending" ? "pending" : task.status === "ready_for_human_merge" ? "pass" : undefined;
+    const profile = parseProfileSnapshot(task.profile ?? safeDefaultSnapshot(task.repoId));
+    if (profile.repoId !== task.repoId) throw new Error("Task profile snapshot repository does not match the task");
+    task.profile = profile;
     const payload = {
       reviewReady: task.reviewReady,
       validation: task.validation,
@@ -185,6 +197,7 @@ export class StateStore {
       latestPushedSha: task.latestPushedSha,
       ciMessage: task.ciMessage,
       error: task.error,
+      profileSnapshot: profile,
     };
     this.transaction(() => {
       this.database.prepare(`
@@ -194,9 +207,9 @@ export class StateStore {
           status, original_prompt, created_at, updated_at, flow_id, flow_status, final_output,
           diff_hash, approval_state, approval_purpose, approval_id, commit_sha, pr_number, pr_url,
           pr_head_sha, review_disposition, unresolved_count, ci_status, merge_readiness,
-          recovery_status, recovery_message, payload_json
+          recovery_status, recovery_message, payload_json, profile_id, profile_version, profile_snapshot_json
         ) VALUES (
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT(task_id) DO UPDATE SET
           repo_id=excluded.repo_id, repo_name=excluded.repo_name, repo_path=excluded.repo_path,
@@ -212,7 +225,9 @@ export class StateStore {
           pr_head_sha=excluded.pr_head_sha, review_disposition=excluded.review_disposition,
           unresolved_count=excluded.unresolved_count, ci_status=excluded.ci_status,
           merge_readiness=excluded.merge_readiness, recovery_status=excluded.recovery_status,
-          recovery_message=excluded.recovery_message, payload_json=excluded.payload_json
+          recovery_message=excluded.recovery_message, payload_json=excluded.payload_json,
+          profile_id=excluded.profile_id, profile_version=excluded.profile_version,
+          profile_snapshot_json=excluded.profile_snapshot_json
       `).run(
         task.id, task.repoId, task.repoName, task.repoPath, task.allowedRoot, task.baseBranch, task.branch,
         task.baseSha, task.originUrl ?? null, task.worktreePath, task.worktreeRoot,
@@ -225,6 +240,7 @@ export class StateStore {
         reviewDisposition ?? null, review?.unresolvedCount ?? null, ciStatus ?? null,
         task.status === "ready_for_human_merge" ? "ready_for_human_merge" : null,
         task.recoveryStatus, task.recoveryMessage ?? null, JSON.stringify(payload),
+        profile.profileId, profile.version, JSON.stringify(profile),
       );
       this.replaceFlowSteps(task.id, task.flowSteps ?? []);
     });
@@ -234,6 +250,11 @@ export class StateStore {
     const rows = this.database.prepare("SELECT * FROM tasks ORDER BY updated_at DESC").all() as TaskRow[];
     const stepStatement = this.database.prepare("SELECT * FROM flow_steps WHERE task_id = ? ORDER BY ordinal");
     return rows.map((row) => this.rowToTask(row, stepStatement.all(String(row.task_id)) as FlowStepRow[]));
+  }
+
+  markTaskProfileNeedsAttention(taskId: string, message: string) {
+    this.database.prepare("UPDATE tasks SET recovery_status = 'needs_attention', recovery_message = ?, updated_at = ? WHERE task_id = ?")
+      .run(message.slice(0, 1_000), new Date().toISOString(), taskId);
   }
 
   queryDashboard(input: DashboardQuery): { rows: DashboardRow[]; counts: DashboardCounts } {
@@ -263,7 +284,7 @@ export class StateStore {
     const raw = this.database.prepare(`
       SELECT task_id, repo_id, repo_name, task_branch, base_branch, status, original_prompt,
         created_at, updated_at, pr_number, pr_url, recovery_status, recovery_message,
-        worktree_status, worktree_available, payload_json, ${DASHBOARD_BUCKET_SQL} AS bucket
+        worktree_status, worktree_available, payload_json, profile_id, profile_version, ${DASHBOARD_BUCKET_SQL} AS bucket
       FROM tasks ${where} ORDER BY ${order} LIMIT ?
     `).all(...listValues, input.limit) as TaskRow[];
     return { rows: raw.map(rowToDashboardRow), counts };
@@ -272,7 +293,7 @@ export class StateStore {
   clearForTests() {
     this.transaction(() => {
       this.dropAppendOnlyTriggers();
-      this.database.exec("DELETE FROM approval_events; DELETE FROM diff_versions; DELETE FROM step_versions; DELETE FROM task_events; DELETE FROM flow_steps; DELETE FROM tasks;");
+      this.database.exec("DELETE FROM approval_events; DELETE FROM diff_versions; DELETE FROM step_versions; DELETE FROM task_events; DELETE FROM flow_steps; DELETE FROM tasks; DELETE FROM profile_audit_events; DELETE FROM project_profile_versions; DELETE FROM project_profiles;");
       this.createAppendOnlyTriggers();
     });
   }
@@ -336,6 +357,65 @@ export class StateStore {
     return { events, stepVersions, diffVersions, approvalEvents };
   }
 
+  loadProjectProfiles(): ProjectProfile[] {
+    const rows = this.database.prepare("SELECT profile_json FROM project_profiles ORDER BY repo_id").all() as Array<{ profile_json: string }>;
+    return rows.map((row) => profileFromStored(row.profile_json));
+  }
+
+  loadRepoProfile(repoId: string): ProjectProfile | undefined {
+    const row = this.database.prepare("SELECT profile_json FROM project_profiles WHERE repo_id = ?").get(repoId) as { profile_json: string } | undefined;
+    return row ? profileFromStored(row.profile_json) : undefined;
+  }
+
+  loadProfileVersions(profileId?: string): ProjectProfileVersion[] {
+    const rows = (profileId
+      ? this.database.prepare("SELECT * FROM project_profile_versions WHERE profile_id = ? ORDER BY version").all(profileId)
+      : this.database.prepare("SELECT * FROM project_profile_versions ORDER BY profile_id, version").all()) as TaskRow[];
+    return rows.map((row) => ({
+      profileId: String(row.profile_id), version: Number(row.version), changedAt: String(row.changed_at),
+      changedFields: JSON.parse(String(row.changed_fields_json)) as string[], actor: "user", snapshot: parseProfileSnapshot(JSON.parse(String(row.snapshot_json))),
+    }));
+  }
+
+  loadProfileAuditEvents() {
+    return (this.database.prepare("SELECT event_type, created_at, actor, repo_id, profile_id, profile_version, task_id FROM profile_audit_events ORDER BY sequence").all() as TaskRow[]).map((row) => ({
+      type: String(row.event_type) as ProfileAuditEventType, createdAt: String(row.created_at), actor: "user" as const,
+      repoId: String(row.repo_id), profileId: String(row.profile_id), profileVersion: Number(row.profile_version), taskId: optionalString(row.task_id),
+    }));
+  }
+
+  createProjectProfile(profile: ProjectProfile) {
+    const snapshot = parseProfileSnapshot(profile);
+    this.transaction(() => {
+      this.database.prepare(`INSERT INTO project_profiles(profile_id, repo_id, name, version, enabled, profile_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(profile.profileId, profile.repoId, profile.name, profile.version, profile.enabled ? 1 : 0, JSON.stringify(profile), profile.createdAt, profile.updatedAt);
+      this.database.prepare(`INSERT INTO project_profile_versions(profile_id, version, changed_at, changed_fields_json, actor, snapshot_json) VALUES (?, ?, ?, ?, 'user', ?)`)
+        .run(profile.profileId, profile.version, profile.createdAt, JSON.stringify(["created"]), JSON.stringify(snapshot));
+      this.appendProfileAudit("profile_created", profile.repoId, profile.profileId, profile.version);
+      this.appendProfileAudit("profile_assigned", profile.repoId, profile.profileId, profile.version);
+    });
+  }
+
+  updateProjectProfile(profile: ProjectProfile, changedFields: readonly string[]) {
+    const snapshot = parseProfileSnapshot(profile);
+    this.transaction(() => {
+      const result = this.database.prepare(`UPDATE project_profiles SET name = ?, version = ?, enabled = ?, profile_json = ?, updated_at = ? WHERE profile_id = ? AND repo_id = ? AND version = ?`)
+        .run(profile.name, profile.version, profile.enabled ? 1 : 0, JSON.stringify(profile), profile.updatedAt, profile.profileId, profile.repoId, profile.version - 1);
+      if (Number(result.changes) !== 1) throw new Error("Profile was changed concurrently; reload and retry");
+      this.database.prepare(`INSERT INTO project_profile_versions(profile_id, version, changed_at, changed_fields_json, actor, snapshot_json) VALUES (?, ?, ?, ?, 'user', ?)`)
+        .run(profile.profileId, profile.version, profile.updatedAt, JSON.stringify(changedFields), JSON.stringify(snapshot));
+      this.appendProfileAudit("profile_updated", profile.repoId, profile.profileId, profile.version);
+      this.appendProfileAudit("profile_assigned", profile.repoId, profile.profileId, profile.version);
+    });
+  }
+
+  appendProfileAudit(type: ProfileAuditEventType, repoId: string, profileId: string, profileVersion: number, taskId?: string) {
+    if (!(["profile_created", "profile_updated", "profile_assigned", "profile_snapshot_created"] as const).includes(type)) throw new Error("Profile audit event type is invalid");
+    if (!/^[A-Za-z0-9._-]{1,100}$/.test(repoId) || !/^[A-Za-z0-9._-]{1,160}$/.test(profileId) || !Number.isSafeInteger(profileVersion) || profileVersion < 1) throw new Error("Profile audit identity is invalid");
+    this.database.prepare(`INSERT INTO profile_audit_events(event_id, event_type, created_at, actor, repo_id, profile_id, profile_version, task_id) VALUES (?, ?, ?, 'user', ?, ?, ?, ?)`)
+      .run(randomUUID(), type, new Date().toISOString(), repoId, profileId, profileVersion, taskId ?? null);
+  }
+
   /** Exposed for rollback tests; application writes use saveTask(). */
   transaction<T>(operation: () => T): T {
     if (this.transactionDepth > 0) return operation();
@@ -371,6 +451,7 @@ export class StateStore {
 
   private rowToTask(row: TaskRow, steps: FlowStepRow[]): RepoTask {
     const payload = parseObject(row.payload_json);
+    const parsedProfile = storedTaskProfile(row, payload);
     return {
       id: String(row.task_id), repoId: String(row.repo_id), repoName: String(row.repo_name),
       repoPath: String(row.repo_path), allowedRoot: String(row.allowed_root), branch: String(row.task_branch),
@@ -395,6 +476,8 @@ export class StateStore {
       ciMessage: optionalString(payload.ciMessage), error: optionalString(payload.error),
       recoveryStatus: String(row.recovery_status) as RepoTask["recoveryStatus"],
       recoveryMessage: optionalString(row.recovery_message),
+      profile: parsedProfile.profile,
+      profileSnapshotValid: parsedProfile.valid,
     } as RepoTask;
   }
 
@@ -487,13 +570,59 @@ export class StateStore {
         INSERT INTO task_events (event_id, task_id, event_type, created_at, actor, status, metadata_json)
           SELECT lower(hex(randomblob(16))), task_id, 'task_created', created_at, 'system', status, NULL FROM tasks;
       `);
-      this.createAppendOnlyTriggers();
       this.database.prepare("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)").run(2, new Date().toISOString());
     });
+    if (version < 2) version = 2;
+    if (version < 3) this.transaction(() => {
+      this.database.exec(`
+        CREATE TABLE project_profiles (
+          profile_id TEXT PRIMARY KEY, repo_id TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+          version INTEGER NOT NULL CHECK(version > 0), enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+          profile_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE project_profile_versions (
+          profile_id TEXT NOT NULL REFERENCES project_profiles(profile_id), version INTEGER NOT NULL CHECK(version > 0),
+          changed_at TEXT NOT NULL, changed_fields_json TEXT NOT NULL,
+          actor TEXT NOT NULL CHECK(actor = 'user'), snapshot_json TEXT NOT NULL,
+          PRIMARY KEY(profile_id, version)
+        );
+        CREATE TABLE profile_audit_events (
+          sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE,
+          event_type TEXT NOT NULL CHECK(event_type IN ('profile_created', 'profile_updated', 'profile_assigned', 'profile_snapshot_created')),
+          created_at TEXT NOT NULL, actor TEXT NOT NULL CHECK(actor = 'user'), repo_id TEXT NOT NULL,
+          profile_id TEXT NOT NULL, profile_version INTEGER NOT NULL CHECK(profile_version > 0), task_id TEXT
+        );
+        ALTER TABLE tasks ADD COLUMN profile_id TEXT;
+        ALTER TABLE tasks ADD COLUMN profile_version INTEGER;
+        ALTER TABLE tasks ADD COLUMN profile_snapshot_json TEXT;
+        INSERT INTO project_profiles(profile_id, repo_id, name, version, enabled, profile_json, created_at, updated_at)
+          SELECT lower(hex(randomblob(16))), repo_id, 'safe_default', 1, 1,
+            json_object(
+              'profileId', '', 'repoId', repo_id, 'name', 'safe_default', 'version', 1, 'enabled', json('true'),
+              'roles', json_object('codex','implement','cursor','review_only','claude','review_only'),
+              'validation', json_object('steps',json_array('npm_test','npm_lint','npm_typecheck','npm_build'),'missingScript','skip','timeout','standard'),
+              'git', json_object('isolatedWorktreeRequired',json('true'),'directMainWriteForbidden',json('true'),'commitRequiresApproval',json('true'),'prRequired',json('true'),'mergeAllowedInApp',json('false'),'forcePushAllowed',json('false'),'deployAllowedInApp',json('false')),
+              'approval', json_object('beforeCommit',json('true'),'beforeRework',json('true'),'diffHashRequired',json('true'),'secretScanRequired',json('true'),'validationRequired',json('true')),
+              'cleanup', json_object('allowCleanWorktreeRemoval',json('true'),'allowDirtyWorktreeRemoval',json('false'),'requireConfirmationIfPrOpen',json('true'),'requireStrongWarningIfReadyForMerge',json('true'))
+            ), MIN(created_at), MAX(updated_at)
+          FROM tasks GROUP BY repo_id;
+        UPDATE project_profiles SET profile_json = json_set(profile_json, '$.profileId', profile_id, '$.createdAt', created_at, '$.updatedAt', updated_at);
+        INSERT INTO project_profile_versions(profile_id, version, changed_at, changed_fields_json, actor, snapshot_json)
+          SELECT profile_id, 1, created_at, '["migration"]', 'user', json_remove(profile_json, '$.createdAt', '$.updatedAt') FROM project_profiles;
+        UPDATE tasks SET
+          profile_id = (SELECT profile_id FROM project_profiles WHERE project_profiles.repo_id = tasks.repo_id),
+          profile_version = 1,
+          profile_snapshot_json = (SELECT json_remove(profile_json, '$.createdAt', '$.updatedAt') FROM project_profiles WHERE project_profiles.repo_id = tasks.repo_id);
+        INSERT INTO profile_audit_events(event_id, event_type, created_at, actor, repo_id, profile_id, profile_version, task_id)
+          SELECT lower(hex(randomblob(16))), 'profile_snapshot_created', updated_at, 'user', repo_id, profile_id, profile_version, task_id FROM tasks;
+      `);
+      this.database.prepare("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)").run(3, new Date().toISOString());
+    });
+    this.createAppendOnlyTriggers();
   }
 
   private createAppendOnlyTriggers() {
-    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events"]) {
+    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events"]) {
       this.database.exec(`
         CREATE TRIGGER IF NOT EXISTS ${table}_no_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT, '${table} is append-only'); END;
         CREATE TRIGGER IF NOT EXISTS ${table}_no_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT, '${table} is append-only'); END;
@@ -502,7 +631,7 @@ export class StateStore {
   }
 
   private dropAppendOnlyTriggers() {
-    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events"]) {
+    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events"]) {
       this.database.exec(`DROP TRIGGER IF EXISTS ${table}_no_update; DROP TRIGGER IF EXISTS ${table}_no_delete;`);
     }
   }
@@ -530,7 +659,25 @@ function parseObject(value: unknown): Record<string, unknown> {
   try { const parsed = JSON.parse(String(value)); return parsed && typeof parsed === "object" ? parsed : {}; }
   catch { return {}; }
 }
-const metadataKeys = new Set(["durationMs", "diffHash", "commitSha", "prNumber", "changedFileCount", "additions", "deletions"]);
+function profileFromStored(value: unknown): ProjectProfile {
+  const parsed = parseObject(value);
+  const snapshot = parseProfileSnapshot(parsed);
+  if (typeof parsed.createdAt !== "string" || typeof parsed.updatedAt !== "string") throw new Error("Stored project profile timestamps are invalid");
+  return { ...snapshot, createdAt: parsed.createdAt, updatedAt: parsed.updatedAt };
+}
+function storedTaskProfile(row: TaskRow, payload: Record<string, unknown>): { profile: ProjectProfileSnapshot; valid: boolean } {
+  const raw = row.profile_snapshot_json ?? payload.profileSnapshot;
+  try {
+    const profile = parseProfileSnapshot(typeof raw === "string" ? JSON.parse(raw) : raw);
+    const valid = profile.repoId === String(row.repo_id)
+      && profile.profileId === String(row.profile_id)
+      && profile.version === Number(row.profile_version);
+    return { profile, valid };
+  } catch {
+    return { profile: safeDefaultSnapshot(String(row.repo_id), optionalString(row.profile_id) ?? `invalid-${String(row.repo_id)}`, optionalNumber(row.profile_version) ?? 1), valid: false };
+  }
+}
+const metadataKeys = new Set(["durationMs", "diffHash", "commitSha", "prNumber", "changedFileCount", "additions", "deletions", "profileId", "profileVersion"]);
 function validateMetadata(value: TaskEventMetadata | undefined) {
   if (!value) return undefined;
   for (const [key, item] of Object.entries(value)) {
@@ -540,6 +687,8 @@ function validateMetadata(value: TaskEventMetadata | undefined) {
     if (key === "prNumber" && (typeof item !== "number" || !Number.isSafeInteger(item) || item < 1)) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
     if (key === "diffHash" && (typeof item !== "string" || !/^[0-9a-f]{64}$/i.test(item))) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
     if (key === "commitSha" && (typeof item !== "string" || !/^[0-9a-f]{40,64}$/i.test(item))) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
+    if (key === "profileId" && (typeof item !== "string" || !/^[A-Za-z0-9._-]{1,160}$/.test(item))) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
+    if (key === "profileVersion" && (typeof item !== "number" || !Number.isSafeInteger(item) || item < 1)) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
   }
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as TaskEventMetadata;
 }
@@ -578,5 +727,6 @@ function rowToDashboardRow(row: TaskRow): DashboardRow {
     recoveryStatus: String(row.recovery_status), recoveryMessage: optionalString(row.recovery_message),
     worktreeStatus: String(row.worktree_status), worktreeAvailable: Number(row.worktree_available) === 1,
     bucket: String(row.bucket) as TaskBucket, payload: parseObject(row.payload_json),
+    profileId: optionalString(row.profile_id), profileVersion: optionalNumber(row.profile_version),
   };
 }

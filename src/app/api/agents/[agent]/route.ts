@@ -33,7 +33,7 @@ export async function POST(
     return Response.json({ error: `Prompt must be ${MAX_PROMPT_LENGTH} characters or fewer` }, { status: 400 });
   }
 
-  const safePrompt = `User request:\n${prompt}\n\nRespond with analysis or an answer only. Do not modify files, run git add, commit, push, create or approve a pull request, merge, deploy, change branches, or call MultiAgents approval APIs.`;
+  const safePrompt = `User request:\n${prompt}\n\nRespond with analysis or an answer only. Do not modify files, run git add, commit, push, create or approve a pull request, merge, deploy, change branches, or call MultiAgents approval or profile APIs.`;
   const result = await agents[agent as AgentId].run(safePrompt, { signal: request.signal });
   return Response.json(result);
 }

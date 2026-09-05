@@ -5,12 +5,13 @@ import { agentIds, flowStepIds, rerunnableStepIds, type AgentId, type AgentResul
 import { FlowEventParser } from "@/flows/sse";
 import { acquireRunLock, releaseRunLock } from "./run-lock";
 import { TaskDashboard } from "./task-dashboard";
+import { agentRoles, validationSteps, type ProjectProfile, type ProjectProfileSnapshot, type RolePolicy, type ValidationPolicy, type ValidationStep } from "@/profiles/policy";
 
 const labels: Record<AgentId, string> = { codex: "Codex", cursor: "Cursor", claude: "Claude" };
 const roleLabels = { draft: "Draft", review: "Review", final: "Final" } as const;
 type Mode = "parallel" | "review";
 type CardState = { status: AgentStatus; output: string; error?: string };
-type Repo = { id: string; name: string; branch: string; dirty: boolean };
+type Repo = { id: string; name: string; branch: string; dirty: boolean; profile: ProjectProfile };
 type OpenPull = { number: number; title: string; url: string; draft: boolean; base: string; head: string; headSha: string };
 type ValidationCheck = { name: string; status: "pass" | "fail" | "skip"; detail?: string };
 type SecretFinding = { path: string; kind: "filename" | "content" | "limit"; rule: string };
@@ -25,6 +26,7 @@ type RepoTask = {
   prReview?: PrReview; reviewIntake?: PrIntake; originalTaskAvailable: boolean; worktreeAvailable: boolean; latestPushedSha?: string; ciMessage?: string; error?: string;
   prompt: string; createdAt: string; updatedAt: string; flowId?: string; flowStatus?: string; flowSteps: FlowStep[]; finalOutput?: string;
   recoveryStatus: "recoverable" | "needs_attention" | "orphaned" | "invalid"; recoveryMessage?: string; worktreeStatus: "available" | "missing" | "removed" | "invalid";
+  profile: ProjectProfileSnapshot;
 };
 type TaskDiff = {
   trackedFiles: string[]; untrackedFiles: string[]; stat: string; patch: string; untrackedPatch: string;
@@ -349,11 +351,13 @@ export default function Home() {
     finally { setApprovalProcessing(false); }
   }
 
+  const selectedProfile = repos.find((repo) => repo.id === repoId)?.profile;
+
   return <main>
     <header><h1>MultiAgents</h1><p>Parallel answers or a fixed, reviewed response from local AI CLIs.</p></header>
     <TaskDashboard repos={repos} busy={sending || approvalProcessing || reviewProcessing} refreshToken={dashboardRefresh} onResume={(id) => void resumePersistedTask(id)} onHistory={(id, label) => void openDashboardHistory(id, label)} onError={setTaskError} />
     {historyTitle ? <section className="dashboardHistory"><div className="cardHeader"><div><span className="eyebrow">Dashboard history</span><h2>{historyTitle}</h2></div><button type="button" className="secondary" onClick={() => { setHistoryTitle(""); setTaskHistory(emptyHistory()); }}>Close</button></div><TaskHistoryPanel history={taskHistory} /></section> : null}
-    <section className="repoPanel"><label htmlFor="repository">Repository</label><div className="repoControls"><select id="repository" value={repoId} disabled={sending || Boolean(task)} onChange={(event) => { setRepoId(event.target.value); setOpenPulls([]); }}>{repos.map((repo) => <option key={repo.id} value={repo.id}>{repo.name}{repo.dirty ? " (dirty)" : ""}</option>)}</select><button type="button" disabled={!repoId || sending || Boolean(task)} onClick={createIsolatedTask}>Create isolated task</button><button type="button" disabled={!repoId || sending || reviewProcessing || Boolean(task)} onClick={loadOpenPulls}>{reviewProcessing ? "Loading…" : "Find open PRs"}</button></div>{!task && openPulls.length > 0 && <div className="openPulls"><h3>Open PRs from this repository origin</h3>{openPulls.map((pull) => <div className="openPull" key={pull.number}><span>#{pull.number} {pull.title} · <code>{pull.head}</code></span><button type="button" disabled={reviewProcessing} onClick={() => recoverPull(pull.number)}>Open review intake</button></div>)}</div>}{task && <><div className="taskReady"><div><strong>Repo:</strong> {task.repoName}</div><div><strong>Branch:</strong> <code>{task.branch}</code></div><div><strong>State:</strong> <code>{task.status}</code></div><div><strong>Worktree:</strong> {task.worktreeAvailable ? "ready" : "unavailable (review-only)"}</div><button type="button" className="delete" onClick={deleteWorktree} disabled={sending || approvalProcessing || reviewProcessing || Boolean(task.commitSha) || !task.worktreeAvailable}>Delete task worktree</button></div>{task.recoveryMessage && <p className="staleReason">{task.recoveryMessage}</p>}</>}{taskError && <ErrorBlock error={taskError} />}</section>
+    <section className="repoPanel"><label htmlFor="repository">Repository</label><div className="repoControls"><select id="repository" value={repoId} disabled={sending || Boolean(task)} onChange={(event) => { setRepoId(event.target.value); setOpenPulls([]); }}>{repos.map((repo) => <option key={repo.id} value={repo.id}>{repo.name}{repo.dirty ? " (dirty)" : ""}</option>)}</select><button type="button" disabled={!repoId || sending || Boolean(task) || selectedProfile?.enabled === false} onClick={createIsolatedTask}>Create isolated task</button><button type="button" disabled={!repoId || sending || reviewProcessing || Boolean(task)} onClick={loadOpenPulls}>{reviewProcessing ? "Loading…" : "Find open PRs"}</button></div>{selectedProfile && <ProfilePanel repoId={repoId} profile={selectedProfile} disabled={sending || approvalProcessing || reviewProcessing || Boolean(task)} onSaved={(profile) => { setRepos((current) => current.map((repo) => repo.id === repoId ? { ...repo, profile } : repo)); setDashboardRefresh((value) => value + 1); }} onError={setTaskError} />}{!task && openPulls.length > 0 && <div className="openPulls"><h3>Open PRs from this repository origin</h3>{openPulls.map((pull) => <div className="openPull" key={pull.number}><span>#{pull.number} {pull.title} · <code>{pull.head}</code></span><button type="button" disabled={reviewProcessing} onClick={() => recoverPull(pull.number)}>Open review intake</button></div>)}</div>}{task && <><div className="taskReady"><div><strong>Repo:</strong> {task.repoName}</div><div><strong>Profile:</strong> {task.profile.name} v{task.profile.version}</div><div><strong>Branch:</strong> <code>{task.branch}</code></div><div><strong>State:</strong> <code>{task.status}</code></div><div><strong>Worktree:</strong> {task.worktreeAvailable ? "ready" : "unavailable (review-only)"}</div><button type="button" className="delete" onClick={deleteWorktree} disabled={sending || approvalProcessing || reviewProcessing || Boolean(task.commitSha) || !task.worktreeAvailable}>Delete task worktree</button></div>{task.recoveryMessage && <p className="staleReason">{task.recoveryMessage}</p>}</>}{taskError && <ErrorBlock error={taskError} />}</section>
     <form onSubmit={submit}>
       <fieldset className="modes" disabled={sending}><legend>Mode</legend><label><input type="radio" checked={mode === "parallel"} onChange={() => setMode("parallel")} /> Parallel</label><label><input type="radio" checked={mode === "review"} onChange={() => setMode("review")} /> Review Flow</label></fieldset>
       <label htmlFor="prompt">Prompt</label>
@@ -372,6 +376,59 @@ export default function Home() {
     {task?.prNumber && <PrReviewPanel task={task} processing={reviewProcessing} onFetch={fetchPrReview} onApply={applyReviewFixes} />}
     {task && <TaskHistoryPanel history={taskHistory} />}
   </main>;
+}
+
+type ProfilePanelProps = { repoId: string; profile: ProjectProfile; disabled: boolean; onSaved: (profile: ProjectProfile) => void; onError: (error: string) => void };
+
+function ProfilePanel(props: ProfilePanelProps) {
+  return <ProfilePanelContent key={`${props.repoId}-${props.profile.profileId}-${props.profile.version}`} {...props} />;
+}
+
+function ProfilePanelContent({ repoId, profile, onSaved, onError }: ProfilePanelProps) {
+  const [editing, setEditing] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [name, setName] = useState(profile.name);
+  const [enabled, setEnabled] = useState(profile.enabled);
+  const [roles, setRoles] = useState<RolePolicy>(profile.roles);
+  const [validation, setValidation] = useState<ValidationPolicy>(profile.validation);
+
+  function toggleStep(step: ValidationStep) {
+    setValidation((current) => ({ ...current, steps: current.steps.includes(step) ? current.steps.filter((item) => item !== step) : validationSteps.filter((item) => current.steps.includes(item) || item === step) }));
+  }
+
+  async function saveProfile() {
+    if (!window.confirm(`Save ${name} as the human-managed profile for this repository? Existing tasks will keep their snapshots.`)) return;
+    setSaving(true); onError("");
+    try {
+      const response = await fetch(`/api/repos/${encodeURIComponent(repoId)}/profile`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-MultiAgents-Human-Action": "profile-save" },
+        body: JSON.stringify({ confirmation: true, name, enabled, roles, validation }),
+      });
+      const data = await response.json() as { profile?: ProjectProfile; error?: string };
+      if (!response.ok || !data.profile) throw new Error(data.error || "Profile update failed");
+      onSaved(data.profile); setEditing(false);
+    } catch (error) { onError(message(error)); }
+    finally { setSaving(false); }
+  }
+
+  return <section className="profilePanel" aria-label="Project profile">
+    <div className="profileHeading"><div><span className="eyebrow">Project Settings</span><h3>Profile: {profile.name} v{profile.version}</h3></div><button type="button" className="secondary" disabled={saving} onClick={() => setEditing((value) => !value)}>{editing ? "Cancel edit" : "Edit profile"}</button></div>
+    <div className="profileSummary">
+      <div className="roleGrid">{agentIds.map((id) => <div key={id}><strong>{labels[id]}</strong><span className={`roleBadge ${profile.roles[id]}`}>{profile.roles[id].replace("_", "-")}</span></div>)}</div>
+      <div><strong>Validation</strong><p>{profile.validation.steps.map((step) => `✓ ${step.replace("npm_", "")}`).join(" · ") || "No steps"} · missing: {profile.validation.missingScript} · {profile.validation.timeout}</p></div>
+      <div><strong>Git & safety</strong><p>✓ isolated worktree · ✓ human approval · ✓ PR required · ✕ merge/deploy in app · ✕ force push</p></div>
+    </div>
+    {editing ? <div className="profileEditor">
+      <label>Profile name<input value={name} maxLength={80} onChange={(event) => setName(event.target.value)} /></label>
+      <label className="profileEnabled"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /> Enabled for new tasks</label>
+      <fieldset><legend>Agent roles</legend><div className="roleEditor">{agentIds.map((id) => <label key={id}>{labels[id]}<select value={roles[id]} onChange={(event) => setRoles((current) => ({ ...current, [id]: event.target.value as RolePolicy[typeof id] }))}>{agentRoles.filter((role) => id === "codex" || role !== "implement").map((role) => <option key={role} value={role}>{role.replace("_", "-")}</option>)}</select></label>)}</div></fieldset>
+      <fieldset><legend>Validation allowlist</legend><div className="validationEditor">{validationSteps.map((step) => <label key={step}><input type="checkbox" checked={validation.steps.includes(step)} onChange={() => toggleStep(step)} /> {step.replace("npm_", "npm ")}</label>)}</div></fieldset>
+      <div className="profileOptions"><label>Missing script<select value={validation.missingScript} onChange={(event) => setValidation((current) => ({ ...current, missingScript: event.target.value as ValidationPolicy["missingScript"] }))}><option value="skip">skip</option><option value="fail">fail</option></select></label><label>Timeout preset<select value={validation.timeout} onChange={(event) => setValidation((current) => ({ ...current, timeout: event.target.value as ValidationPolicy["timeout"] }))}><option value="standard">standard</option><option value="extended">extended</option></select></label></div>
+      <p className="muted">Git, approval, cleanup, merge, deploy, and force-push safety values are server-fixed and cannot be relaxed.</p>
+      <button type="button" disabled={saving || !name} onClick={() => void saveProfile()}>{saving ? "Saving…" : "Save profile"}</button>
+    </div> : null}
+  </section>;
 }
 
 function PrReviewPanel({ task, processing, onFetch, onApply }: { task: RepoTask; processing: boolean; onFetch: () => void; onApply: () => void }) {

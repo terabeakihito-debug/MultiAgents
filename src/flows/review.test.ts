@@ -80,6 +80,35 @@ describe("runReviewFlow", () => {
     expect(calls.codex[1]).toContain("Claude review unavailable due to execution error.");
   });
 
+  it("never executes an agent disabled by the task profile", async () => {
+    const { adapters, calls } = setup({ codex: [ok("codex", "draft"), ok("codex", "final")], cursor: [ok("cursor", "must-not-run")], claude: [ok("claude", "review")] });
+    const result = await runReviewFlow("request", { agents: adapters, cwd: "/task", roles: { codex: "implement", cursor: "disabled", claude: "review_only" }, fingerprint: async () => "same" });
+    expect(calls.cursor).toHaveLength(0);
+    expect(result.steps[1]).toMatchObject({ status: "skipped", error: "cursor is disabled by the task profile" });
+  });
+
+  it("passes write authority only to implement roles and fingerprints review-only roles", async () => {
+    const { adapters } = setup({ codex: [ok("codex", "draft"), ok("codex", "final")], cursor: [ok("cursor", "review")], claude: [ok("claude", "review")] });
+    const options: Record<AgentId, AgentRunOptions[]> = { codex: [], cursor: [], claude: [] };
+    for (const id of ["codex", "cursor", "claude"] as const) {
+      const original = adapters[id].run;
+      adapters[id].run = vi.fn(async (prompt, runOptions) => { options[id].push(runOptions ?? {}); return original(prompt, runOptions); });
+    }
+    await runReviewFlow("request", { agents: adapters, cwd: "/task", roles: { codex: "implement", cursor: "review_only", claude: "review_only" }, fingerprint: async () => "same" });
+    expect(options.codex.every((value) => value.cwd === "/task" && value.writeAccess === true)).toBe(true);
+    expect(options.cursor[0].writeAccess).toBe(false);
+    expect(options.claude[0].writeAccess).toBe(false);
+  });
+
+  it("fails closed when a review-only agent changes the worktree fingerprint", async () => {
+    const { adapters } = setup({ codex: [ok("codex", "draft"), ok("codex", "final")], cursor: [ok("cursor", "review")] });
+    let fingerprintCalls = 0;
+    const fingerprint = async () => (++fingerprintCalls === 2 ? "before-cursor" : fingerprintCalls === 3 ? "after-cursor" : "stable");
+    const result = await runReviewFlow("request", { agents: adapters, cwd: "/task", roles: { codex: "implement", cursor: "review_only", claude: "disabled" }, fingerprint });
+    expect(result.steps[1].status).toBe("error");
+    expect(result.steps[1].error).toContain("modified the review-only worktree");
+  });
+
   it("continues emitting the final events after a Claude failure", async () => {
     const { adapters } = setup({ codex: [ok("codex", "draft"), ok("codex", "final")], claude: [fail("claude")] });
     const events: FlowEvent[] = [];

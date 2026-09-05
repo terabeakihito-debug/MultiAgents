@@ -80,7 +80,7 @@ describe("createAgentAdapter", () => {
     );
   });
 
-  it("keeps the existing Codex arguments for a normal non-repository run", async () => {
+  it("forces a normal non-repository Codex run into read-only mode", async () => {
     const child = fakeChild();
     const spawnProcess = vi.fn(() => child);
     const adapter = createAgentAdapter(
@@ -92,7 +92,7 @@ describe("createAgentAdapter", () => {
     await promise;
     expect(spawnProcess).toHaveBeenCalledWith(
       "codex",
-      ["exec", "--cd", "/workspace", "answer only"],
+      ["exec", "--sandbox", "read-only", "--cd", "/workspace", "answer only"],
       expect.objectContaining({ cwd: "/workspace", shell: false }),
     );
   });
@@ -141,8 +141,8 @@ describe("createAgentAdapter", () => {
   it("uses fixed CLI read-only modes for repository reviewers", () => {
     expect(cursorArgs("review", "/task", true, false)).toEqual(["--trust", "--workspace", "/task", "--mode", "ask", "--sandbox", "enabled", "-p", "review"]);
     expect(claudeArgs("review", "/task", true, false)).toEqual(["--permission-mode", "plan", "--tools", "Read,Glob,Grep", "-p", "review"]);
-    expect(cursorArgs("answer", "/workspace", false, false)).toEqual(["--trust", "--workspace", "/workspace", "-p", "answer"]);
-    expect(claudeArgs("answer", "/workspace", false, false)).toEqual(["-p", "answer"]);
+    expect(cursorArgs("answer", "/workspace", false, false)).toEqual(["--trust", "--workspace", "/workspace", "--mode", "ask", "--sandbox", "enabled", "-p", "answer"]);
+    expect(claudeArgs("answer", "/workspace", false, false)).toEqual(["--permission-mode", "plan", "--tools", "Read,Glob,Grep", "-p", "answer"]);
   });
 
   it("returns an agent-scoped error without throwing", async () => {

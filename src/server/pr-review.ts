@@ -19,7 +19,7 @@ import {
 import type { PullRequestCheck, PullRequestReview, PullRequestReviewItem, ReviewDisposition } from "./pr-review-types";
 import { ALLOWED_ROOT, validateRepository } from "./repositories";
 import { acquireTaskLock, isTaskLocked, releaseTaskLock } from "./task-lock";
-import { WORKTREE_ROOT, getTask, getTaskDiff, persistTask, publicTask, recordApprovalEvent, recordDiffVersion, recordTaskEvent, registerRecoveredTask, transitionTask, type RepoTask } from "./tasks";
+import { WORKTREE_ROOT, getTask, getTaskDiff, persistTask, publicTask, recordApprovalEvent, recordDiffVersion, recordTaskEvent, registerRecoveredTask, requireTaskProfile, transitionTask, type RepoTask } from "./tasks";
 
 const MAX_REVIEW_BODY_CHARS = 10_000;
 const MAX_REVIEW_ITEMS = 200;
@@ -53,7 +53,7 @@ const defaults: PrReviewDependencies = {
   push: async (task) => { await runGit(task.worktreePath, ["push", "origin", task.branch]); },
   checkGhAuth: async (task) => { await checkedGh(["auth", "status", "--hostname", "github.com"], task.worktreePath); },
   checkDependencies: async (task) => { const { checkTaskDependencies } = await import("./pull-request"); await checkTaskDependencies(task); },
-  runValidation: async (task, script) => { const { runValidationCommand } = await import("./pull-request"); await runValidationCommand(task, script); },
+  runValidation: async (task, script, timeoutMs) => { const { runValidationCommand } = await import("./pull-request"); await runValidationCommand(task, script, timeoutMs); },
   verifyPush: async (task, expectedSha) => {
     const review = await fetchPullRequestReview(task);
     if (review.headSha !== expectedSha) throw new Error("Existing PR head did not update to the rework commit");
@@ -80,6 +80,7 @@ export async function fetchReviewIntake(taskId: string, dependencies: Partial<Pr
       const diff = await deps.fetchDiff(task);
       const intake = await deps.runIntake(task.prompt, diff, review, {
         agents,
+        roles: requireTaskProfile(task).roles,
         cwd: task.worktreeAvailable ? task.worktreePath : task.repoPath,
         fingerprint: async () => reviewFingerprint(task),
       });
@@ -112,6 +113,8 @@ export async function applyReviewedFixes(taskId: string, input: { approved: true
   const deps = { ...defaults, ...dependencies };
   try {
     const task = requireTask(taskId);
+    const profile = requireTaskProfile(task);
+    if (!profile.approval.beforeRework) throw new ApprovalError("Task profile does not require the mandatory rework approval gate");
     if (input.approved !== true) throw new ApprovalError("Explicit human approval is required", 400);
     if (task.status !== "awaiting_rework_approval" || !task.prReview || !task.reviewIntake?.requiresRework) throw new ApprovalError("Reviewed fixes are not awaiting approval");
     if (!task.originalTaskAvailable || !task.worktreeAvailable || !task.prompt) throw new ApprovalError("Original task context or managed worktree was lost after restart; rework cannot start safely");
@@ -125,6 +128,7 @@ export async function applyReviewedFixes(taskId: string, input: { approved: true
       const diff = await deps.fetchDiff(task);
       result = await deps.runRework(task.prompt, diff, task.prReview, task.reviewIntake, {
         agents,
+        roles: profile.roles,
         cwd: task.worktreePath,
         fingerprint: async () => (await createDiffSnapshot(task)).hash,
         getDiff: async () => {
@@ -173,6 +177,10 @@ export async function approveRework(taskId: string, input: ApprovalInput, depend
   const deps = { ...defaults, ...dependencies };
   try {
     const task = requireTask(taskId);
+    const profile = requireTaskProfile(task);
+    if (!profile.git.commitRequiresApproval || !profile.git.prRequired || !profile.approval.beforeCommit || !profile.approval.diffHashRequired || !profile.approval.secretScanRequired || !profile.approval.validationRequired || profile.git.mergeAllowedInApp || profile.git.forcePushAllowed || profile.git.deployAllowedInApp) {
+      throw new ApprovalError("Task profile does not satisfy the enforced safe rework policy");
+    }
     requireReworkApproval(task, input);
     const acceptedApproval = { approvalId: input.approvalId, diffHash: input.diffHash, purpose: "rework" as const };
     recordApprovalEvent(task, "accepted", acceptedApproval, "accepted");

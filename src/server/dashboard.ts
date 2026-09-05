@@ -122,6 +122,7 @@ export function validatedDashboardPrUrl(task: RepoTask | undefined, row: Pick<Da
 
 async function dashboardTask(row: DashboardRow, now: Date): Promise<DashboardTask> {
   const task = getTask(row.taskId);
+  const profile = object(row.payload.profileSnapshot);
   let dirty = false;
   let cleanupCheckFailed = false;
   if (task?.worktreeAvailable && row.worktreeStatus === "available") {
@@ -146,6 +147,8 @@ async function dashboardTask(row: DashboardRow, now: Date): Promise<DashboardTas
     createdAt: row.createdAt, updatedAt: row.updatedAt,
     inactive: now.getTime() - Date.parse(row.updatedAt) >= INACTIVE_AFTER_MS,
     recoveryStatus: row.recoveryStatus, recoveryMessage: row.recoveryMessage, worktreeStatus: row.worktreeStatus,
+    profileName: typeof profile.name === "string" ? profile.name : "invalid profile",
+    profileVersion: typeof profile.version === "number" ? profile.version : row.profileVersion ?? 0,
     nextAction, nextActionLabel: NEXT_ACTION_LABELS[nextAction], attentionReason: row.bucket === "needs_attention" ? attentionReasonFor(row) : undefined,
     canResume: row.bucket !== "archived" && row.recoveryStatus !== "invalid", canViewDiff: row.worktreeAvailable && row.worktreeStatus === "available",
     canRefreshPr: Boolean(row.prNumber && prUrl),

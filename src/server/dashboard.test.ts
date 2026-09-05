@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { PullRequestReview } from "./pr-review-types";
-import { DashboardQueryError, nextActionFor, parseDashboardQuery, summarizeTaskPrompt, validatedDashboardPrUrl } from "./dashboard";
+import { DashboardQueryError, getDashboard, nextActionFor, parseDashboardQuery, summarizeTaskPrompt, validatedDashboardPrUrl } from "./dashboard";
 import { StateStore, replaceStateStoreForTests, type DashboardQuery } from "./state-store";
 import type { RepoTask, TaskStatus } from "./tasks";
 
@@ -38,6 +38,13 @@ beforeEach(() => {
 afterEach(() => { replaceStateStoreForTests(new StateStore(":memory:")); });
 
 describe("Phase 9 dashboard query", () => {
+  it("displays the immutable task profile name and version", async () => {
+    const item = task("10111111-1111-4111-8111-111111111111", "draft", { worktreeAvailable: false, worktreeStatus: "missing" });
+    store.saveTask(item);
+    const result = await getDashboard(query(), new Date("2026-01-01T00:00:01.000Z"));
+    expect(result.tasks[0]).toMatchObject({ profileName: "safe_default", profileVersion: 1 });
+  });
+
   it("classifies every dashboard bucket and returns counts", () => {
     store.saveTask(task("11111111-1111-4111-8111-111111111111", "draft", { flowStatus: "running" }));
     store.saveTask(task("22222222-2222-4222-8222-222222222222", "ci_failed"));

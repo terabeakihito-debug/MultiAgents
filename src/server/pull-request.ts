@@ -4,6 +4,7 @@ import { lstat, readFile, readlink, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { GIT_BINARY, runGit } from "./git";
 import { validateRepository } from "./repositories";
+import { validationScript, validationTimeoutMs, type ValidationStep } from "../profiles/policy";
 import { acquireTaskLock, clearTaskLocksForTests, isTaskLocked, releaseTaskLock } from "./task-lock";
 import {
   MAX_UNTRACKED_FILE_BYTES,
@@ -17,6 +18,7 @@ import {
   recordApprovalEvent,
   recordDiffVersion,
   recordTaskEvent,
+  requireTaskProfile,
   transitionTask,
   type RepoTask,
   type SecretFinding,
@@ -40,7 +42,7 @@ export type ApprovalDependencies = {
   checkGhAuth: (task: RepoTask) => Promise<void>;
   createPr: (task: RepoTask, remote: GitHubRemote, title: string, body: string) => Promise<{ url: string; number: number }>;
   checkDependencies: (task: RepoTask) => Promise<void>;
-  runValidation: (task: RepoTask, script: ValidationScript) => Promise<void>;
+  runValidation: (task: RepoTask, script: ValidationScript, timeoutMs?: number) => Promise<void>;
 };
 
 export type ValidationScript = "test" | "lint" | "typecheck" | "build";
@@ -158,6 +160,10 @@ export async function approveAndCreatePullRequest(taskId: string, input: Approva
   try {
     const task = getTask(taskId);
     if (!task) throw new ApprovalError("Task not found", 404);
+    const profile = requireTaskProfile(task);
+    if (!profile.git.prRequired || !profile.git.commitRequiresApproval || !profile.approval.beforeCommit || !profile.approval.diffHashRequired || !profile.approval.secretScanRequired || !profile.approval.validationRequired || profile.git.mergeAllowedInApp || profile.git.forcePushAllowed || profile.git.deployAllowedInApp) {
+      throw new ApprovalError("Task profile does not satisfy the enforced safe PR policy");
+    }
     requireApproval(task, input);
     const acceptedApproval = { approvalId: input.approvalId, diffHash: input.diffHash, purpose: "create_pr" as const };
     recordApprovalEvent(task, "accepted", acceptedApproval, "accepted");
@@ -287,6 +293,8 @@ export async function retryPullRequest(taskId: string, dependencies: Partial<App
   try {
     const task = getTask(taskId);
     if (!task) throw new ApprovalError("Task not found", 404);
+    const profile = requireTaskProfile(task);
+    if (!profile.git.prRequired || profile.git.mergeAllowedInApp || profile.git.forcePushAllowed || profile.git.deployAllowedInApp) throw new ApprovalError("Task profile forbids this Git operation");
     if (task.prNumber && task.prUrl) return publicTask(task);
     if (task.status !== "pr_failed" || !task.commitSha || task.approvalState !== "used") throw new ApprovalError("PR retry is not available for this task");
     await validateCommittedTask(task);
@@ -326,6 +334,8 @@ function requireApproval(task: RepoTask, input: ApprovalInput) {
 }
 
 export async function validateTaskSafety(task: RepoTask) {
+  const profile = requireTaskProfile(task);
+  if (!profile.git.isolatedWorktreeRequired || !profile.git.directMainWriteForbidden) throw new Error("Task profile does not require an isolated worktree");
   const validated = await validateRepository(task.repoId, task.allowedRoot);
   const repoPath = await realpath(task.repoPath);
   const worktreePath = await realpath(task.worktreePath);
@@ -452,6 +462,7 @@ export async function scanSecrets(snapshot: DiffSnapshot): Promise<SecretFinding
 }
 
 export async function runProjectValidation(task: RepoTask, deps: Pick<ApprovalDependencies, "checkDependencies" | "runValidation">) {
+  const profile = requireTaskProfile(task);
   let packageJson: { scripts?: Record<string, unknown> } | undefined;
   const packagePath = join(task.worktreePath, "package.json");
   try {
@@ -466,8 +477,16 @@ export async function runProjectValidation(task: RepoTask, deps: Pick<ApprovalDe
       throw new ApprovalError(task.error);
     }
   }
-  const scripts = (["test", "lint", "typecheck", "build"] as const)
-    .filter((script) => typeof packageJson?.scripts?.[script] === "string");
+  const configured = profile.validation.steps.map((step: ValidationStep) => ({ step, script: validationScript(step) }));
+  const scripts = configured.filter(({ script }) => typeof packageJson?.scripts?.[script] === "string");
+  const missing = configured.filter(({ script }) => typeof packageJson?.scripts?.[script] !== "string");
+  if (missing.length && profile.validation.missingScript === "fail") {
+    for (const { script } of missing) fail(task, npmLabel(script), packageJson ? "Required script not defined" : "No package.json");
+    task.approvalState = "invalidated";
+    transitionTask(task, "validation_failed");
+    task.error = "A validation script required by the task profile is missing. No commit was created.";
+    throw new ApprovalError(task.error);
+  }
   if (scripts.length) {
     try {
       await deps.checkDependencies(task);
@@ -480,16 +499,17 @@ export async function runProjectValidation(task: RepoTask, deps: Pick<ApprovalDe
       throw new ApprovalError(task.error);
     }
   }
-  for (const script of ["test", "lint", "typecheck", "build"] as const) {
-    if (!scripts.includes(script)) {
+  for (const { script } of configured) {
+    if (!scripts.some((item) => item.script === script)) {
       task.validation.push({ name: npmLabel(script), status: "skip", detail: packageJson ? "Script not defined" : "No package.json" });
       continue;
     }
+    const timeoutMs = validationTimeoutMs(script, profile.validation.timeout);
     try {
-      await deps.runValidation(task, script);
+      await deps.runValidation(task, script, timeoutMs);
       pass(task, npmLabel(script));
     } catch (error) {
-      const detail = validationFailureDetail(error, VALIDATION_TIMEOUT_MS[script]);
+      const detail = validationFailureDetail(error, timeoutMs);
       fail(task, npmLabel(script), detail);
       task.approvalState = "invalidated";
       transitionTask(task, "validation_failed");
@@ -517,10 +537,10 @@ export async function checkTaskDependencies(task: RepoTask) {
   }
 }
 
-export async function runValidationCommand(task: RepoTask, script: ValidationScript) {
+export async function runValidationCommand(task: RepoTask, script: ValidationScript, timeoutMs = VALIDATION_TIMEOUT_MS[script]) {
   const npm = npmInvocation(script);
   const envOverrides: NodeJS.ProcessEnv | undefined = script === "build" ? { NODE_ENV: "production" } : undefined;
-  await checkedProcess(npm.binary, npm.args, task.worktreePath, VALIDATION_TIMEOUT_MS[script], envOverrides);
+  await checkedProcess(npm.binary, npm.args, task.worktreePath, timeoutMs, envOverrides);
 }
 
 export function validateGitHubRemote(url: string): GitHubRemote {

@@ -1,3 +1,5 @@
+import { isAgentExecutionActive } from "./agent-execution-guard";
+
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 export function rejectNonLocalRequest(request: Request): Response | undefined {
@@ -15,6 +17,25 @@ export function rejectNonLocalRequest(request: Request): Response | undefined {
     } catch {
       return Response.json({ error: "Invalid Origin header" }, { status: 403 });
     }
+  }
+}
+
+export function rejectNonHumanProfileMutation(request: Request): Response | undefined {
+  const local = rejectNonLocalRequest(request);
+  if (local) return local;
+  if (isAgentExecutionActive()) return Response.json({ error: "Profile changes are blocked while an agent process is running" }, { status: 423 });
+  const origin = request.headers.get("origin");
+  const fetchSite = request.headers.get("sec-fetch-site");
+  const humanAction = request.headers.get("x-multiagents-human-action");
+  if (!origin || fetchSite !== "same-origin" || humanAction !== "profile-save") {
+    return Response.json({ error: "Profile changes require an explicit same-origin human UI action" }, { status: 403 });
+  }
+  try {
+    const originUrl = new URL(origin);
+    const requestUrl = new URL(request.url);
+    if (originUrl.origin !== requestUrl.origin || !LOOPBACK_HOSTS.has(originUrl.hostname)) throw new Error();
+  } catch {
+    return Response.json({ error: "Profile changes require the localhost UI" }, { status: 403 });
   }
 }
 

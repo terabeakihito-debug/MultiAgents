@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { rejectNonLocalRequest } from "./request-security";
+import { rejectNonHumanProfileMutation, rejectNonLocalRequest } from "./request-security";
+import { beginAgentExecution } from "./agent-execution-guard";
 
 describe("rejectNonLocalRequest", () => {
   it("allows a localhost same-origin request", () => {
@@ -17,5 +18,19 @@ describe("rejectNonLocalRequest", () => {
       headers: { host: "localhost:3000", origin: "https://example.test" },
     });
     expect(rejectNonLocalRequest(badOrigin)?.status).toBe(403);
+  });
+});
+
+describe("rejectNonHumanProfileMutation", () => {
+  it("requires the explicit same-origin browser profile-save signal", () => {
+    const agentLike = new Request("http://localhost:3000/api/repos/repo/profile", { method: "POST", headers: { host: "localhost:3000" } });
+    expect(rejectNonHumanProfileMutation(agentLike)?.status).toBe(403);
+    const humanUi = new Request("http://localhost:3000/api/repos/repo/profile", { method: "POST", headers: {
+      host: "localhost:3000", origin: "http://localhost:3000", "sec-fetch-site": "same-origin", "x-multiagents-human-action": "profile-save",
+    } });
+    expect(rejectNonHumanProfileMutation(humanUi)).toBeUndefined();
+    const end = beginAgentExecution();
+    expect(rejectNonHumanProfileMutation(humanUi)?.status).toBe(423);
+    end();
   });
 });

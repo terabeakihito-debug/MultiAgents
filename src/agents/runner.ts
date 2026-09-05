@@ -1,6 +1,7 @@
 import { spawn, type SpawnOptions } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import type { AgentAdapter, AgentDefinition, AgentResult } from "./types";
+import { beginAgentExecution } from "../server/agent-execution-guard";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_OUTPUT_BYTES = 1_000_000;
@@ -43,10 +44,12 @@ function runProcess(
     };
 
     let child;
+    let endAgentExecution: (() => void) | undefined;
     try {
       // A per-run cwd is supplied only after a server-side repository task lookup.
       // It is intentionally a boolean capability, not a client-selectable sandbox value.
       child = spawnProcess(definition.binary, definition.args(prompt, cwd, Boolean(runOptions?.cwd), runOptions?.writeAccess ?? Boolean(runOptions?.cwd)), spawnOptions);
+      endAgentExecution = beginAgentExecution();
     } catch (error) {
       resolve(errorResult(definition.id, error));
       return;
@@ -62,6 +65,7 @@ function runProcess(
       finished = true;
       clearTimeout(timer);
       signal?.removeEventListener("abort", abort);
+      endAgentExecution?.();
       resolve(result);
     };
 

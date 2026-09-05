@@ -188,12 +188,13 @@ is also manual.
 
 ## Local state persistence
 
-Phase 8 uses SQLite from Node.js itself; it does not add a database server or
+Phase 8 and Phase 10 use SQLite from Node.js itself; they do not add a database server or
 ORM. State is stored at `~/.multiagents/state.db`, outside every repository.
 The directory is forced to mode `0700` and the database file to `0600` when it
 is opened. Schema migrations are tracked in `schema_version`; the current
-schema is version 2. The v1→v2 migration runs in one transaction and preserves
-existing task and flow-step snapshots.
+schema is version 3. The v1→v2 and v2→v3 migrations run transactionally and
+preserve existing task and flow-step snapshots. Existing tasks receive a
+`safe_default` v1 profile snapshot during the v3 migration.
 
 The database stores task/repository/worktree identity, the latest state-machine
 status, original prompt, current Review Flow steps and outputs, stale/rerun
@@ -237,6 +238,39 @@ commit SHA and PR number act as idempotency barriers. Task snapshots and flow
 step updates use SQLite transactions.
 
 The server remains localhost-only and has no multi-user or remote-sync mode.
+
+## Project Profiles
+
+Phase 10 stores a human-managed Project Profile for each repository in the
+MultiAgents SQLite state database. Repository files, prompts, agent output, and
+review comments are never profile sources and cannot change policy. The
+built-in `safe_default` preset assigns Codex `implement`, Cursor `review_only`,
+and Claude `review_only`; an agent may also be set to `disabled`, in which case
+the server does not start it.
+
+Validation Presets are an ordered selection from the fixed `npm_test`,
+`npm_lint`, `npm_typecheck`, and `npm_build` allowlist. The server maps these to
+`npm test`, `npm run lint`, `npm run typecheck`, and `npm run build`. Profiles
+cannot contain arbitrary commands, binaries, shell hooks, or numeric timeouts.
+The `standard` and `extended` timeout presets map to server-owned limits, and
+missing scripts use the selected `skip` or `fail` policy.
+
+Every task receives an immutable copy of the assigned profile and its version
+when the isolated worktree is created. Updating a repository from profile v1 to
+v2 affects only new tasks; Resume continues to enforce each task's saved
+snapshot even if the current repository profile is later disabled or removed.
+An inconsistent snapshot is classified as **Needs Attention**.
+
+Profile edits require an explicit, confirmed action in **Project Settings**.
+Each save increments the profile version and records `profile_created`,
+`profile_updated`, `profile_assigned`, and/or `profile_snapshot_created` audit
+data with safe identifiers only and actor `user`. Agent processes are never
+given a profile-edit capability, and the mutation endpoint requires a
+same-origin localhost browser action. Git, approval, and cleanup safety values
+are server-fixed: isolated worktrees, diff hashes, secret scan, validation,
+human approval, and a PR are required; dirty cleanup, direct-main writes,
+force-push, merge, and deploy remain forbidden. MultiAgents remains
+localhost-only.
 
 ## Verification
 

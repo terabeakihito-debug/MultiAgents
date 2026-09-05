@@ -45,6 +45,8 @@ export type DashboardTask = {
   recoveryStatus: string;
   recoveryMessage?: string;
   worktreeStatus: string;
+  profileName: string;
+  profileVersion: number;
   nextAction: NextAction;
   nextActionLabel: string;
   attentionReason?: string;

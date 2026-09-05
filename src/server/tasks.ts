@@ -6,7 +6,9 @@ import { runGit } from "./git";
 import { ALLOWED_ROOT, validateRepository } from "./repositories";
 import { getStateStore, type ApprovalEvent, type TaskEventActor, type TaskEventMetadata, type TaskEventType, type TaskHistory } from "./state-store";
 import type { FlowEvent, FlowStep, ReviewRerunEvent } from "../agents/types";
+import { parseProfileSnapshot, safeDefaultSnapshot, type ProjectProfileSnapshot } from "../profiles/policy";
 import type { PrReviewIntake, PullRequestReview, ReworkFlowResult } from "./pr-review-types";
+import { getOrCreateRepoProfile, requireUsableTaskProfile, taskProfileSnapshot } from "./project-profiles";
 
 export const WORKTREE_ROOT = join(homedir(), "code", ".multiagents-worktrees");
 export const TASK_BRANCH_PATTERN = /^multiagents\/[0-9a-f-]{36}$/;
@@ -91,6 +93,8 @@ export type RepoTask = {
   recoveryStatus: RecoveryStatus;
   recoveryMessage?: string;
   worktreeStatus: WorktreeStatus;
+  profile?: ProjectProfileSnapshot;
+  profileSnapshotValid?: boolean;
 };
 
 export type TaskDiff = {
@@ -149,6 +153,8 @@ export async function createTask(repoId: string, options: { allowedRoot?: string
   const allowedRoot = options.allowedRoot ?? ALLOWED_ROOT;
   const repo = await validateRepository(repoId, allowedRoot);
   if (repo.dirty) throw new Error("Repository has uncommitted changes. Commit or stash them before creating a worktree.");
+  const profile = taskProfileSnapshot(await getOrCreateRepoProfile(repoId, allowedRoot));
+  requireUsableTaskProfile(profile, repoId);
   const id = randomUUID();
   const branch = `multiagents/${id}`;
   const worktreeRoot = options.worktreeRoot ?? WORKTREE_ROOT;
@@ -183,12 +189,16 @@ export async function createTask(repoId: string, options: { allowedRoot?: string
     updatedAt: new Date().toISOString(),
     recoveryStatus: "recoverable",
     worktreeStatus: "available",
+    profile,
+    profileSnapshotValid: true,
   };
   tasks.set(id, task);
   const store = getStateStore();
   store.transaction(() => {
     persistTask(task);
     store.appendTaskEvent(task.id, { type: "task_created", actor: "user", createdAt: task.createdAt, status: task.status });
+    store.appendTaskEvent(task.id, { type: "profile_snapshot_created", actor: "user", createdAt: task.createdAt, status: "created", metadata: { profileId: profile.profileId, profileVersion: profile.version } });
+    store.appendProfileAudit("profile_snapshot_created", task.repoId, profile.profileId, profile.version, task.id);
   });
   return task;
 }
@@ -270,6 +280,8 @@ export function registerRecoveredTask(task: RepoTask) {
   task.updatedAt ||= now;
   task.recoveryStatus ||= task.worktreeAvailable ? "recoverable" : "orphaned";
   task.worktreeStatus ||= task.worktreeAvailable ? "available" : "missing";
+  task.profile ??= safeDefaultSnapshot(task.repoId);
+  task.profileSnapshotValid = true;
   tasks.set(task.id, task);
   const store = getStateStore();
   store.transaction(() => {
@@ -312,6 +324,7 @@ export function publicTask(task: RepoTask) {
     recoveryStatus: task.recoveryStatus,
     recoveryMessage: task.recoveryMessage,
     worktreeStatus: task.worktreeStatus,
+    profile: task.profile ?? safeDefaultSnapshot(task.repoId),
   };
 }
 
@@ -472,10 +485,12 @@ export async function getTaskDiff(task: RepoTask): Promise<TaskDiff> {
 export async function deleteTask(id: string, input: { confirmedPrCleanup?: boolean } = {}) {
   const task = getTask(id);
   if (!task) throw new Error("Task not found");
+  const profile = requireTaskProfile(task);
   recordTaskEvent(task, "worktree_cleanup_requested", "user", { status: "requested", metadata: task.prNumber ? { prNumber: task.prNumber } : undefined });
+  if (!profile.cleanup.allowCleanWorktreeRemoval) throw new Error("The task profile forbids worktree cleanup");
   if (!task.worktreeAvailable || task.worktreeStatus !== "available") throw new Error("Managed task worktree is unavailable");
-  if (task.prNumber && input.confirmedPrCleanup !== true) throw new Error("Explicit confirmation is required before removing a PR task worktree");
-  if (await runGit(task.worktreePath, ["status", "--porcelain"])) throw new Error("Task worktree has uncommitted changes and cannot be deleted");
+  if (task.prNumber && profile.cleanup.requireConfirmationIfPrOpen && input.confirmedPrCleanup !== true) throw new Error("Explicit confirmation is required before removing a PR task worktree");
+  if (await runGit(task.worktreePath, ["status", "--porcelain"]) && !profile.cleanup.allowDirtyWorktreeRemoval) throw new Error("Task worktree has uncommitted changes and cannot be deleted");
   const root = await realpath(task.worktreeRoot);
   const target = await realpath(task.worktreePath);
   const rel = relative(root, target);
@@ -506,6 +521,7 @@ export async function resumeTask(id: string, options: { allowedRoot?: string; wo
   const task = tasks.get(id);
   if (!task) return undefined;
   await recoverTask(task, options.allowedRoot ?? ALLOWED_ROOT, options.worktreeRoot ?? WORKTREE_ROOT);
+  if (!task.profileSnapshotValid) throw new Error(task.recoveryMessage ?? "Task profile snapshot is invalid");
   if (task.status === "archived") throw new Error("Archived tasks cannot be resumed");
   if (task.recoveryStatus === "invalid") throw new Error(task.recoveryMessage ?? "Task failed recovery validation");
   recordTaskEvent(task, "task_resumed", "user", { status: task.recoveryStatus });
@@ -517,6 +533,14 @@ async function recoverAllTasks(allowedRoot: string, worktreeRoot: string) {
 }
 
 async function recoverTask(task: RepoTask, allowedRoot: string, worktreeRoot: string) {
+  try { requireTaskProfile(task); }
+  catch (error) {
+    task.profileSnapshotValid = false;
+    task.recoveryStatus = "needs_attention";
+    task.recoveryMessage = error instanceof Error ? error.message : "Task profile snapshot is invalid";
+    getStateStore().markTaskProfileNeedsAttention(task.id, task.recoveryMessage);
+    return;
+  }
   if (task.status === "archived" && task.worktreeStatus === "removed") {
     task.worktreeAvailable = false;
     task.recoveryStatus = "recoverable";
@@ -630,8 +654,17 @@ function loadPersistedTasks() {
     task.recoveryStatus = "needs_attention";
     task.recoveryMessage = "Pending startup recovery validation.";
     tasks.set(task.id, task);
-    persistTask(task);
+    if (task.profileSnapshotValid !== false) persistTask(task);
   }
+}
+
+export function requireTaskProfile(task: RepoTask): ProjectProfileSnapshot {
+  if (task.profileSnapshotValid === false) throw new Error("Task profile snapshot is inconsistent. Human attention is required.");
+  const profile = parseProfileSnapshot(task.profile);
+  if (profile.repoId !== task.repoId) throw new Error("Task profile snapshot repository does not match the task");
+  task.profile = profile;
+  task.profileSnapshotValid = true;
+  return profile;
 }
 
 export function clearTasksForTests() {
