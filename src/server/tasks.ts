@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { join, relative, sep } from "node:path";
 import { runGit } from "./git";
 import { ALLOWED_ROOT, validateRepository } from "./repositories";
-import { getStateStore } from "./state-store";
+import { getStateStore, type ApprovalEvent, type TaskEventActor, type TaskEventMetadata, type TaskEventType, type TaskHistory } from "./state-store";
 import type { FlowEvent, FlowStep, ReviewRerunEvent } from "../agents/types";
 import type { PrReviewIntake, PullRequestReview, ReworkFlowResult } from "./pr-review-types";
 
@@ -185,7 +185,11 @@ export async function createTask(repoId: string, options: { allowedRoot?: string
     worktreeStatus: "available",
   };
   tasks.set(id, task);
-  persistTask(task);
+  const store = getStateStore();
+  store.transaction(() => {
+    persistTask(task);
+    store.appendTaskEvent(task.id, { type: "task_created", actor: "user", createdAt: task.createdAt, status: task.status });
+  });
   return task;
 }
 
@@ -248,10 +252,14 @@ export function completeTaskReview(task: RepoTask, finalReady: boolean) {
 }
 
 export function invalidateApproval(task: RepoTask) {
+  const prior = task.approvalId && task.diffHash && task.approvalPurpose && ["pending", "processing"].includes(task.approvalState)
+    ? { approvalId: task.approvalId, diffHash: task.diffHash, purpose: task.approvalPurpose }
+    : undefined;
   task.diffHash = undefined;
   task.approvalId = undefined;
   task.approvalState = "unavailable";
   task.approvalPurpose = undefined;
+  if (prior) recordApprovalEvent(task, "invalidated", prior, "invalidated");
 }
 
 export function registerRecoveredTask(task: RepoTask) {
@@ -263,7 +271,11 @@ export function registerRecoveredTask(task: RepoTask) {
   task.recoveryStatus ||= task.worktreeAvailable ? "recoverable" : "orphaned";
   task.worktreeStatus ||= task.worktreeAvailable ? "available" : "missing";
   tasks.set(task.id, task);
-  persistTask(task);
+  const store = getStateStore();
+  store.transaction(() => {
+    persistTask(task);
+    store.appendTaskEvent(task.id, { type: "task_created", actor: "system", createdAt: task.createdAt, status: task.status });
+  });
   return task;
 }
 
@@ -305,26 +317,86 @@ export function publicTask(task: RepoTask) {
 
 export function persistTask(task: RepoTask) { getStateStore().saveTask(task); }
 
-export function recordFlowEvent(task: RepoTask, event: FlowEvent | ReviewRerunEvent) {
-  if (event.type === "flow_started") {
-    task.flowId = event.flowId;
-    task.flowStatus = "running";
-  } else if (event.type === "rerun_started") {
-    task.flowId = event.flowId;
-    task.flowStatus = "running";
-  } else if ("step" in event) {
-    const steps = task.flowSteps ?? [];
-    const index = steps.findIndex((step) => step.id === event.step.id);
-    if (index >= 0) steps[index] = event.step;
-    else steps.push(event.step);
-    task.flowSteps = steps;
-  } else {
-    task.flowId = event.result.flowId;
-    task.flowStatus = event.result.status;
-    task.flowSteps = event.result.steps;
-    task.finalOutput = event.result.finalOutput;
+export function getTaskHistory(taskId: string): TaskHistory { return getStateStore().loadTaskHistory(taskId); }
+
+export function recordTaskEvent(task: RepoTask, type: TaskEventType, actor: TaskEventActor, input: { createdAt?: string; stepId?: string; status?: string; metadata?: TaskEventMetadata } = {}) {
+  return getStateStore().appendTaskEvent(task.id, { type, actor, ...input });
+}
+
+export function recordApprovalEvent(
+  task: RepoTask,
+  type: ApprovalEvent["type"],
+  approval: { approvalId: string; diffHash: string; purpose: NonNullable<RepoTask["approvalPurpose"]> },
+  status?: string,
+) {
+  const store = getStateStore();
+  return store.transaction(() => {
+    persistTask(task);
+    const event = store.appendApprovalEvent(task.id, { type, ...approval, status });
+    const taskType = type === "issued" ? "approval_issued" : type === "invalidated" ? "approval_invalidated" : type === "accepted" ? "approval_accepted" : "approval_failed";
+    store.appendTaskEvent(task.id, { type: taskType, actor: type === "accepted" ? "user" : "system", createdAt: event.createdAt, status, metadata: { diffHash: approval.diffHash } });
+    return event;
+  });
+}
+
+export function recordDiffVersion(task: RepoTask, diffHash: string, diff: TaskDiff) {
+  const changedFiles = new Set([...diff.trackedFiles, ...diff.untrackedFiles]);
+  let additions = 0;
+  let deletions = 0;
+  for (const line of `${diff.patch}\n${diff.untrackedPatch}`.split("\n")) {
+    if (line.startsWith("+") && !line.startsWith("+++")) additions += 1;
+    else if (line.startsWith("-") && !line.startsWith("---")) deletions += 1;
   }
-  persistTask(task);
+  const store = getStateStore();
+  return store.transaction(() => {
+    const version = store.appendDiffVersion(task.id, { diffHash, changedFileCount: changedFiles.size, additions, deletions });
+    if (version) store.appendTaskEvent(task.id, { type: "diff_generated", actor: "system", createdAt: version.createdAt, status: "generated", metadata: { diffHash, changedFileCount: changedFiles.size, additions, deletions } });
+    return version;
+  });
+}
+
+export function recordFlowEvent(task: RepoTask, event: FlowEvent | ReviewRerunEvent) {
+  const store = getStateStore();
+  store.transaction(() => {
+    const previousSteps = new Map((task.flowSteps ?? []).map((step) => [step.id, step]));
+    if (event.type === "flow_started") {
+      task.flowId = event.flowId;
+      task.flowStatus = "running";
+      store.appendTaskEvent(task.id, { type: "flow_started", actor: "system", createdAt: event.timestamp, status: "running" });
+    } else if (event.type === "rerun_started") {
+      task.flowId = event.flowId;
+      task.flowStatus = "running";
+      const step = task.flowSteps?.find((item) => item.id === event.stepId);
+      store.appendTaskEvent(task.id, { type: "step_rerun", actor: step?.agent ?? "system", createdAt: event.timestamp, stepId: event.stepId, status: "started" });
+    } else if ("step" in event) {
+      const steps = task.flowSteps ?? [];
+      const index = steps.findIndex((step) => step.id === event.step.id);
+      if (index >= 0) steps[index] = event.step;
+      else steps.push(event.step);
+      task.flowSteps = steps;
+      const started = event.type === "step_started" || event.type === "rerun_step_started";
+      const completed = event.type === "step_completed" || event.type === "rerun_step_completed";
+      const type = started ? "step_started" : completed ? "step_completed" : "step_failed";
+      const createdAt = started ? event.step.startedAt : event.step.completedAt;
+      store.appendTaskEvent(task.id, { type, actor: event.step.agent, createdAt, stepId: event.step.id, status: event.step.status, metadata: event.step.durationMs === undefined ? undefined : { durationMs: event.step.durationMs } });
+      if (!started && event.type !== "step_skipped") store.appendStepVersion(task.id, event.step, createdAt);
+    } else {
+      task.flowId = event.result.flowId;
+      task.flowStatus = event.result.status;
+      task.flowSteps = event.result.steps;
+      task.finalOutput = event.result.finalOutput;
+      if (event.type.startsWith("rerun_")) {
+        for (const step of event.result.steps) {
+          if (step.status === "stale" && previousSteps.get(step.id)?.status !== "stale") {
+            store.appendTaskEvent(task.id, { type: "step_stale", actor: "system", stepId: step.id, status: "stale" });
+          }
+        }
+      }
+      const aborted = event.type === "flow_aborted" || event.type === "flow_timed_out" || event.type === "rerun_aborted" || event.type === "rerun_timed_out";
+      store.appendTaskEvent(task.id, { type: aborted ? "flow_aborted" : "flow_completed", actor: "system", status: event.result.status });
+    }
+    persistTask(task);
+  });
 }
 
 export async function getTaskDiff(task: RepoTask): Promise<TaskDiff> {
@@ -407,13 +479,17 @@ export async function deleteTask(id: string) {
   const rel = relative(root, target);
   if (!rel || rel.startsWith(`..${sep}`) || rel === "..") throw new Error("Invalid worktree path");
   await runGit(task.repoPath, ["worktree", "remove", task.worktreePath]);
-  task.status = "archived";
-  task.worktreeAvailable = false;
-  task.worktreeStatus = "removed";
-  task.recoveryStatus = "recoverable";
-  task.recoveryMessage = "Task worktree was removed and the task was archived.";
-  invalidateApproval(task);
-  persistTask(task);
+  const store = getStateStore();
+  store.transaction(() => {
+    task.status = "archived";
+    task.worktreeAvailable = false;
+    task.worktreeStatus = "removed";
+    task.recoveryStatus = "recoverable";
+    task.recoveryMessage = "Task worktree was removed and the task was archived.";
+    invalidateApproval(task);
+    persistTask(task);
+    store.appendTaskEvent(task.id, { type: "task_archived", actor: "user", status: "archived" });
+  });
 }
 
 export async function initializeTaskRecovery(options: { allowedRoot?: string; worktreeRoot?: string } = {}) {
@@ -522,11 +598,15 @@ function githubCoordinates(origin: string) {
 function invalidateApprovalForRestart(task: RepoTask) {
   const active = task.approvalState === "pending" || task.approvalState === "processing";
   if (!active) return false;
+  const approval = task.approvalId && task.diffHash && task.approvalPurpose
+    ? { approvalId: task.approvalId, diffHash: task.diffHash, purpose: task.approvalPurpose }
+    : undefined;
   task.approvalState = "invalidated";
   task.approvalId = undefined;
   if (["awaiting_approval", "validating"].includes(task.status)) task.status = "approval_invalidated";
   else if (task.status === "awaiting_final_approval") task.status = "approval_invalidated";
   else if (["committing", "committing_rework"].includes(task.status)) task.status = "commit_failed";
+  if (approval) recordApprovalEvent(task, "invalidated", approval, "server_restart");
   return true;
 }
 
@@ -552,7 +632,7 @@ export function clearTasksForTests() {
   tasks.clear();
   tasksLoaded = true;
   recoveryPromise = undefined;
-  getStateStore().clear();
+  getStateStore().clearForTests();
 }
 
 export function reloadTasksFromStoreForTests() {

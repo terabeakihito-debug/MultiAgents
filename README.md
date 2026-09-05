@@ -37,6 +37,8 @@ After a Review Flow finishes, **Re-run** is available for Cursor Review, Claude 
 
 Rerun state, stale markers, the original prompt, and the latest step outputs are stored locally and restored by **Resume** after a reload or server restart. A rerun can be cancelled through the same **Cancel** control and process-group termination path. If it fails, is cancelled, or times out, the prior successful output is retained and the step reports the rerun failure.
 
+Repository tasks also expose an append-only **Timeline**. It records who or what caused each important task, flow, step, approval, validation, commit, push, PR, rework, readiness, and archive event. When a review step has been run more than once, its card provides a version selector so earlier outputs remain inspectable.
+
 If the draft fails, every later step is skipped. If Cursor fails, Claude and final Codex continue with an explicit unavailable-review marker. If Claude fails, final Codex continues with the draft and available Cursor review. A final Codex failure leaves the prior timeline visible.
 
 Review progress uses a same-origin `fetch` POST whose response is an SSE-compatible `text/event-stream`. Streaming is step-level only: agent output is sent once that step finishes, not token by token. **Cancel** aborts the active request, stops the current CLI process group, marks the running step as errored/aborted, and skips steps that have not started. Closing the stream or disconnecting the browser aborts the server-side flow through the same signal path so the active child process is not left running.
@@ -145,11 +147,12 @@ is also manual.
 
 ## Local state persistence
 
-Phase 7 uses SQLite from Node.js itself; it does not add a database server or
+Phase 8 uses SQLite from Node.js itself; it does not add a database server or
 ORM. State is stored at `~/.multiagents/state.db`, outside every repository.
 The directory is forced to mode `0700` and the database file to `0600` when it
 is opened. Schema migrations are tracked in `schema_version`; the current
-schema is version 1.
+schema is version 2. The v1→v2 migration runs in one transaction and preserves
+existing task and flow-step snapshots.
 
 The database stores task/repository/worktree identity, the latest state-machine
 status, original prompt, current Review Flow steps and outputs, stale/rerun
@@ -158,6 +161,17 @@ classification/counts, CI/readiness state, and recovery classification. It
 does not store API keys, GitHub tokens, CLI credentials, cookies,
 `Authorization` headers, environment variables, or shell history. GitHub
 review bodies are externally recoverable and are not retained in snapshots.
+
+The existing `tasks` and `flow_steps` tables remain the source of truth for
+current state. Audit data is separated into `task_events`, `step_versions`,
+`diff_versions`, and `approval_events`. History rows are ordered by a monotonic
+SQLite sequence and protected by triggers that reject updates and deletes.
+Migrated v1 tasks receive a baseline `task_created` event. Step versions retain
+bounded outputs; diff history stores only hashes and line/file counts, never the
+diff body. Task-event metadata accepts only operational fields such as
+durations, hashes, counts, commit SHAs, and PR numbers. Prompts, agent output,
+review bodies, credentials, tokens, cookies, authorization data, and environment
+variables cannot be placed in event metadata.
 
 Local state may contain prompts and agent outputs. Protect `~/.multiagents` as
 sensitive local application data. Prompt and output fields are bounded, and
@@ -224,9 +238,9 @@ Tests mock process spawning and never invoke the real AI CLIs.
 
 ## Not implemented
 
-Draft reruns, downstream automatic reruns, old-result version history, free-form
+Draft reruns, downstream automatic reruns, free-form
 agent conversations, agent-selected or recursive handoffs, automatic retry
 loops, merges, remote cloning, recursive repository
-discovery, versioned task/audit history, long-term memory, token/cost
+discovery, full diff-body history, event editing/deletion, long-term memory, token/cost
 tracking, token-level streaming, production deployment, and Docker are not
 implemented.

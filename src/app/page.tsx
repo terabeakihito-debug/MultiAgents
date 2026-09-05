@@ -30,6 +30,12 @@ type TaskDiff = {
   truncated: boolean; approvable: boolean; blockedReason?: string;
 };
 type Approval = { diffHash?: string; approvalId?: string; blockedReason?: string };
+type TaskEvent = { id: string; sequence: number; taskId: string; type: string; createdAt: string; actor: string; stepId?: string; status?: string; metadata?: Record<string, string | number> };
+type StepVersion = { id: string; taskId: string; stepId: FlowStep["id"]; version: number; agent: AgentId; createdAt: string; output: string; status: FlowStep["status"]; durationMs?: number };
+type DiffVersion = { id: string; taskId: string; version: number; diffHash: string; changedFileCount: number; additions: number; deletions: number; createdAt: string };
+type ApprovalEvent = { id: string; sequence: number; taskId: string; approvalId: string; type: string; purpose: string; diffHash: string; createdAt: string; status?: string };
+type TaskHistory = { events: TaskEvent[]; stepVersions: StepVersion[]; diffVersions: DiffVersion[]; approvalEvents: ApprovalEvent[] };
+const emptyHistory = (): TaskHistory => ({ events: [], stepVersions: [], diffVersions: [], approvalEvents: [] });
 const initialCards = (): Record<AgentId, CardState> => ({ codex: { status: "idle", output: "" }, cursor: { status: "idle", output: "" }, claude: { status: "idle", output: "" } });
 const initialSteps = (): FlowStep[] => [
   { id: "codex_draft", agent: "codex", role: "draft", status: "idle", output: "" },
@@ -59,6 +65,7 @@ export default function Home() {
   const [approvalProcessing, setApprovalProcessing] = useState(false);
   const [reviewProcessing, setReviewProcessing] = useState(false);
   const [taskError, setTaskError] = useState("");
+  const [taskHistory, setTaskHistory] = useState<TaskHistory>(emptyHistory);
   const sendingRef = useRef(false);
   const flowAbortRef = useRef<AbortController | null>(null);
   const currentFlowIdRef = useRef("");
@@ -77,8 +84,15 @@ export default function Home() {
 
   useEffect(() => { void loadHistory().catch((error) => setTaskError(message(error))); }, []);
 
+  async function loadTaskHistory(taskId: string) {
+    const response = await fetch(`/api/tasks/${taskId}/history`);
+    const data = await response.json() as { history?: TaskHistory; error?: string };
+    if (!response.ok || !data.history) throw new Error(data.error || "Could not load task history");
+    setTaskHistory(data.history);
+  }
+
   async function resumePersistedTask(taskId: string) {
-    setTaskError(""); setTaskDiff(null); setApproval(null); setReviewedDiff(false);
+    setTaskError(""); setTaskDiff(null); setApproval(null); setReviewedDiff(false); setTaskHistory(emptyHistory());
     try {
       const response = await fetch(`/api/tasks/${taskId}/resume`, { method: "POST" });
       const data = await response.json() as { diff?: TaskDiff; task?: RepoTask; approval?: Approval; error?: string };
@@ -90,17 +104,17 @@ export default function Home() {
       setFinalOutput(restored.finalOutput ?? ""); currentFlowIdRef.current = restored.flowId ?? "";
       setTaskDiff(data.diff ?? null); setApproval(data.approval ?? null);
       if (data.error) setTaskError(data.error);
-      await loadHistory();
+      await Promise.all([loadHistory(), loadTaskHistory(restored.id)]);
     } catch (error) { setTaskError(message(error)); }
   }
 
   async function createIsolatedTask() {
-    setTaskError(""); setTaskDiff(null); setApproval(null); setReviewedDiff(false); setOpenPulls([]);
+    setTaskError(""); setTaskDiff(null); setApproval(null); setReviewedDiff(false); setOpenPulls([]); setTaskHistory(emptyHistory());
     try {
       const response = await fetch("/api/tasks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repoId }) });
       const data = await response.json() as { task?: RepoTask; error?: string };
       if (!response.ok || !data.task) throw new Error(data.error || "Task creation failed");
-      setTask(data.task); setMode("review"); await loadHistory();
+      setTask(data.task); setMode("review"); await Promise.all([loadHistory(), loadTaskHistory(data.task.id)]);
     } catch (error) { setTaskError(message(error)); }
   }
 
@@ -123,7 +137,7 @@ export default function Home() {
       const response = await fetch("/api/tasks/recover-pr", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repoId, prNumber }) });
       const data = await response.json() as { task?: RepoTask; error?: string };
       if (!response.ok || !data.task) throw new Error(data.error || "PR task recovery failed");
-      setTask(data.task); setMode("review"); setOpenPulls([]); if (data.task.worktreeAvailable) await refreshDiff(data.task);
+      setTask(data.task); setMode("review"); setOpenPulls([]); if (data.task.worktreeAvailable) await refreshDiff(data.task); else await loadTaskHistory(data.task.id);
     } catch (error) { setTaskError(message(error)); }
     finally { setReviewProcessing(false); }
   }
@@ -139,6 +153,7 @@ export default function Home() {
     if (data.task) setTask(data.task);
     setApproval(data.approval ?? null);
     if (!data.approval?.diffHash || data.approval.diffHash !== previousHash || data.approval.approvalId !== previousApprovalId) setReviewedDiff(false);
+    await loadTaskHistory(activeTask.id);
   }
 
   async function deleteWorktree() {
@@ -146,7 +161,7 @@ export default function Home() {
     setTaskError("");
     const response = await fetch(`/api/tasks/${task.id}`, { method: "DELETE" });
     if (!response.ok) { const data = await response.json() as { error?: string }; setTaskError(data.error || "Cleanup failed"); return; }
-    setTask(null); setTaskDiff(null); setApproval(null); setReviewedDiff(false);
+    setTask(null); setTaskDiff(null); setApproval(null); setReviewedDiff(false); setTaskHistory(emptyHistory());
     await loadHistory();
   }
 
@@ -287,6 +302,7 @@ export default function Home() {
       setTask(data.task);
       setApproval(null);
       setReviewedDiff(false);
+      await loadTaskHistory(data.task.id);
     } catch (error) {
       setTaskError(message(error));
       try { await refreshDiff(task); } catch { /* retain the operation error */ }
@@ -303,7 +319,7 @@ export default function Home() {
       const response = await fetch(`/api/tasks/${task.id}/fetch-review`, { method: "POST" });
       const data = await response.json() as { task?: RepoTask; error?: string };
       if (!response.ok || !data.task) throw new Error(data.error || "PR review fetch failed");
-      setTask(data.task); setReviewedDiff(false);
+      setTask(data.task); setReviewedDiff(false); await loadTaskHistory(data.task.id);
     } catch (error) { setTaskError(message(error)); }
     finally { setReviewProcessing(false); }
   }
@@ -328,7 +344,7 @@ export default function Home() {
       const response = await fetch(`/api/tasks/${task.id}/create-pr`, { method: "POST" });
       const data = await response.json() as { task?: RepoTask; error?: string };
       if (!response.ok || !data.task) throw new Error(data.error || "PR retry failed");
-      setTask(data.task);
+      setTask(data.task); await loadTaskHistory(data.task.id);
     } catch (error) { setTaskError(message(error)); }
     finally { setApprovalProcessing(false); }
   }
@@ -343,7 +359,7 @@ export default function Home() {
       <textarea id="prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} maxLength={20_000} rows={6} placeholder="Ask Codex, Cursor, and Claude…" />
       <div className="actions"><span>{prompt.length.toLocaleString()} / 20,000</span><div className="actionButtons">{sending && mode === "review" && <button className="cancel" type="button" onClick={cancelFlow}>Cancel</button>}<button type="submit" disabled={sending || !prompt.trim() || (mode === "review" && Boolean(task) && !task?.worktreeAvailable)}>{sending ? "Running…" : mode === "parallel" ? "Send to all" : "Run review flow"}</button></div></div>
     </form>
-    {mode === "parallel" ? <section className="cards" aria-label="Agent responses">{agentIds.map((id) => <AgentCard key={id} name={labels[id]} state={cards[id]} />)}</section> : <FlowTimeline steps={steps} status={flowStatus} finalOutput={finalOutput} sending={sending} activeRerun={activeRerun} onRerun={rerunStep} />}
+    {mode === "parallel" ? <section className="cards" aria-label="Agent responses">{agentIds.map((id) => <AgentCard key={id} name={labels[id]} state={cards[id]} />)}</section> : <FlowTimeline steps={steps} versions={taskHistory.stepVersions} status={flowStatus} finalOutput={finalOutput} sending={sending} activeRerun={activeRerun} onRerun={rerunStep} />}
     {taskDiff && <section className="diff card"><h2>Final Diff</h2><h3>Tracked changed files</h3><pre>{taskDiff.trackedFiles.join("\n") || "None."}</pre><h3>Untracked files</h3><pre>{taskDiff.untrackedFiles.join("\n") || "None."}</pre><h3>Changed lines</h3><pre>{taskDiff.stat || "No tracked changes."}</pre><details><summary>View full diff</summary><pre>{[taskDiff.patch, taskDiff.untrackedPatch].filter(Boolean).join("\n\n") || "No changes."}</pre></details>{taskDiff.blockedReason && <p className="staleReason">{taskDiff.blockedReason}</p>}
       {(task?.validation.length || approvalProcessing) && <div className="validation"><h3>Pre-PR Validation</h3>{task?.validation.map((check, index) => <div className="validationRow" key={`${check.name}-${index}`}><span>{check.name}</span><Status value={check.status} /><span>{check.detail}</span></div>)}{approvalProcessing && <p>Server-side checks and PR creation are running…</p>}</div>}
       {task?.secretFindings.length ? <div className="error"><strong>Secret scan findings</strong><ul>{task.secretFindings.map((finding, index) => <li key={`${finding.path}-${finding.rule}-${index}`}><code>{finding.path}</code>: {finding.rule}</li>)}</ul></div> : null}
@@ -353,6 +369,7 @@ export default function Home() {
       {task?.status === "pr_created" && task.prUrl && <div className="prCreated"><h3>PR CREATED</h3><p><strong>Branch:</strong> <code>{task.branch}</code></p><p><strong>Commit:</strong> <code>{task.commitSha}</code></p><p><strong>Pull Request:</strong> #{task.prNumber} <a href={task.prUrl} target="_blank" rel="noreferrer">{task.prUrl}</a></p><p>The task worktree is retained. No merge was attempted.</p></div>}
     </section>}
     {task?.prNumber && <PrReviewPanel task={task} processing={reviewProcessing} onFetch={fetchPrReview} onApply={applyReviewFixes} />}
+    {task && <TaskHistoryPanel history={taskHistory} />}
   </main>;
 }
 
@@ -375,7 +392,23 @@ function PrReviewPanel({ task, processing, onFetch, onApply }: { task: RepoTask;
 }
 
 function AgentCard({ name, state }: { name: string; state: CardState }) { return <article className="card"><div className="cardHeader"><h2>{name}</h2><Status value={state.status} /></div>{state.error && <ErrorBlock error={state.error} />}<pre className="output">{state.output || fallback(state.status)}</pre></article>; }
-function FlowTimeline({ steps, status, finalOutput, sending, activeRerun, onRerun }: { steps: FlowStep[]; status: ReviewFlowResult["status"] | "idle" | "running"; finalOutput: string; sending: boolean; activeRerun: RerunnableStepId | null; onRerun: (id: RerunnableStepId) => void }) { return <section className="flow" aria-label="Review flow"><div className="flowTitle"><h2>Review Flow</h2><Status value={status} /></div>{flowStepIds.map((id, index) => { const step = steps.find((item) => item.id === id)!; const rerunnable = rerunnableStepIds.includes(id as RerunnableStepId) && ["completed", "stale", "error"].includes(step.status) && Boolean(step.output); return <div key={id}><article className={`card flowStep ${step.role === "final" ? "finalStep" : ""}`}><div className="cardHeader"><div><span className="stepNumber">Step {index + 1}</span><h2>{labels[step.agent]} — {roleLabels[step.role]}</h2></div><Status value={step.status} /></div><div className="duration">{step.status === "running" ? activeRerun === id ? "Re-running..." : "Running..." : <>Duration: {step.durationMs === undefined ? "—" : formatDuration(step.durationMs)}</>}</div>{step.error && (step.status === "stale" ? <div className="staleReason">{step.error}</div> : <ErrorBlock error={step.error} />)}<pre className="output">{step.output || fallback(step.status)}</pre>{rerunnable && <button className="rerun" type="button" disabled={sending} onClick={() => onRerun(id as RerunnableStepId)}>Re-run</button>}</article>{index < steps.length - 1 && <div className="arrow" aria-hidden="true">↓</div>}</div>; })}{finalOutput && <article className="card finalOutput"><h2>Final Output</h2><pre className="output">{finalOutput}</pre></article>}</section>; }
+function FlowTimeline({ steps, versions, status, finalOutput, sending, activeRerun, onRerun }: { steps: FlowStep[]; versions: StepVersion[]; status: ReviewFlowResult["status"] | "idle" | "running"; finalOutput: string; sending: boolean; activeRerun: RerunnableStepId | null; onRerun: (id: RerunnableStepId) => void }) { return <section className="flow" aria-label="Review flow"><div className="flowTitle"><h2>Review Flow</h2><Status value={status} /></div>{flowStepIds.map((id, index) => { const step = steps.find((item) => item.id === id)!; const stepVersions = versions.filter((item) => item.stepId === id); const rerunnable = rerunnableStepIds.includes(id as RerunnableStepId) && ["completed", "stale", "error"].includes(step.status) && Boolean(step.output); return <div key={id}><article className={`card flowStep ${step.role === "final" ? "finalStep" : ""}`}><div className="cardHeader"><div><span className="stepNumber">Step {index + 1}</span><h2>{labels[step.agent]} — {roleLabels[step.role]}</h2></div><Status value={step.status} /></div><div className="duration">{step.status === "running" ? activeRerun === id ? "Re-running..." : "Running..." : <>Duration: {step.durationMs === undefined ? "—" : formatDuration(step.durationMs)}</>}</div>{step.error && (step.status === "stale" ? <div className="staleReason">{step.error}</div> : <ErrorBlock error={step.error} />)}{stepVersions.length > 1 ? <StepVersionViewer key={`${id}-${stepVersions.at(-1)?.version}`} versions={stepVersions} /> : <pre className="output">{step.output || fallback(step.status)}</pre>}{rerunnable && <button className="rerun" type="button" disabled={sending} onClick={() => onRerun(id as RerunnableStepId)}>Re-run</button>}</article>{index < steps.length - 1 && <div className="arrow" aria-hidden="true">↓</div>}</div>; })}{finalOutput && <article className="card finalOutput"><h2>Final Output</h2><pre className="output">{finalOutput}</pre></article>}</section>; }
+
+function StepVersionViewer({ versions }: { versions: StepVersion[] }) {
+  const [selected, setSelected] = useState(versions.at(-1)?.version ?? 1);
+  const version = versions.find((item) => item.version === selected) ?? versions.at(-1)!;
+  return <div className="versionViewer"><label>Output version <select aria-label={`${version.stepId} output version`} value={version.version} onChange={(event) => setSelected(Number(event.target.value))}>{versions.map((item) => <option key={item.id} value={item.version}>Version {item.version}</option>)}</select></label><div className="versionMeta"><Status value={version.status} /> · {new Date(version.createdAt).toLocaleString()} · {version.durationMs === undefined ? "—" : formatDuration(version.durationMs)}</div><pre className="output">{version.output || fallback(version.status)}</pre></div>;
+}
+
+function TaskHistoryPanel({ history }: { history: TaskHistory }) {
+  return <section className="card auditTrail" aria-label="Task history"><div className="cardHeader"><div><span className="stepNumber">Append-only audit trail</span><h2>Timeline</h2></div><span>{history.events.length} events</span></div>{history.events.length ? <ol className="timeline">{history.events.map((event) => <li key={event.id}><time dateTime={event.createdAt}>{new Date(event.createdAt).toLocaleString()}</time><div><strong>{eventLabel(event)}</strong><span>{event.actor}{event.stepId ? ` · ${event.stepId.replaceAll("_", " ")}` : ""}{event.status ? ` · ${event.status}` : ""}</span>{event.metadata && <small>{metadataLabel(event.metadata)}</small>}</div></li>)}</ol> : <p className="muted">No audit events recorded.</p>}{history.diffVersions.length > 0 && <div className="diffHistory"><h3>Diff versions</h3>{history.diffVersions.map((version) => <div key={version.id}><strong>Version {version.version}</strong><span>{version.changedFileCount} files · +{version.additions} −{version.deletions}</span><code>{version.diffHash.slice(0, 12)}</code></div>)}</div>}</section>;
+}
+
+const eventLabels: Record<string, string> = {
+  task_created: "Task created", flow_started: "Review flow started", step_started: "Step started", step_completed: "Step completed", step_failed: "Step failed", step_rerun: "Step re-run started", step_stale: "Step marked stale", flow_completed: "Review flow completed", flow_aborted: "Review flow aborted", approval_issued: "Approval issued", approval_invalidated: "Approval invalidated", approval_accepted: "Approval accepted", approval_failed: "Approval failed", validation_started: "Validation started", validation_passed: "Validation passed", validation_failed: "Validation failed", diff_generated: "Diff generated", commit_created: "Commit created", branch_pushed: "Branch pushed", pr_created: "Pull request created", pr_review_fetched: "PR review fetched", rework_started: "Rework started", rework_completed: "Rework completed", ready_for_human_merge: "Ready for human merge", task_archived: "Task archived",
+};
+function eventLabel(event: TaskEvent) { return eventLabels[event.type] ?? event.type.replaceAll("_", " "); }
+function metadataLabel(metadata: Record<string, string | number>) { return Object.entries(metadata).map(([key, value]) => `${key}: ${typeof value === "string" && value.length > 16 ? value.slice(0, 12) : value}`).join(" · "); }
 function Status({ value }: { value: string }) { return <span className={`status ${value}`}>{value.toUpperCase()}</span>; }
 function ErrorBlock({ error }: { error: string }) { return <div className="error"><strong>Error</strong><pre>{error}</pre></div>; }
 function fallback(status: string) { return status === "idle" ? "Waiting for a prompt." : status === "running" ? "Waiting for response…" : status === "skipped" ? "This step was not run." : "No output."; }

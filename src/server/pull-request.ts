@@ -14,6 +14,9 @@ import {
   invalidateApproval,
   persistTask,
   publicTask,
+  recordApprovalEvent,
+  recordDiffVersion,
+  recordTaskEvent,
   transitionTask,
   type RepoTask,
   type SecretFinding,
@@ -120,13 +123,20 @@ export async function prepareApproval(task: RepoTask) {
     persistTask(task);
     return { diff, approval: { blockedReason: "The final diff is empty." }, task: publicTask(task) };
   }
+  recordDiffVersion(task, snapshot.hash, diff);
   if (task.status === "reviewed") transitionTask(task, "awaiting_approval");
+  let issued: { approvalId: string; diffHash: string; purpose: NonNullable<RepoTask["approvalPurpose"]> } | undefined;
   if (task.diffHash !== snapshot.hash || task.approvalState !== "pending" || !task.approvalId) {
     const changed = task.diffHash !== snapshot.hash;
+    if (task.approvalId && task.diffHash && task.approvalPurpose && ["pending", "processing"].includes(task.approvalState)) {
+      task.approvalState = "invalidated";
+      recordApprovalEvent(task, "invalidated", { approvalId: task.approvalId, diffHash: task.diffHash, purpose: task.approvalPurpose }, "diff_changed");
+    }
     task.diffHash = snapshot.hash;
     task.approvalId = randomUUID();
     task.approvalState = "pending";
     task.approvalPurpose = rework ? "rework" : "create_pr";
+    issued = { approvalId: task.approvalId, diffHash: task.diffHash, purpose: task.approvalPurpose };
     if (changed) {
       task.validation = [];
       task.secretFindings = [];
@@ -134,6 +144,7 @@ export async function prepareApproval(task: RepoTask) {
     }
   }
   persistTask(task);
+  if (issued) recordApprovalEvent(task, "issued", issued, "pending");
   return {
     diff,
     approval: { diffHash: task.diffHash, approvalId: task.approvalId },
@@ -148,9 +159,12 @@ export async function approveAndCreatePullRequest(taskId: string, input: Approva
     const task = getTask(taskId);
     if (!task) throw new ApprovalError("Task not found", 404);
     requireApproval(task, input);
+    const acceptedApproval = { approvalId: input.approvalId, diffHash: input.diffHash, purpose: "create_pr" as const };
+    recordApprovalEvent(task, "accepted", acceptedApproval, "accepted");
     task.approvalState = "processing";
     if (task.status !== "awaiting_approval") transitionTask(task, "awaiting_approval");
     transitionTask(task, "validating");
+    recordTaskEvent(task, "validation_started", "system", { status: "running", metadata: { diffHash: input.diffHash } });
     task.error = undefined;
     task.validation = [];
     task.secretFindings = [];
@@ -198,6 +212,8 @@ export async function approveAndCreatePullRequest(taskId: string, input: Approva
         throw new ApprovalError(task.error);
       }
 
+      recordTaskEvent(task, "validation_passed", "system", { status: "passed", metadata: { diffHash: input.diffHash } });
+
       const beforeStage = await createDiffSnapshot(task);
       if (beforeStage.hash !== input.diffHash) throw invalidate(task, "Approval invalidated because the worktree changed. Review the latest diff again.");
 
@@ -210,6 +226,7 @@ export async function approveAndCreatePullRequest(taskId: string, input: Approva
         task.commitSha = await runGit(task.worktreePath, ["rev-parse", "HEAD"]);
         task.approvalState = "used";
         persistTask(task);
+        recordTaskEvent(task, "commit_created", "system", { status: "created", metadata: { commitSha: task.commitSha } });
       } catch (error) {
         if (error instanceof ApprovalError) throw error;
         task.approvalState = "invalidated";
@@ -221,6 +238,7 @@ export async function approveAndCreatePullRequest(taskId: string, input: Approva
       transitionTask(task, "pushing");
       try {
         await deps.push(task);
+        recordTaskEvent(task, "branch_pushed", "system", { status: "pushed", metadata: task.commitSha ? { commitSha: task.commitSha } : undefined });
       } catch {
         transitionTask(task, "push_failed");
         task.error = "Git push failed. The commit exists only in the retained task worktree.";
@@ -235,6 +253,7 @@ export async function approveAndCreatePullRequest(taskId: string, input: Approva
         task.prUrl = created.url;
         task.prNumber = created.number;
         transitionTask(task, "pr_created");
+        recordTaskEvent(task, "pr_created", "system", { status: "created", metadata: { prNumber: created.number, ...(task.commitSha ? { commitSha: task.commitSha } : {}) } });
         task.error = undefined;
         return publicTask(task);
       } catch {
@@ -243,13 +262,18 @@ export async function approveAndCreatePullRequest(taskId: string, input: Approva
         throw new ApprovalError(task.error);
       }
     } catch (error) {
-      if (error instanceof ApprovalError) throw error;
-      if (task.status === "validating") {
+      const failure = error instanceof ApprovalError ? error : new ApprovalError(task.error ?? "Approve and create PR failed");
+      if (!(error instanceof ApprovalError) && task.status === "validating") {
         task.approvalState = "invalidated";
         transitionTask(task, "validation_failed");
         task.error = "Pre-PR safety validation failed.";
       }
-      throw new ApprovalError(task.error ?? "Approve and create PR failed");
+      if (task.approvalState === "invalidated") {
+        if (["validation_failed", "secret_scan_failed", "approval_invalidated"].includes(task.status)) recordTaskEvent(task, "validation_failed", "system", { status: task.status, metadata: { diffHash: input.diffHash } });
+        recordApprovalEvent(task, "invalidated", acceptedApproval, task.status);
+        recordApprovalEvent(task, "failed", acceptedApproval, task.status);
+      }
+      throw error instanceof ApprovalError ? failure : new ApprovalError(task.error ?? failure.message);
     }
   } finally {
     const task = getTask(taskId); if (task) persistTask(task);
@@ -276,6 +300,7 @@ export async function retryPullRequest(taskId: string, dependencies: Partial<App
       task.prUrl = created.url;
       task.prNumber = created.number;
       transitionTask(task, "pr_created");
+      recordTaskEvent(task, "pr_created", "system", { status: "created", metadata: { prNumber: created.number, commitSha: task.commitSha } });
       task.error = undefined;
       return publicTask(task);
     } catch {

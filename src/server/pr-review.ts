@@ -19,7 +19,7 @@ import {
 import type { PullRequestCheck, PullRequestReview, PullRequestReviewItem, ReviewDisposition } from "./pr-review-types";
 import { ALLOWED_ROOT, validateRepository } from "./repositories";
 import { acquireTaskLock, isTaskLocked, releaseTaskLock } from "./task-lock";
-import { WORKTREE_ROOT, getTask, getTaskDiff, persistTask, publicTask, registerRecoveredTask, transitionTask, type RepoTask } from "./tasks";
+import { WORKTREE_ROOT, getTask, getTaskDiff, persistTask, publicTask, recordApprovalEvent, recordDiffVersion, recordTaskEvent, registerRecoveredTask, transitionTask, type RepoTask } from "./tasks";
 
 const MAX_REVIEW_BODY_CHARS = 10_000;
 const MAX_REVIEW_ITEMS = 200;
@@ -88,7 +88,11 @@ export async function fetchReviewIntake(taskId: string, dependencies: Partial<Pr
       task.reviewIntake = intake;
       task.reworkResult = undefined;
       task.reviewReady = false;
-      if (intake.readyForHumanMerge) transitionTask(task, "ready_for_human_merge");
+      recordTaskEvent(task, "pr_review_fetched", "system", { status: "completed", metadata: { prNumber: review.number, changedFileCount: review.changedFiles.length } });
+      if (intake.readyForHumanMerge) {
+        transitionTask(task, "ready_for_human_merge");
+        recordTaskEvent(task, "ready_for_human_merge", "system", { status: "ready", metadata: { prNumber: review.number } });
+      }
       else if (intake.requiresRework) transitionTask(task, "awaiting_rework_approval");
       else transitionTask(task, "review_ready");
       return publicTask(task);
@@ -113,6 +117,7 @@ export async function applyReviewedFixes(taskId: string, input: { approved: true
     if (!task.originalTaskAvailable || !task.worktreeAvailable || !task.prompt) throw new ApprovalError("Original task context or managed worktree was lost after restart; rework cannot start safely");
     await validateExistingPullRequest(task, task.prReview);
     transitionTask(task, "reworking");
+    recordTaskEvent(task, "rework_started", "user", { status: "running", metadata: task.prNumber ? { prNumber: task.prNumber } : undefined });
     task.error = undefined;
     task.reworkBaseSha = task.commitSha;
     let result;
@@ -152,6 +157,9 @@ export async function applyReviewedFixes(taskId: string, input: { approved: true
     task.approvalPurpose = "rework";
     task.validation = [];
     task.secretFindings = [];
+    recordDiffVersion(task, snapshot.hash, await getTaskDiff(task));
+    recordTaskEvent(task, "rework_completed", "system", { status: "completed", metadata: { diffHash: snapshot.hash } });
+    recordApprovalEvent(task, "issued", { approvalId: task.approvalId, diffHash: task.diffHash, purpose: "rework" }, "pending");
     transitionTask(task, "awaiting_final_approval");
     return publicTask(task);
   } finally {
@@ -166,8 +174,11 @@ export async function approveRework(taskId: string, input: ApprovalInput, depend
   try {
     const task = requireTask(taskId);
     requireReworkApproval(task, input);
+    const acceptedApproval = { approvalId: input.approvalId, diffHash: input.diffHash, purpose: "rework" as const };
+    recordApprovalEvent(task, "accepted", acceptedApproval, "accepted");
     task.approvalState = "processing";
     transitionTask(task, "validating");
+    recordTaskEvent(task, "validation_started", "system", { status: "running", metadata: { diffHash: input.diffHash } });
     task.validation = [];
     task.secretFindings = [];
     task.error = undefined;
@@ -193,6 +204,7 @@ export async function approveRework(taskId: string, input: ApprovalInput, depend
       await deps.checkGhAuth(task);
       task.validation.push({ name: "gh auth", status: "pass" });
       if ((await createDiffSnapshot(task)).hash !== input.diffHash) throw approvalInvalidated(task);
+      recordTaskEvent(task, "validation_passed", "system", { status: "passed", metadata: { diffHash: input.diffHash } });
 
       transitionTask(task, "committing_rework");
       try {
@@ -211,6 +223,7 @@ export async function approveRework(taskId: string, input: ApprovalInput, depend
       task.commitSha = commitSha;
       task.approvalState = "used";
       persistTask(task);
+      recordTaskEvent(task, "commit_created", "system", { status: "created", metadata: { commitSha } });
 
       transitionTask(task, "pushing_rework");
       try { await deps.push(task); }
@@ -220,6 +233,7 @@ export async function approveRework(taskId: string, input: ApprovalInput, depend
         throw new ApprovalError(task.error);
       }
       task.latestPushedSha = commitSha;
+      recordTaskEvent(task, "branch_pushed", "system", { status: "pushed", metadata: { commitSha } });
       transitionTask(task, "checking_ci");
       const verified = await deps.verifyPush(task, commitSha);
       await validateExistingPullRequest(task, verified);
@@ -230,16 +244,24 @@ export async function approveRework(taskId: string, input: ApprovalInput, depend
       if (ci.status === "fail") transitionTask(task, "ci_failed");
       else if (ci.status === "pending") transitionTask(task, "ci_pending");
       else if (hasRequiredAction(ci.review) || !pullRequestCanBeMergedByHuman(ci.review)) transitionTask(task, "review_ready");
-      else transitionTask(task, "ready_for_human_merge");
+      else {
+        transitionTask(task, "ready_for_human_merge");
+        recordTaskEvent(task, "ready_for_human_merge", "system", { status: "ready", metadata: task.prNumber ? { prNumber: task.prNumber, commitSha } : { commitSha } });
+      }
       return publicTask(task);
     } catch (error) {
-      if (error instanceof ApprovalError) throw error;
-      if (task.status === "validating") {
+      const failure = error instanceof ApprovalError ? error : new ApprovalError(task.error ?? safeError(error, "Rework approval failed"));
+      if (!(error instanceof ApprovalError) && task.status === "validating") {
         task.approvalState = "invalidated";
         transitionTask(task, "validation_failed");
         task.error = safeError(error, "Rework validation failed. No commit was created.");
       }
-      throw new ApprovalError(task.error ?? safeError(error, "Rework approval failed"));
+      if (task.approvalState === "invalidated") {
+        if (["validation_failed", "secret_scan_failed", "approval_invalidated"].includes(task.status)) recordTaskEvent(task, "validation_failed", "system", { status: task.status, metadata: { diffHash: input.diffHash } });
+        recordApprovalEvent(task, "invalidated", acceptedApproval, task.status);
+        recordApprovalEvent(task, "failed", acceptedApproval, task.status);
+      }
+      throw error instanceof ApprovalError ? failure : new ApprovalError(task.error ?? failure.message);
     }
   } finally {
     const task = getTask(taskId); if (task) persistTask(task);
