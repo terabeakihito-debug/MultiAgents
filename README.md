@@ -52,6 +52,8 @@ worktree. Cursor and Claude are instructed to review the task and diff without
 editing. No phase creates commits, pushes, merges, or PRs. The final `git diff
 --stat` and `git diff` are shown in the UI.
 
+Any resulting pull request requires explicit human approval before merging.
+
 **Delete task worktree** uses `git worktree remove` only when the task worktree
 is clean. Dirty task worktrees are deliberately retained. Because task state is
 in memory, a server crash can leave an orphan. Inspect and remove it manually:
