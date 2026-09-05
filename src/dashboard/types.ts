@@ -61,6 +61,12 @@ export type DashboardTask = {
     warning?: string;
     blockedReason?: string;
   };
+  source?: {
+    findingId: string;
+    sourceTaskId: string;
+    severity: string;
+    title: string;
+  };
 };
 
 export type DashboardCounts = Record<TaskBucket, number>;

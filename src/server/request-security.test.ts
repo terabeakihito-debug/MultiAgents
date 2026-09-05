@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { rejectNonHumanProfileMutation, rejectNonHumanTemplateMutation, rejectNonLocalRequest } from "./request-security";
+import { rejectNonHumanFindingMutation, rejectNonHumanProfileMutation, rejectNonHumanTemplateMutation, rejectNonLocalRequest } from "./request-security";
 import { beginAgentExecution } from "./agent-execution-guard";
 
 describe("rejectNonLocalRequest", () => {
@@ -44,5 +44,20 @@ describe("rejectNonHumanTemplateMutation", () => {
     const humanUi = new Request("http://localhost:3000/api/repos/repo/templates", { method: "POST", headers: { host: "localhost:3000", origin: "http://localhost:3000", "sec-fetch-site": "same-origin", "x-multiagents-human-action": "template-save" } });
     expect(rejectNonHumanTemplateMutation(humanUi)).toBeUndefined();
     const end = beginAgentExecution(); expect(rejectNonHumanTemplateMutation(humanUi)?.status).toBe(423); end();
+  });
+});
+
+describe("rejectNonHumanFindingMutation", () => {
+  it("requires the exact human conversion action and blocks conversion during agent execution", () => {
+    const url = "http://localhost:3000/api/findings/11111111-1111-4111-8111-111111111111/convert";
+    const direct = new Request(url, { method: "POST", headers: { host: "localhost:3000" } });
+    expect(rejectNonHumanFindingMutation(direct, "finding-convert")?.status).toBe(403);
+    const wrongAction = new Request(url, { method: "POST", headers: { host: "localhost:3000", origin: "http://localhost:3000", "sec-fetch-site": "same-origin", "x-multiagents-human-action": "finding-accept" } });
+    expect(rejectNonHumanFindingMutation(wrongAction, "finding-convert")?.status).toBe(403);
+    const humanUi = new Request(url, { method: "POST", headers: { host: "localhost:3000", origin: "http://localhost:3000", "sec-fetch-site": "same-origin", "x-multiagents-human-action": "finding-convert" } });
+    expect(rejectNonHumanFindingMutation(humanUi, "finding-convert")).toBeUndefined();
+    const end = beginAgentExecution();
+    expect(rejectNonHumanFindingMutation(humanUi, "finding-convert")?.status).toBe(423);
+    end();
   });
 });

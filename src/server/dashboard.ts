@@ -122,6 +122,7 @@ export function validatedDashboardPrUrl(task: RepoTask | undefined, row: Pick<Da
 
 async function dashboardTask(row: DashboardRow, now: Date): Promise<DashboardTask> {
   const task = getTask(row.taskId);
+  const sourceFinding = row.sourceFindingId ? getStateStore().loadFinding(row.sourceFindingId) : undefined;
   const profile = object(row.payload.profileSnapshot);
   const template = object(row.payload.templateSnapshot);
   let dirty = false;
@@ -156,6 +157,7 @@ async function dashboardTask(row: DashboardRow, now: Date): Promise<DashboardTas
     canResume: row.bucket !== "archived" && row.recoveryStatus !== "invalid", canViewDiff: row.worktreeAvailable && row.worktreeStatus === "available",
     canRefreshPr: Boolean(row.prNumber && prUrl),
     cleanup: { allowed: !cleanupBlocked, requiresConfirmation: hasPr, warning, blockedReason: cleanupBlocked },
+    source: sourceFinding && row.sourceTaskId ? { findingId: sourceFinding.findingId, sourceTaskId: row.sourceTaskId, severity: sourceFinding.severity, title: sourceFinding.title } : undefined,
   };
 }
 

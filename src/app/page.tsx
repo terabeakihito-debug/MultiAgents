@@ -7,6 +7,7 @@ import { acquireRunLock, releaseRunLock } from "./run-lock";
 import { TaskDashboard } from "./task-dashboard";
 import { agentRoles, validationSteps, type ProjectProfile, type ProjectProfileSnapshot, type RolePolicy, type ValidationPolicy, type ValidationStep } from "@/profiles/policy";
 import type { RepoTemplateSettings, TaskTemplate, TaskTemplateSnapshot } from "@/templates/policy";
+import type { Finding } from "@/findings/types";
 
 const labels: Record<AgentId, string> = { codex: "Codex", cursor: "Cursor", claude: "Claude" };
 const roleLabels = { draft: "Draft", review: "Review", final: "Final" } as const;
@@ -29,6 +30,8 @@ type RepoTask = {
   recoveryStatus: "recoverable" | "needs_attention" | "orphaned" | "invalid"; recoveryMessage?: string; worktreeStatus: "available" | "not_required" | "missing" | "removed" | "invalid";
   profile: ProjectProfileSnapshot;
   template: TaskTemplateSnapshot;
+  sourceFindingId?: string;
+  sourceTaskId?: string;
 };
 type TaskDiff = {
   trackedFiles: string[]; untrackedFiles: string[]; stat: string; patch: string; untrackedPatch: string;
@@ -73,6 +76,7 @@ export default function Home() {
   const [taskError, setTaskError] = useState("");
   const [taskHistory, setTaskHistory] = useState<TaskHistory>(emptyHistory);
   const [historyTitle, setHistoryTitle] = useState("");
+  const [findings, setFindings] = useState<Finding[]>([]);
   const sendingRef = useRef(false);
   const flowAbortRef = useRef<AbortController | null>(null);
   const currentFlowIdRef = useRef("");
@@ -92,6 +96,13 @@ export default function Home() {
     setTaskHistory(data.history);
   }
 
+  async function loadTaskFindings(taskId: string) {
+    const response = await fetch(`/api/tasks/${taskId}/findings`);
+    const data = await response.json() as { findings?: Finding[]; error?: string };
+    if (!response.ok || !data.findings) throw new Error(data.error || "Could not load findings");
+    setFindings(data.findings);
+  }
+
   async function openDashboardHistory(taskId: string, label: string) {
     setTaskError("");
     try { await loadTaskHistory(taskId); setHistoryTitle(label); }
@@ -99,7 +110,7 @@ export default function Home() {
   }
 
   async function resumePersistedTask(taskId: string) {
-    setTaskError(""); setTaskDiff(null); setApproval(null); setReviewedDiff(false); setTaskHistory(emptyHistory());
+    setTaskError(""); setTaskDiff(null); setApproval(null); setReviewedDiff(false); setTaskHistory(emptyHistory()); setFindings([]);
     try {
       const response = await fetch(`/api/tasks/${taskId}/resume`, { method: "POST" });
       const data = await response.json() as { diff?: TaskDiff; task?: RepoTask; approval?: Approval; error?: string };
@@ -112,11 +123,12 @@ export default function Home() {
       setTaskDiff(data.diff ?? null); setApproval(data.approval ?? null);
       if (data.error) setTaskError(data.error);
       await loadTaskHistory(restored.id); setHistoryTitle(""); setDashboardRefresh((value) => value + 1);
+      if (["security_review", "investigation"].includes(restored.template.taskType)) await loadTaskFindings(restored.id);
     } catch (error) { setTaskError(message(error)); }
   }
 
   async function createIsolatedTask() {
-    setTaskError(""); setTaskDiff(null); setApproval(null); setReviewedDiff(false); setOpenPulls([]); setTaskHistory(emptyHistory());
+    setTaskError(""); setTaskDiff(null); setApproval(null); setReviewedDiff(false); setOpenPulls([]); setTaskHistory(emptyHistory()); setFindings([]);
     try {
       const response = await fetch("/api/tasks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repoId, templateId, prompt }) });
       const data = await response.json() as { task?: RepoTask; error?: string };
@@ -168,7 +180,7 @@ export default function Home() {
     setTaskError("");
     const response = await fetch(`/api/tasks/${task.id}`, { method: "DELETE" });
     if (!response.ok) { const data = await response.json() as { error?: string }; setTaskError(data.error || "Cleanup failed"); return; }
-    setTask(null); setTaskDiff(null); setApproval(null); setReviewedDiff(false); setTaskHistory(emptyHistory());
+    setTask(null); setTaskDiff(null); setApproval(null); setReviewedDiff(false); setTaskHistory(emptyHistory()); setFindings([]);
     setDashboardRefresh((value) => value + 1);
   }
 
@@ -364,7 +376,7 @@ export default function Home() {
     <header><h1>MultiAgents</h1><p>Parallel answers or a fixed, reviewed response from local AI CLIs.</p></header>
     <TaskDashboard repos={repos} busy={sending || approvalProcessing || reviewProcessing} refreshToken={dashboardRefresh} onResume={(id) => void resumePersistedTask(id)} onHistory={(id, label) => void openDashboardHistory(id, label)} onError={setTaskError} />
     {historyTitle ? <section className="dashboardHistory"><div className="cardHeader"><div><span className="eyebrow">Dashboard history</span><h2>{historyTitle}</h2></div><button type="button" className="secondary" onClick={() => { setHistoryTitle(""); setTaskHistory(emptyHistory()); }}>Close</button></div><TaskHistoryPanel history={taskHistory} /></section> : null}
-    <section className="repoPanel"><label htmlFor="repository">Repository</label><div className="repoControls"><select id="repository" value={repoId} disabled={sending || Boolean(task)} onChange={(event) => { const next = repos.find((repo) => repo.id === event.target.value); setRepoId(event.target.value); setTemplateId(next?.settings.defaultTemplateId || ""); setOpenPulls([]); }}>{repos.map((repo) => <option key={repo.id} value={repo.id}>{repo.name}{repo.dirty ? " (dirty)" : ""}</option>)}</select><button type="button" disabled={!repoId || !selectedTemplate || !prompt.trim() || sending || Boolean(task) || selectedProfile?.enabled === false} onClick={createIsolatedTask}>{selectedTemplate?.readOnly ? "Create read-only task" : "Create isolated task"}</button><button type="button" disabled={!repoId || sending || reviewProcessing || Boolean(task)} onClick={loadOpenPulls}>{reviewProcessing ? "Loading…" : "Find open PRs"}</button></div>{selectedProfile && <ProfilePanel repoId={repoId} profile={selectedProfile} disabled={sending || approvalProcessing || reviewProcessing || Boolean(task)} onSaved={(profile) => { setRepos((current) => current.map((repo) => repo.id === repoId ? { ...repo, profile } : repo)); setDashboardRefresh((value) => value + 1); }} onError={setTaskError} />}{selectedRepo && !task ? <TemplatePanel repo={selectedRepo} selectedTemplateId={templateId} disabled={sending || approvalProcessing || reviewProcessing} onSelected={setTemplateId} onSaved={(data) => { setRepos((current) => current.map((repo) => repo.id === selectedRepo.id ? { ...repo, ...data } : repo)); if (!data.templates.some((template) => template.templateId === templateId && template.enabled)) setTemplateId(data.settings.defaultTemplateId); }} onError={setTaskError} /> : null}{!task && openPulls.length > 0 && <div className="openPulls"><h3>Open PRs from this repository origin</h3>{openPulls.map((pull) => <div className="openPull" key={pull.number}><span>#{pull.number} {pull.title} · <code>{pull.head}</code></span><button type="button" disabled={reviewProcessing} onClick={() => recoverPull(pull.number)}>Open review intake</button></div>)}</div>}{task && <><div className="taskReady"><div><strong>Repo:</strong> {task.repoName}</div><div><strong>Profile:</strong> {task.profile.name} v{task.profile.version}</div><div><strong>Template:</strong> {task.template.name} v{task.template.version}</div><div><strong>Branch:</strong> <code>{task.branch}</code></div><div><strong>State:</strong> <code>{task.status}</code></div><div><strong>Worktree:</strong> {task.worktreeAvailable ? "ready" : task.template.readOnly ? "not required (read-only)" : "unavailable"}</div><button type="button" className="delete" onClick={deleteWorktree} disabled={sending || approvalProcessing || reviewProcessing || Boolean(task.commitSha) || !task.worktreeAvailable}>Delete task worktree</button></div>{task.recoveryMessage && <p className="staleReason">{task.recoveryMessage}</p>}</>}{taskError && <ErrorBlock error={taskError} />}</section>
+    <section className="repoPanel"><label htmlFor="repository">Repository</label><div className="repoControls"><select id="repository" value={repoId} disabled={sending || Boolean(task)} onChange={(event) => { const next = repos.find((repo) => repo.id === event.target.value); setRepoId(event.target.value); setTemplateId(next?.settings.defaultTemplateId || ""); setOpenPulls([]); }}>{repos.map((repo) => <option key={repo.id} value={repo.id}>{repo.name}{repo.dirty ? " (dirty)" : ""}</option>)}</select><button type="button" disabled={!repoId || !selectedTemplate || !prompt.trim() || sending || Boolean(task) || selectedProfile?.enabled === false} onClick={createIsolatedTask}>{selectedTemplate?.readOnly ? "Create read-only task" : "Create isolated task"}</button><button type="button" disabled={!repoId || sending || reviewProcessing || Boolean(task)} onClick={loadOpenPulls}>{reviewProcessing ? "Loading…" : "Find open PRs"}</button></div>{selectedProfile && <ProfilePanel repoId={repoId} profile={selectedProfile} disabled={sending || approvalProcessing || reviewProcessing || Boolean(task)} onSaved={(profile) => { setRepos((current) => current.map((repo) => repo.id === repoId ? { ...repo, profile } : repo)); setDashboardRefresh((value) => value + 1); }} onError={setTaskError} />}{selectedRepo && !task ? <TemplatePanel repo={selectedRepo} selectedTemplateId={templateId} disabled={sending || approvalProcessing || reviewProcessing} onSelected={setTemplateId} onSaved={(data) => { setRepos((current) => current.map((repo) => repo.id === selectedRepo.id ? { ...repo, ...data } : repo)); if (!data.templates.some((template) => template.templateId === templateId && template.enabled)) setTemplateId(data.settings.defaultTemplateId); }} onError={setTaskError} /> : null}{!task && openPulls.length > 0 && <div className="openPulls"><h3>Open PRs from this repository origin</h3>{openPulls.map((pull) => <div className="openPull" key={pull.number}><span>#{pull.number} {pull.title} · <code>{pull.head}</code></span><button type="button" disabled={reviewProcessing} onClick={() => recoverPull(pull.number)}>Open review intake</button></div>)}</div>}{task && <><div className="taskReady"><div><strong>Repo:</strong> {task.repoName}</div><div><strong>Profile:</strong> {task.profile.name} v{task.profile.version}</div><div><strong>Template:</strong> {task.template.name} v{task.template.version}</div><div><strong>Branch:</strong> <code>{task.branch}</code></div><div><strong>State:</strong> <code>{task.status}</code></div><div><strong>Worktree:</strong> {task.worktreeAvailable ? "ready" : task.template.readOnly ? "not required (read-only)" : "unavailable"}</div>{task.sourceFindingId && task.sourceTaskId ? <button type="button" className="secondary" onClick={() => void resumePersistedTask(task.sourceTaskId!)}>Source finding {task.sourceFindingId.slice(0, 8)}</button> : null}<button type="button" className="delete" onClick={deleteWorktree} disabled={sending || approvalProcessing || reviewProcessing || Boolean(task.commitSha) || !task.worktreeAvailable}>Delete task worktree</button></div>{task.recoveryMessage && <p className="staleReason">{task.recoveryMessage}</p>}</>}{taskError && <ErrorBlock error={taskError} />}</section>
     <form onSubmit={submit}>
       <fieldset className="modes" disabled={sending || Boolean(task)}><legend>Mode</legend><label><input type="radio" checked={mode === "parallel"} onChange={() => setMode("parallel")} /> Parallel</label><label><input type="radio" checked={mode === "review"} onChange={() => setMode("review")} /> Review Flow</label></fieldset>
       <label htmlFor="prompt">{task ? "Task" : "Task / Prompt"}</label>
@@ -372,6 +384,7 @@ export default function Home() {
       <div className="actions"><span>{prompt.length.toLocaleString()} / 20,000</span><div className="actionButtons">{sending && mode === "review" && <button className="cancel" type="button" onClick={cancelFlow}>Cancel</button>}<button type="submit" disabled={sending || !prompt.trim() || (mode === "review" && Boolean(task) && !task?.worktreeAvailable && !task?.template.readOnly)}>{sending ? "Running…" : mode === "parallel" ? "Send to all" : "Run review flow"}</button></div></div>
     </form>
     {mode === "parallel" ? <section className="cards" aria-label="Agent responses">{agentIds.map((id) => <AgentCard key={id} name={labels[id]} state={cards[id]} />)}</section> : <FlowTimeline steps={steps} versions={taskHistory.stepVersions} status={flowStatus} finalOutput={finalOutput} sending={sending} activeRerun={activeRerun} onRerun={rerunStep} />}
+    {task && ["security_review", "investigation"].includes(task.template.taskType) ? <FindingsPanel task={task} templates={selectedRepo?.templates ?? []} findings={findings} busy={sending || reviewProcessing} onFindings={setFindings} onOpenTask={(id) => void resumePersistedTask(id)} onHistoryRefresh={() => void loadTaskHistory(task.id)} onDashboardRefresh={() => setDashboardRefresh((value) => value + 1)} onError={setTaskError} /> : null}
     {taskDiff && <section className="diff card"><h2>Final Diff</h2><h3>Tracked changed files</h3><pre>{taskDiff.trackedFiles.join("\n") || "None."}</pre><h3>Untracked files</h3><pre>{taskDiff.untrackedFiles.join("\n") || "None."}</pre><h3>Changed lines</h3><pre>{taskDiff.stat || "No tracked changes."}</pre><details><summary>View full diff</summary><pre>{[taskDiff.patch, taskDiff.untrackedPatch].filter(Boolean).join("\n\n") || "No changes."}</pre></details>{taskDiff.blockedReason && <p className="staleReason">{taskDiff.blockedReason}</p>}
       {(task?.validation.length || approvalProcessing) && <div className="validation"><h3>Pre-PR Validation</h3>{task?.validation.map((check, index) => <div className="validationRow" key={`${check.name}-${index}`}><span>{check.name}</span><Status value={check.status} /><span>{check.detail}</span></div>)}{approvalProcessing && <p>Server-side checks and PR creation are running…</p>}</div>}
       {task?.secretFindings.length ? <div className="error"><strong>Secret scan findings</strong><ul>{task.secretFindings.map((finding, index) => <li key={`${finding.path}-${finding.rule}-${index}`}><code>{finding.path}</code>: {finding.rule}</li>)}</ul></div> : null}
@@ -383,6 +396,98 @@ export default function Home() {
     {task?.prNumber && <PrReviewPanel task={task} processing={reviewProcessing} onFetch={fetchPrReview} onApply={applyReviewFixes} />}
     {task && <TaskHistoryPanel history={taskHistory} />}
   </main>;
+}
+
+function FindingsPanel({ task, templates, findings, busy, onFindings, onOpenTask, onHistoryRefresh, onDashboardRefresh, onError }: {
+  task: RepoTask;
+  templates: TaskTemplate[];
+  findings: Finding[];
+  busy: boolean;
+  onFindings: (findings: Finding[]) => void;
+  onOpenTask: (taskId: string) => void;
+  onHistoryRefresh: () => void;
+  onDashboardRefresh: () => void;
+  onError: (error: string) => void;
+}) {
+  const safeTemplates = templates.filter((template) => template.enabled && ["bug_fix", "feature", "refactor"].includes(template.templateId));
+  const [processing, setProcessing] = useState("");
+  const [conversion, setConversion] = useState<Finding | null>(null);
+  const [conversionTemplate, setConversionTemplate] = useState("bug_fix");
+  const [objective, setObjective] = useState("");
+
+  async function extract() {
+    setProcessing("extract"); onError("");
+    try {
+      const response = await fetch(`/api/tasks/${task.id}/findings/extract`, { method: "POST", headers: { "Content-Type": "application/json", "X-MultiAgents-Human-Action": "finding-extract" }, body: JSON.stringify({ confirmed: true }) });
+      const data = await response.json() as { findings?: Finding[]; error?: string };
+      if (!response.ok || !data.findings) throw new Error(data.error || "Finding extraction failed");
+      onFindings(data.findings); onHistoryRefresh();
+    } catch (error) { onError(message(error)); }
+    finally { setProcessing(""); }
+  }
+
+  async function changeStatus(finding: Finding, action: "accept" | "dismiss") {
+    let reason: string | undefined;
+    if (action === "dismiss") {
+      const answer = window.prompt("Optional dismissal reason (Cancel keeps the finding open):", "");
+      if (answer === null) return;
+      reason = answer;
+    }
+    setProcessing(finding.findingId); onError("");
+    try {
+      const response = await fetch(`/api/findings/${finding.findingId}/${action}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-MultiAgents-Human-Action": `finding-${action}` },
+        body: JSON.stringify(action === "accept" ? { confirmed: true } : { confirmed: true, reason }),
+      });
+      const data = await response.json() as { finding?: Finding; error?: string };
+      if (!response.ok || !data.finding) throw new Error(data.error || `Finding ${action} failed`);
+      onFindings(findings.map((item) => item.findingId === data.finding!.findingId ? data.finding! : item)); onHistoryRefresh();
+    } catch (error) { onError(message(error)); }
+    finally { setProcessing(""); }
+  }
+
+  function openConversion(finding: Finding) {
+    const initialTemplate = safeTemplates.find((template) => template.templateId === "bug_fix")?.templateId ?? safeTemplates[0]?.templateId ?? "";
+    setConversionTemplate(initialTemplate);
+    setObjective("Fix the confirmed issue described in the reviewed finding.");
+    setConversion(finding);
+  }
+
+  async function convert() {
+    if (!conversion) return;
+    setProcessing(conversion.findingId); onError("");
+    try {
+      const response = await fetch(`/api/findings/${conversion.findingId}/convert`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-MultiAgents-Human-Action": "finding-convert" },
+        body: JSON.stringify({ confirmed: true, templateId: conversionTemplate, objective }),
+      });
+      const data = await response.json() as { finding?: Finding; task?: RepoTask; error?: string };
+      if (!response.ok || !data.finding || !data.task) throw new Error(data.error || "Finding conversion failed");
+      onFindings(findings.map((item) => item.findingId === data.finding!.findingId ? data.finding! : item));
+      setConversion(null); onHistoryRefresh(); onDashboardRefresh();
+    } catch (error) { onError(message(error)); }
+    finally { setProcessing(""); }
+  }
+
+  return <section className="card findings" aria-labelledby="findings-title">
+    <div className="cardHeader"><div><span className="eyebrow">Untrusted review output</span><h2 id="findings-title">Findings</h2></div>{findings.length === 0 ? <button type="button" disabled={busy || Boolean(processing) || task.flowStatus !== "completed" || !task.finalOutput} onClick={() => void extract()}>{processing === "extract" ? "Extracting…" : "Extract findings"}</button> : <span>{findings.length} findings</span>}</div>
+    <p className="muted">Finding content is untrusted. Extraction never creates an implementation task; only the confirmation below can do that.</p>
+    {findings.length ? <div className="findingList">{findings.map((finding) => <article className="findingItem" key={finding.findingId}>
+      <div className="findingHeading"><Status value={finding.severity} /><h3>{finding.title}</h3><span className={`findingStatus ${finding.status}`}>{finding.status.toUpperCase()}</span></div>
+      <p>{finding.summary}</p>
+      {finding.category ? <p><strong>Category:</strong> {finding.category}</p> : null}
+      {finding.affectedPaths?.length ? <div><strong>Affected (hints):</strong><ul>{finding.affectedPaths.map((path) => <li key={path}><code>{path}</code></li>)}</ul></div> : null}
+      {finding.evidence ? <details><summary>Evidence</summary><pre>{finding.evidence}</pre></details> : null}
+      <div className="findingActions">
+        {finding.status === "open" ? <><button type="button" disabled={busy || Boolean(processing)} onClick={() => void changeStatus(finding, "accept")}>Accept</button><button type="button" className="secondary" disabled={busy || Boolean(processing)} onClick={() => void changeStatus(finding, "dismiss")}>Dismiss</button></> : null}
+        {["open", "accepted"].includes(finding.status) ? <button type="button" disabled={busy || Boolean(processing) || safeTemplates.length === 0} onClick={() => openConversion(finding)}>Create implementation task</button> : null}
+        {finding.convertedTaskId ? <button type="button" className="secondary" onClick={() => onOpenTask(finding.convertedTaskId!)}>Open implementation task</button> : null}
+      </div>
+    </article>)}</div> : <p className="muted">Run and complete the read-only review, then explicitly extract structured findings.</p>}
+    {conversion ? <div className="dialogBackdrop" role="presentation"><section className="cleanupDialog conversionDialog" role="dialog" aria-modal="true" aria-labelledby="conversion-title"><span className="eyebrow">Human approval required</span><h2 id="conversion-title">Create implementation task?</h2><dl><div><dt>Finding</dt><dd>{conversion.title}</dd></div><div><dt>Severity</dt><dd>{conversion.severity.toUpperCase()}</dd></div><div><dt>Repository</dt><dd>{task.repoName}</dd></div></dl><label>Target template<select value={conversionTemplate} onChange={(event) => setConversionTemplate(event.target.value)}>{safeTemplates.map((template) => <option key={template.templateId} value={template.templateId}>{template.name}</option>)}</select></label><label>Human-approved objective<textarea rows={4} maxLength={20_000} value={objective} onChange={(event) => setObjective(event.target.value)} /></label><p>This creates a new isolated task in the same repository. The finding text is wrapped as untrusted context, and the current project profile is re-evaluated.</p><div className="dialogActions"><button type="button" className="secondary" disabled={Boolean(processing)} onClick={() => setConversion(null)}>Cancel</button><button type="button" disabled={Boolean(processing) || !conversionTemplate || !objective.trim()} onClick={() => void convert()}>{processing ? "Creating…" : "Create task"}</button></div></section></div> : null}
+  </section>;
 }
 
 type ProfilePanelProps = { repoId: string; profile: ProjectProfile; disabled: boolean; onSaved: (profile: ProjectProfile) => void; onError: (error: string) => void };
@@ -499,7 +604,7 @@ function TaskHistoryPanel({ history }: { history: TaskHistory }) {
 }
 
 const eventLabels: Record<string, string> = {
-  task_created: "Task created", flow_started: "Review flow started", step_started: "Step started", step_completed: "Step completed", step_failed: "Step failed", step_rerun: "Step re-run started", step_stale: "Step marked stale", flow_completed: "Review flow completed", flow_aborted: "Review flow aborted", approval_issued: "Approval issued", approval_invalidated: "Approval invalidated", approval_accepted: "Approval accepted", approval_failed: "Approval failed", validation_started: "Validation started", validation_passed: "Validation passed", validation_failed: "Validation failed", diff_generated: "Diff generated", commit_created: "Commit created", branch_pushed: "Branch pushed", pr_created: "Pull request created", pr_review_fetched: "PR review fetched", rework_started: "Rework started", rework_completed: "Rework completed", ready_for_human_merge: "Ready for human merge", task_resumed: "Task resumed", worktree_cleanup_requested: "Worktree cleanup requested", worktree_removed: "Worktree removed", pr_status_refreshed: "PR status refreshed", task_archived: "Task archived", template_snapshot_created: "Task template snapshot created",
+  task_created: "Task created", flow_started: "Review flow started", step_started: "Step started", step_completed: "Step completed", step_failed: "Step failed", step_rerun: "Step re-run started", step_stale: "Step marked stale", flow_completed: "Review flow completed", flow_aborted: "Review flow aborted", approval_issued: "Approval issued", approval_invalidated: "Approval invalidated", approval_accepted: "Approval accepted", approval_failed: "Approval failed", validation_started: "Validation started", validation_passed: "Validation passed", validation_failed: "Validation failed", diff_generated: "Diff generated", commit_created: "Commit created", branch_pushed: "Branch pushed", pr_created: "Pull request created", pr_review_fetched: "PR review fetched", rework_started: "Rework started", rework_completed: "Rework completed", ready_for_human_merge: "Ready for human merge", task_resumed: "Task resumed", worktree_cleanup_requested: "Worktree cleanup requested", worktree_removed: "Worktree removed", pr_status_refreshed: "PR status refreshed", task_archived: "Task archived", template_snapshot_created: "Task template snapshot created", finding_created: "Finding created", finding_status_changed: "Finding status changed", finding_converted: "Finding converted", implementation_task_created: "Implementation task created",
 };
 function eventLabel(event: TaskEvent) { return eventLabels[event.type] ?? event.type.replaceAll("_", " "); }
 function metadataLabel(metadata: Record<string, string | number>) { return Object.entries(metadata).map(([key, value]) => `${key}: ${typeof value === "string" && value.length > 16 ? value.slice(0, 12) : value}`).join(" · "); }

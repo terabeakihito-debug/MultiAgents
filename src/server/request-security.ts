@@ -28,6 +28,10 @@ export function rejectNonHumanTemplateMutation(request: Request): Response | und
   return rejectNonHumanMutation(request, "template-save", "Task template");
 }
 
+export function rejectNonHumanFindingMutation(request: Request, action: "finding-extract" | "finding-accept" | "finding-dismiss" | "finding-convert"): Response | undefined {
+  return rejectNonHumanMutation(request, action, "Finding");
+}
+
 function rejectNonHumanMutation(request: Request, expectedAction: string, label: string): Response | undefined {
   const local = rejectNonLocalRequest(request);
   if (local) return local;

@@ -8,10 +8,11 @@ import type { DashboardCounts, DashboardSort, PrFilter, TaskBucket } from "../da
 import { parseProfileSnapshot, safeDefaultSnapshot, type ProjectProfile, type ProjectProfileSnapshot } from "../profiles/policy";
 import { builtInTemplates, mergeTemplateWithProfile, parseTemplateSnapshot, snapshotTemplate, type RepoTemplateSettings, type TaskTemplate, type TaskTemplateSnapshot } from "../templates/policy";
 import type { RepoTask } from "./tasks";
+import { findingEventTypes, type Finding, type FindingEvent, type FindingEventType } from "../findings/types";
 
 export const STATE_DIRECTORY = join(homedir(), ".multiagents");
 export const STATE_DATABASE = join(STATE_DIRECTORY, "state.db");
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 const MAX_STORED_PROMPT_CHARS = 20_000;
 const MAX_STORED_OUTPUT_CHARS = 1_000_000;
 
@@ -22,6 +23,7 @@ export const taskEventTypes = [
   "pr_created", "pr_review_fetched", "rework_started", "rework_completed", "ready_for_human_merge", "task_archived",
   "task_resumed", "worktree_cleanup_requested", "worktree_removed", "pr_status_refreshed",
   "profile_snapshot_created", "template_snapshot_created",
+  "finding_created", "finding_status_changed", "finding_converted", "implementation_task_created",
 ] as const;
 export type TaskEventType = (typeof taskEventTypes)[number];
 export type TaskEventActor = "user" | "system" | "codex" | "cursor" | "claude";
@@ -37,6 +39,8 @@ export type TaskEventMetadata = Partial<{
   profileVersion: number;
   templateId: string;
   templateVersion: number;
+  findingId: string;
+  sourceTaskId: string;
 }>;
 export type TaskEvent = {
   id: string;
@@ -119,6 +123,8 @@ export type DashboardRow = {
   profileVersion?: number;
   templateId?: string;
   templateVersion?: number;
+  sourceFindingId?: string;
+  sourceTaskId?: string;
 };
 
 export type ProfileAuditEventType = "profile_created" | "profile_updated" | "profile_assigned" | "profile_snapshot_created";
@@ -220,8 +226,9 @@ export class StateStore {
           pr_head_sha, review_disposition, unresolved_count, ci_status, merge_readiness,
           recovery_status, recovery_message, payload_json, profile_id, profile_version, profile_snapshot_json,
           template_id, template_version, template_snapshot_json
+          , source_finding_id, source_task_id
         ) VALUES (
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT(task_id) DO UPDATE SET
           repo_id=excluded.repo_id, repo_name=excluded.repo_name, repo_path=excluded.repo_path,
@@ -241,7 +248,8 @@ export class StateStore {
           profile_id=excluded.profile_id, profile_version=excluded.profile_version,
           profile_snapshot_json=excluded.profile_snapshot_json,
           template_id=excluded.template_id, template_version=excluded.template_version,
-          template_snapshot_json=excluded.template_snapshot_json
+          template_snapshot_json=excluded.template_snapshot_json,
+          source_finding_id=excluded.source_finding_id, source_task_id=excluded.source_task_id
       `).run(
         task.id, task.repoId, task.repoName, task.repoPath, task.allowedRoot, task.baseBranch, task.branch,
         task.baseSha, task.originUrl ?? null, task.worktreePath, task.worktreeRoot,
@@ -256,6 +264,7 @@ export class StateStore {
         task.recoveryStatus, task.recoveryMessage ?? null, JSON.stringify(payload),
         profile.profileId, profile.version, JSON.stringify(profile),
         template.templateId, template.version, JSON.stringify(template),
+        task.sourceFindingId ?? null, task.sourceTaskId ?? null,
       );
       this.replaceFlowSteps(task.id, task.flowSteps ?? []);
     });
@@ -301,6 +310,7 @@ export class StateStore {
         created_at, updated_at, pr_number, pr_url, recovery_status, recovery_message,
         worktree_status, worktree_available, payload_json, profile_id, profile_version,
         template_id, template_version, ${DASHBOARD_BUCKET_SQL} AS bucket
+        , source_finding_id, source_task_id
       FROM tasks ${where} ORDER BY ${order} LIMIT ?
     `).all(...listValues, input.limit) as TaskRow[];
     return { rows: raw.map(rowToDashboardRow), counts };
@@ -309,7 +319,7 @@ export class StateStore {
   clearForTests() {
     this.transaction(() => {
       this.dropAppendOnlyTriggers();
-      this.database.exec("DELETE FROM approval_events; DELETE FROM diff_versions; DELETE FROM step_versions; DELETE FROM task_events; DELETE FROM flow_steps; DELETE FROM tasks; DELETE FROM template_audit_events; DELETE FROM task_template_versions; DELETE FROM repo_template_settings; DELETE FROM task_templates; DELETE FROM profile_audit_events; DELETE FROM project_profile_versions; DELETE FROM project_profiles;");
+      this.database.exec("DELETE FROM finding_events; DELETE FROM findings; DELETE FROM approval_events; DELETE FROM diff_versions; DELETE FROM step_versions; DELETE FROM task_events; DELETE FROM flow_steps; DELETE FROM tasks; DELETE FROM template_audit_events; DELETE FROM task_template_versions; DELETE FROM repo_template_settings; DELETE FROM task_templates; DELETE FROM profile_audit_events; DELETE FROM project_profile_versions; DELETE FROM project_profiles;");
       this.createAppendOnlyTriggers();
     });
   }
@@ -363,6 +373,52 @@ export class StateStore {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `).run(id, taskId, input.approvalId, input.type, input.purpose, input.diffHash, createdAt, input.status ?? null);
     return { id, sequence: Number(result.lastInsertRowid), taskId, approvalId: input.approvalId, type: input.type, purpose: input.purpose, diffHash: input.diffHash, createdAt, status: input.status } satisfies ApprovalEvent;
+  }
+
+  createFindings(findings: Finding[]) {
+    const insert = this.database.prepare(`
+      INSERT INTO findings (finding_id, source_task_id, title, summary, severity, category, affected_paths_json, evidence, status, created_at, updated_at, converted_task_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const finding of findings) insert.run(
+      finding.findingId, finding.sourceTaskId, finding.title, finding.summary, finding.severity,
+      finding.category ?? null, finding.affectedPaths ? JSON.stringify(finding.affectedPaths) : null,
+      finding.evidence ?? null, finding.status, finding.createdAt, finding.updatedAt, finding.convertedTaskId ?? null,
+    );
+  }
+
+  loadFindings(sourceTaskId: string): Finding[] {
+    return (this.database.prepare("SELECT * FROM findings WHERE source_task_id = ? ORDER BY created_at, finding_id").all(sourceTaskId) as TaskRow[]).map(rowToFinding);
+  }
+
+  loadFinding(findingId: string): Finding | undefined {
+    const row = this.database.prepare("SELECT * FROM findings WHERE finding_id = ?").get(findingId) as TaskRow | undefined;
+    return row ? rowToFinding(row) : undefined;
+  }
+
+  updateFindingStatus(findingId: string, expected: readonly Finding["status"][], status: Finding["status"], convertedTaskId?: string) {
+    const placeholders = expected.map(() => "?").join(",");
+    const result = this.database.prepare(`UPDATE findings SET status = ?, converted_task_id = ?, updated_at = ? WHERE finding_id = ? AND status IN (${placeholders})`)
+      .run(status, convertedTaskId ?? null, new Date().toISOString(), findingId, ...expected);
+    if (Number(result.changes) !== 1) throw new Error("Finding status transition is not allowed");
+    return this.loadFinding(findingId)!;
+  }
+
+  appendFindingEvent(finding: Pick<Finding, "findingId" | "sourceTaskId">, input: { type: FindingEventType; actor: FindingEvent["actor"]; createdAt?: string; reason?: string; convertedTaskId?: string }) {
+    if (!findingEventTypes.includes(input.type)) throw new Error("Finding event type is invalid");
+    if (!['user', 'system'].includes(input.actor)) throw new Error("Finding event actor is invalid");
+    if (input.reason !== undefined && (typeof input.reason !== "string" || input.reason.length > 1_000)) throw new Error("Finding dismissal reason is invalid");
+    const id = randomUUID();
+    const createdAt = input.createdAt ?? new Date().toISOString();
+    const result = this.database.prepare(`
+      INSERT INTO finding_events (event_id, finding_id, source_task_id, event_type, actor, created_at, reason, converted_task_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, finding.findingId, finding.sourceTaskId, input.type, input.actor, createdAt, input.reason?.trim() || null, input.convertedTaskId ?? null);
+    return { id, sequence: Number(result.lastInsertRowid), findingId: finding.findingId, sourceTaskId: finding.sourceTaskId, type: input.type, actor: input.actor, createdAt, reason: input.reason?.trim() || undefined, convertedTaskId: input.convertedTaskId } satisfies FindingEvent;
+  }
+
+  loadFindingEvents(findingId: string): FindingEvent[] {
+    return (this.database.prepare("SELECT * FROM finding_events WHERE finding_id = ? ORDER BY sequence").all(findingId) as TaskRow[]).map(rowToFindingEvent);
   }
 
   loadTaskHistory(taskId: string): TaskHistory {
@@ -573,6 +629,8 @@ export class StateStore {
       profileSnapshotValid: parsedProfile.valid,
       template: parsedTemplate.template,
       templateSnapshotValid: parsedTemplate.valid,
+      sourceFindingId: optionalString(row.source_finding_id),
+      sourceTaskId: optionalString(row.source_task_id),
     } as RepoTask;
   }
 
@@ -763,11 +821,47 @@ export class StateStore {
       `);
       this.database.prepare("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)").run(4, new Date().toISOString());
     });
+    if (version < 4) version = 4;
+    if (version < 5) this.transaction(() => {
+      this.database.exec(`
+        ALTER TABLE tasks ADD COLUMN source_finding_id TEXT;
+        ALTER TABLE tasks ADD COLUMN source_task_id TEXT REFERENCES tasks(task_id);
+        CREATE TABLE findings (
+          finding_id TEXT PRIMARY KEY,
+          source_task_id TEXT NOT NULL REFERENCES tasks(task_id),
+          title TEXT NOT NULL,
+          summary TEXT NOT NULL,
+          severity TEXT NOT NULL CHECK(severity IN ('critical','high','medium','low','info')),
+          category TEXT,
+          affected_paths_json TEXT,
+          evidence TEXT,
+          status TEXT NOT NULL CHECK(status IN ('open','accepted','dismissed','converted')),
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          converted_task_id TEXT UNIQUE REFERENCES tasks(task_id)
+        );
+        CREATE INDEX findings_source_task_idx ON findings(source_task_id, created_at);
+        CREATE UNIQUE INDEX tasks_source_finding_unique ON tasks(source_finding_id) WHERE source_finding_id IS NOT NULL;
+        CREATE TABLE finding_events (
+          sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+          event_id TEXT NOT NULL UNIQUE,
+          finding_id TEXT NOT NULL REFERENCES findings(finding_id),
+          source_task_id TEXT NOT NULL REFERENCES tasks(task_id),
+          event_type TEXT NOT NULL CHECK(event_type IN ('finding_created','finding_accepted','finding_dismissed','finding_conversion_requested','implementation_task_created')),
+          actor TEXT NOT NULL CHECK(actor IN ('user','system')),
+          created_at TEXT NOT NULL,
+          reason TEXT,
+          converted_task_id TEXT REFERENCES tasks(task_id)
+        );
+        CREATE INDEX finding_events_finding_order_idx ON finding_events(finding_id, sequence);
+      `);
+      this.database.prepare("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)").run(5, new Date().toISOString());
+    });
     this.createAppendOnlyTriggers();
   }
 
   private createAppendOnlyTriggers() {
-    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events", "task_template_versions", "template_audit_events"]) {
+    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events", "task_template_versions", "template_audit_events", "finding_events"]) {
       this.database.exec(`
         CREATE TRIGGER IF NOT EXISTS ${table}_no_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT, '${table} is append-only'); END;
         CREATE TRIGGER IF NOT EXISTS ${table}_no_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT, '${table} is append-only'); END;
@@ -776,7 +870,7 @@ export class StateStore {
   }
 
   private dropAppendOnlyTriggers() {
-    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events", "task_template_versions", "template_audit_events"]) {
+    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events", "task_template_versions", "template_audit_events", "finding_events"]) {
       this.database.exec(`DROP TRIGGER IF EXISTS ${table}_no_update; DROP TRIGGER IF EXISTS ${table}_no_delete;`);
     }
   }
@@ -842,7 +936,7 @@ function storedTaskTemplate(row: TaskRow, payload: Record<string, unknown>, prof
     return { template: fallback, valid: false };
   }
 }
-const metadataKeys = new Set(["durationMs", "diffHash", "commitSha", "prNumber", "changedFileCount", "additions", "deletions", "profileId", "profileVersion", "templateId", "templateVersion"]);
+const metadataKeys = new Set(["durationMs", "diffHash", "commitSha", "prNumber", "changedFileCount", "additions", "deletions", "profileId", "profileVersion", "templateId", "templateVersion", "findingId", "sourceTaskId"]);
 function validateMetadata(value: TaskEventMetadata | undefined) {
   if (!value) return undefined;
   for (const [key, item] of Object.entries(value)) {
@@ -856,6 +950,7 @@ function validateMetadata(value: TaskEventMetadata | undefined) {
     if (key === "profileVersion" && (typeof item !== "number" || !Number.isSafeInteger(item) || item < 1)) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
     if (key === "templateId" && (typeof item !== "string" || !/^[A-Za-z0-9._-]{1,100}$/.test(item))) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
     if (key === "templateVersion" && (typeof item !== "number" || !Number.isSafeInteger(item) || item < 1)) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
+    if (["findingId", "sourceTaskId"].includes(key) && (typeof item !== "string" || !/^[0-9a-f-]{36}$/i.test(item))) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
   }
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as TaskEventMetadata;
 }
@@ -876,6 +971,23 @@ function rowToDiffVersion(row: TaskRow): DiffVersion {
 function rowToApprovalEvent(row: TaskRow): ApprovalEvent {
   return { id: String(row.approval_event_id), sequence: Number(row.sequence), taskId: String(row.task_id), approvalId: String(row.approval_id), type: String(row.event_type) as ApprovalEvent["type"], purpose: String(row.purpose) as ApprovalEvent["purpose"], diffHash: String(row.diff_hash), createdAt: String(row.created_at), status: optionalString(row.status) };
 }
+function rowToFinding(row: TaskRow): Finding {
+  const affectedPaths = row.affected_paths_json === null || row.affected_paths_json === undefined ? undefined : array(parseJson(row.affected_paths_json)).filter((item): item is string => typeof item === "string");
+  return {
+    findingId: String(row.finding_id), sourceTaskId: String(row.source_task_id), title: String(row.title), summary: String(row.summary),
+    severity: String(row.severity) as Finding["severity"], category: optionalString(row.category), affectedPaths,
+    evidence: optionalString(row.evidence), status: String(row.status) as Finding["status"], createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at), convertedTaskId: optionalString(row.converted_task_id),
+  };
+}
+function rowToFindingEvent(row: TaskRow): FindingEvent {
+  return {
+    id: String(row.event_id), sequence: Number(row.sequence), findingId: String(row.finding_id), sourceTaskId: String(row.source_task_id),
+    type: String(row.event_type) as FindingEventType, actor: String(row.actor) as FindingEvent["actor"], createdAt: String(row.created_at),
+    reason: optionalString(row.reason), convertedTaskId: optionalString(row.converted_task_id),
+  };
+}
+function parseJson(value: unknown): unknown { try { return JSON.parse(String(value)); } catch { return undefined; } }
 function rowToFlowStep(row: FlowStepRow): FlowStep {
   return {
     id: String(row.step_id) as FlowStep["id"], agent: String(row.agent) as FlowStep["agent"],
@@ -896,5 +1008,6 @@ function rowToDashboardRow(row: TaskRow): DashboardRow {
     bucket: String(row.bucket) as TaskBucket, payload: parseObject(row.payload_json),
     profileId: optionalString(row.profile_id), profileVersion: optionalNumber(row.profile_version),
     templateId: optionalString(row.template_id), templateVersion: optionalNumber(row.template_version),
+    sourceFindingId: optionalString(row.source_finding_id), sourceTaskId: optionalString(row.source_task_id),
   };
 }

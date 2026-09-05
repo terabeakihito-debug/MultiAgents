@@ -192,7 +192,7 @@ Phase 8, Phase 10, and Phase 11 use SQLite from Node.js itself; they do not add 
 ORM. State is stored at `~/.multiagents/state.db`, outside every repository.
 The directory is forced to mode `0700` and the database file to `0600` when it
 is opened. Schema migrations are tracked in `schema_version`; the current
-schema is version 4. The v1→v2, v2→v3, and v3→v4 migrations run transactionally and
+schema is version 5. The v1→v2, v2→v3, v3→v4, and v4→v5 migrations run transactionally and
 preserve existing task and flow-step snapshots. Existing tasks receive a
 `safe_default` v1 profile snapshot during the v3 migration and a compatible
 `Bug Fix` v1 template snapshot during the v4 migration.
@@ -312,6 +312,44 @@ localhost UI and are blocked while any agent process is running. Agents are
 instructed not to call template APIs, repository files are never template
 sources, and the server normalizes current definitions from built-in code. The
 application remains localhost-only.
+
+## Findings and human-approved conversion
+
+Completed **Security Review** and **Investigation** tasks can run a separate,
+read-only structured extraction step. The server asks Codex for JSON with a
+fixed schema and rejects unknown fields, invalid severities, more than 50
+findings, overlong title/summary/evidence fields, and more than 100 affected
+paths. Paths must be repository-relative and cannot be absolute, contain
+traversal, use ambiguous backslashes, or escape through a symlink. Finding
+title, summary, and evidence are scanned for recognizable credentials before
+anything is stored. The final review and extracted finding text are always
+marked as untrusted data; instructions inside them cannot change policy or
+invoke a command.
+
+Findings are stored in SQLite with append-only events. A human may explicitly
+**Accept** an open finding without creating work, or **Dismiss** it with an
+optional short reason. MultiAgents never converts a finding automatically.
+**Create implementation task** opens a confirmation dialog that shows the
+finding, severity, same repository, a human-selected **Bug Fix**, **Feature**,
+or **Refactor** template, and an editable objective. The mutation requires a
+confirmed same-origin localhost UI action and is blocked while an agent process
+is active.
+
+Conversion re-evaluates the repository's current Project Profile and intersects
+it with the selected built-in template. It never copies the read-only source
+roles into a write task and refuses profiles that cannot safely allow Codex in
+an isolated implementation worktree with read-only reviewers. The new prompt
+places finding data inside an explicit `UNTRUSTED FINDING` wrapper and restates
+the server-owned repository, worktree, approval, commit, push, merge, and deploy
+constraints. The source task remains read-only and unchanged.
+
+The implementation task stores `sourceFindingId` and `sourceTaskId`; the
+finding stores `convertedTaskId`. Task details and dashboard cards display the
+source relationship, while a converted finding links to its implementation
+task. A per-finding server lock plus a SQLite unique constraint prevents a
+second implementation task. Converted findings cannot be reopened in this
+phase. No extraction, acceptance, dismissal, or conversion operation performs
+a GitHub write.
 
 ## Verification
 
