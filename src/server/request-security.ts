@@ -36,6 +36,10 @@ export function rejectNonHumanNotificationMutation(request: Request, action: "no
   return rejectNonHumanMutation(request, action, "Notification");
 }
 
+export function rejectNonHumanOutboundMutation(request: Request, action: "outbound-preferences" | "outbound-test" | "outbound-retry"): Response | undefined {
+  return rejectNonHumanMutation(request, action, "External notification");
+}
+
 function rejectNonHumanMutation(request: Request, expectedAction: string, label: string): Response | undefined {
   const local = rejectNonLocalRequest(request);
   if (local) return local;

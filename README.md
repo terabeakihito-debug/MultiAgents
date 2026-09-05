@@ -16,13 +16,24 @@ This is intentionally a small MVP. The browser calls Next.js server routes; only
   - `~/.local/bin/claude -p "..."`
   - `gh auth status --hostname github.com`
 
-No API keys are required by this app; it uses the existing CLI authentication.
+No API keys are required for agent execution; it uses the existing CLI
+authentication. Optional Slack notifications use an Incoming Webhook supplied
+only through the server environment.
 
 ## Run locally
 
 ```bash
 cd ~/code/MultiAgents
 npm install
+npm run dev
+```
+
+To enable the optional Slack adapter, set the Incoming Webhook URL only in the
+process environment before starting the server (do not put it in a committed
+file):
+
+```bash
+export MULTIAGENTS_SLACK_WEBHOOK_URL='https://hooks.slack.com/services/...'
 npm run dev
 ```
 
@@ -192,7 +203,7 @@ Phase 8, Phase 10, and Phase 11 use SQLite from Node.js itself; they do not add 
 ORM. State is stored at `~/.multiagents/state.db`, outside every repository.
 The directory is forced to mode `0700` and the database file to `0600` when it
 is opened. Schema migrations are tracked in `schema_version`; the current
-schema is version 7. The v1→v2 through v6→v7 migrations run transactionally and
+schema is version 8. The v1→v2 through v7→v8 migrations run transactionally and
 preserve existing task and flow-step snapshots. Existing tasks receive a
 `safe_default` v1 profile snapshot during the v3 migration and a compatible
 `Bug Fix` v1 template snapshot during the v4 migration.
@@ -411,8 +422,7 @@ merge readiness, 72-hour inactivity, orphaned worktrees, and invalidated
 approval. Repository files, prompts, finding text, and agents cannot define a
 rule or create a notification. Rules run after existing task/finding/PR/CI
 events; the inactivity rule also runs when the dashboard is opened. There is no
-background daemon, scheduler, cron job, external webhook, Slack, email, Teams,
-Discord, SMS, cloud push, or other external notification integration.
+background daemon, scheduler, or cron job.
 
 `watch_rule_state` records the previous observation. Alerts are created on a
 state transition, while head-sensitive PR/CI rules may alert again for a new
@@ -430,6 +440,49 @@ repository content, diffs, credentials, or tokens. The in-app templates are
 also fixed and bounded. All notification APIs remain localhost-only, mutation
 routes require an explicit same-origin human action and are blocked while an
 agent process is active, and there is no arbitrary notification-creation API.
+
+## Outbound Notification Core and Slack adapter
+
+Phase 15A can forward a limited set of newly created internal notifications to
+Slack through an Incoming Webhook. The path is fixed server-side: built-in
+watch rule → internal notification → outbound policy → sanitizer → Slack
+adapter. Agents, prompts, repository files, finding evidence, and review text
+cannot call Slack or construct an outbound payload. There is no generic webhook
+or arbitrary destination URL.
+
+The sanitizer rebuilds Slack content from a notification-type allowlist. It
+uses fixed title/message/action text and may add only a strictly validated short
+repository name and positive PR number. Full prompts, agent output, diffs,
+finding evidence, review bodies, credentials, tokens, cookies, Authorization
+headers, environment variables, absolute filesystem/worktree paths, and local
+usernames are never copied to the outbound payload. Slack receives no localhost
+link; messages say to open MultiAgents locally for details.
+
+Critical findings, high findings, Needs Attention, PR changes requested, failed
+required CI, and Ready for Human Merge are enabled by default. Ready for
+Approval, inactive tasks, orphaned worktrees, and invalidated approvals default
+to suppressed. Preferences and a display-only channel label are stored in
+SQLite. The webhook secret is read only from
+`MULTIAGENTS_SLACK_WEBHOOK_URL`; it is never saved in SQLite, returned by an
+API, rendered in the UI, or written to application/audit logs. The adapter
+accepts only HTTPS `hooks.slack.com/services/...` URLs, preventing the setting
+from becoming an SSRF primitive. The UI never accepts a webhook URL.
+
+`notification_deliveries` stores only notification ID, channel, status,
+attempt/delivery timestamps, and a bounded error code. Its composite primary
+key prevents duplicate Slack delivery for one notification. A ten-second
+timeout bounds each request; 2xx is delivered, while non-2xx, network errors,
+and timeouts are failed without reading or persisting the response body.
+Outbound failure never rolls back or removes the internal notification.
+
+Failed delivery can be retried only by the explicit **Retry Slack** control in
+the same-origin localhost UI. There is no automatic retry loop and restart
+recovery never resends pending or failed rows. The v7→v8 migration creates no
+delivery rows for historical notifications, so enabling Slack cannot replay old
+alerts. **Send test notification** is also human-only and sends exactly a fixed,
+context-free test string. Settings updates, test sends, and retry actions are
+blocked while an agent process is running. Audit rows record only notification
+ID, `slack`, status, event type, and timestamp.
 
 ## Verification
 

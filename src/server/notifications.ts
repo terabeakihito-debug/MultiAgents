@@ -10,6 +10,7 @@ import {
   type NotificationType,
 } from "../notifications/types";
 import { getStateStore } from "./state-store";
+import { dispatchOutboundNotification } from "./outbound-notifications";
 import type { RepoTask } from "./tasks";
 
 const INACTIVE_AFTER_MS = 72 * 60 * 60 * 1_000;
@@ -107,7 +108,8 @@ function evaluateTransition(subjectType: "task" | "finding", subjectId: string, 
   const newlyActive = prior?.lastState !== "active";
   const shouldNotify = active && (!prior?.lastNotifiedKey || (keyMayRetriggerWhileActive && prior.lastNotifiedKey !== value.dedupeKey));
   if (shouldNotify && (newlyActive || keyMayRetriggerWhileActive || !prior?.lastNotifiedKey) && store.loadNotificationPreferences()[preferenceFor[rule]]) {
-    store.createBuiltInNotification({ ...value, ...relations });
+    const notification = store.createBuiltInNotification({ ...value, ...relations });
+    if (notification) void dispatchOutboundNotification(notification.notificationId).catch(() => undefined);
     notifiedKey = value.dedupeKey;
   }
   store.saveWatchRuleState(subjectType, subjectId, rule, active ? "active" : "inactive", active ? notifiedKey : undefined);

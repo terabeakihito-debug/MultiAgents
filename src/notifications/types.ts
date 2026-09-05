@@ -1,3 +1,5 @@
+import type { NotificationDelivery } from "../outbound/types";
+
 export const notificationTypes = [
   "finding_critical_created",
   "finding_high_created",
@@ -32,6 +34,7 @@ export type AppNotification = {
   createdAt: string;
   readAt?: string;
   dismissedAt?: string;
+  deliveries?: NotificationDelivery[];
 };
 
 export type NotificationPreferences = {

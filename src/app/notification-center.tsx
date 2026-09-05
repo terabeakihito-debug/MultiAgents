@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { defaultNotificationPreferences, notificationTypes, type AppNotification, type NotificationPreferences, type NotificationSeverity, type NotificationType } from "@/notifications/types";
+import { defaultOutboundChannelConfig, type OutboundChannelConfig } from "@/outbound/types";
 
 type Repo = { id: string; name: string };
 type Props = { repos: Repo[]; refreshToken: number; onOpenTask: (taskId: string) => void; onError: (message: string) => void };
@@ -23,6 +24,9 @@ export function NotificationCenter({ repos, refreshToken, onOpenTask, onError }:
   const [repo, setRepo] = useState("");
   const [type, setType] = useState<NotificationType | "">("");
   const [preferences, setPreferences] = useState<NotificationPreferences>(defaultNotificationPreferences);
+  const [outboundConfig, setOutboundConfig] = useState<OutboundChannelConfig>(defaultOutboundChannelConfig);
+  const [slackConfigured, setSlackConfigured] = useState(false);
+  const [sendingTest, setSendingTest] = useState(false);
   const [browserEnabled, setBrowserEnabled] = useState(false);
   const initialized = useRef(false);
   const seen = useRef(new Set<string>());
@@ -56,11 +60,18 @@ export function NotificationCenter({ repos, refreshToken, onOpenTask, onError }:
   }, [load, onError, refreshToken]);
   useEffect(() => {
     if (!open) return;
-    void fetch("/api/notification-preferences").then(async (response) => {
-      const data = await response.json() as { preferences?: NotificationPreferences; error?: string };
-      if (!response.ok || !data.preferences) throw new Error(data.error || "Could not load notification preferences");
-      setPreferences(data.preferences);
-    }).catch((error: unknown) => onError(error instanceof Error ? error.message : "Could not load notification preferences"));
+    void Promise.all([
+      fetch("/api/notification-preferences").then(async (response) => {
+        const data = await response.json() as { preferences?: NotificationPreferences; error?: string };
+        if (!response.ok || !data.preferences) throw new Error(data.error || "Could not load notification preferences");
+        setPreferences(data.preferences);
+      }),
+      fetch("/api/outbound/slack/settings").then(async (response) => {
+        const data = await response.json() as { configured?: boolean; config?: OutboundChannelConfig; error?: string };
+        if (!response.ok || !data.config || typeof data.configured !== "boolean") throw new Error(data.error || "Could not load Slack settings");
+        setOutboundConfig(data.config); setSlackConfigured(data.configured);
+      }),
+    ]).catch((error: unknown) => onError(error instanceof Error ? error.message : "Could not load notification settings"));
   }, [onError, open]);
 
   async function mutate(path: string, action: string) {
@@ -77,6 +88,25 @@ export function NotificationCenter({ repos, refreshToken, onOpenTask, onError }:
     });
     const data = await response.json() as { preferences?: NotificationPreferences; error?: string };
     if (!response.ok || !data.preferences) throw new Error(data.error || "Could not save notification preferences");
+  }
+
+  async function saveOutboundConfig(next: OutboundChannelConfig) {
+    setOutboundConfig(next);
+    const response = await fetch("/api/outbound/slack/settings", {
+      method: "POST", headers: { "Content-Type": "application/json", "X-MultiAgents-Human-Action": "outbound-preferences" }, body: JSON.stringify(next),
+    });
+    const data = await response.json() as { configured?: boolean; config?: OutboundChannelConfig; error?: string };
+    if (!response.ok || !data.config || typeof data.configured !== "boolean") throw new Error(data.error || "Could not save Slack settings");
+    setOutboundConfig(data.config); setSlackConfigured(data.configured);
+  }
+
+  async function sendSlackTest() {
+    setSendingTest(true);
+    try {
+      const response = await fetch("/api/outbound/slack/test", { method: "POST", headers: { "X-MultiAgents-Human-Action": "outbound-test" } });
+      const data = await response.json() as { error?: string };
+      if (!response.ok) throw new Error(data.error || "Slack test delivery failed");
+    } finally { setSendingTest(false); }
   }
 
   async function enableBrowserNotifications() {
@@ -98,14 +128,27 @@ export function NotificationCenter({ repos, refreshToken, onOpenTask, onError }:
         <label>Repository<select value={repo} onChange={(event) => setRepo(event.target.value)}><option value="">All</option>{repos.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
         <label>Type<select value={type} onChange={(event) => setType(event.target.value as NotificationType | "")}><option value="">All</option>{notificationTypes.map((value) => <option key={value}>{value}</option>)}</select></label>
       </div>
-      <div className="notificationList">{notifications.length ? notifications.map((item) => <article key={item.notificationId} className={`notificationItem ${item.status} severity-${item.severity}`}>
-        <div><span className={`severityBadge ${item.severity}`}>{item.severity}</span><time>{relativeTime(item.createdAt)}</time></div><h3>{item.title}</h3><p>{item.message}</p><small>{item.repoName || item.repoId || "Local operation"}{item.prNumber ? ` · PR #${item.prNumber}` : ""}</small>
-        <div className="notificationActions">{item.taskId ? <button type="button" className="compactButton" onClick={() => { setOpen(false); onOpenTask(item.taskId!); }}>Open related</button> : null}{item.status === "unread" ? <button type="button" className="secondary compactButton" onClick={() => void mutate(`/api/notifications/${item.notificationId}/read`, "notification-read").catch((error: unknown) => onError(message(error)))}>Mark as read</button> : null}<button type="button" className="secondary compactButton" onClick={() => void mutate(`/api/notifications/${item.notificationId}/dismiss`, "notification-dismiss").catch((error: unknown) => onError(message(error)))}>Dismiss</button></div>
-      </article>) : <p className="muted">No notifications match these filters.</p>}</div>
+      <div className="notificationList">{notifications.length ? notifications.map((item) => {
+        const slack = item.deliveries?.find((delivery) => delivery.channel === "slack");
+        return <article key={item.notificationId} className={`notificationItem ${item.status} severity-${item.severity}`}>
+          <div><span className={`severityBadge ${item.severity}`}>{item.severity}</span><time>{relativeTime(item.createdAt)}</time></div><h3>{item.title}</h3><p>{item.message}</p><small>{item.repoName || item.repoId || "Local operation"}{item.prNumber ? ` · PR #${item.prNumber}` : ""}</small>
+          {slack ? <p className={`deliveryStatus delivery-${slack.status}`}>Slack: {deliveryLabel(slack.status, slack.errorCode)}</p> : null}
+          <div className="notificationActions">{item.taskId ? <button type="button" className="compactButton" onClick={() => { setOpen(false); onOpenTask(item.taskId!); }}>Open related</button> : null}{item.status === "unread" ? <button type="button" className="secondary compactButton" onClick={() => void mutate(`/api/notifications/${item.notificationId}/read`, "notification-read").catch((error: unknown) => onError(message(error)))}>Mark as read</button> : null}<button type="button" className="secondary compactButton" onClick={() => void mutate(`/api/notifications/${item.notificationId}/dismiss`, "notification-dismiss").catch((error: unknown) => onError(message(error)))}>Dismiss</button>{slack?.status === "failed" ? <button type="button" className="secondary compactButton" onClick={() => void mutate(`/api/notifications/${item.notificationId}/deliveries/slack/retry`, "outbound-retry").catch((error: unknown) => onError(message(error)))}>Retry Slack</button> : null}</div>
+        </article>;
+      }) : <p className="muted">No notifications match these filters.</p>}</div>
       <details className="notificationSettings"><summary>Notification settings</summary>
         <div className="preferenceGrid">{(Object.keys(defaultNotificationPreferences) as Array<keyof NotificationPreferences>).map((key) => <label key={key}><input type="checkbox" checked={preferences[key]} onChange={(event) => void savePreferences({ ...preferences, [key]: event.target.checked }).catch((error: unknown) => onError(message(error)))} /> {preferenceLabel(key)}</label>)}</div>
         <button type="button" className="secondary" disabled={browserEnabled} onClick={() => void enableBrowserNotifications()}>{browserEnabled ? "Browser notifications enabled" : "Enable browser notifications"}</button>
         <p className="muted">Browser alerts contain only generic operational text. Permission is requested only by this button.</p>
+        <section className="externalNotificationSettings" aria-label="External Notifications">
+          <h3>External Notifications</h3>
+          <div className="externalStatus"><strong>Slack</strong><span>Status: {slackConfigured ? "configured" : "not configured"}</span></div>
+          <label><input type="checkbox" checked={outboundConfig.enabled} onChange={(event) => void saveOutboundConfig({ ...outboundConfig, enabled: event.target.checked }).catch((error: unknown) => onError(message(error)))} /> Enabled</label>
+          <label>Channel label<input value={outboundConfig.channelLabel} maxLength={80} onChange={(event) => setOutboundConfig({ ...outboundConfig, channelLabel: event.target.value })} onBlur={() => void saveOutboundConfig(outboundConfig).catch((error: unknown) => onError(message(error)))} /></label>
+          <div className="preferenceGrid">{outboundPreferenceFields.map(([key, label]) => <label key={key}><input type="checkbox" checked={outboundConfig[key]} onChange={(event) => void saveOutboundConfig({ ...outboundConfig, [key]: event.target.checked }).catch((error: unknown) => onError(message(error)))} /> {label}</label>)}</div>
+          <button type="button" className="secondary" disabled={!slackConfigured || sendingTest} onClick={() => void sendSlackTest().catch((error: unknown) => onError(message(error)))}>{sendingTest ? "Sending…" : "Send test notification"}</button>
+          <p className="muted">The webhook URL comes only from the server environment and is never displayed or stored. Slack receives sanitized, important notifications only; failed deliveries require a human retry.</p>
+        </section>
       </details>
     </section> : null}
   </div>;
@@ -113,4 +156,11 @@ export function NotificationCenter({ repos, refreshToken, onOpenTask, onError }:
 
 function relativeTime(value: string) { const elapsed = Date.now() - Date.parse(value); if (elapsed < 60_000) return "just now"; if (elapsed < 3_600_000) return `${Math.floor(elapsed / 60_000)}m ago`; if (elapsed < 86_400_000) return `${Math.floor(elapsed / 3_600_000)}h ago`; return `${Math.floor(elapsed / 86_400_000)}d ago`; }
 function preferenceLabel(value: keyof NotificationPreferences) { return value.replace(/([A-Z])/g, " $1").replace(/^./, (character) => character.toUpperCase()); }
+const outboundPreferenceFields: Array<[Exclude<keyof OutboundChannelConfig, "channel" | "enabled" | "channelLabel">, string]> = [
+  ["sendCriticalFindings", "Critical Findings"], ["sendHighFindings", "High Findings"], ["sendNeedsAttention", "Needs Attention"],
+  ["sendChangesRequested", "Changes Requested"], ["sendCiFailed", "CI Failed"], ["sendReadyForHumanMerge", "Ready for Merge"],
+  ["sendReadyForApproval", "Ready for Approval"], ["sendInactiveTask", "Inactive Task"], ["sendWorktreeOrphaned", "Worktree Orphaned"],
+  ["sendApprovalInvalidated", "Approval Invalidated"],
+];
+function deliveryLabel(status: string, errorCode?: string) { if (status === "suppressed" && errorCode === "not_configured") return "Not configured"; return status.charAt(0).toUpperCase() + status.slice(1); }
 function message(error: unknown) { return error instanceof Error ? error.message : "Notification action failed"; }

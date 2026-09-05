@@ -9,6 +9,12 @@ import { parseProfileSnapshot, safeDefaultSnapshot, type ProjectProfile, type Pr
 import { builtInTemplates, mergeTemplateWithProfile, parseTemplateSnapshot, snapshotTemplate, type RepoTemplateSettings, type TaskTemplate, type TaskTemplateSnapshot } from "../templates/policy";
 import type { RepoTask } from "./tasks";
 import {
+  defaultOutboundChannelConfig,
+  type DeliveryStatus,
+  type NotificationDelivery,
+  type OutboundChannelConfig,
+} from "../outbound/types";
+import {
   defaultNotificationPreferences,
   notificationSeverities,
   notificationTypes,
@@ -33,7 +39,7 @@ import {
 
 export const STATE_DIRECTORY = join(homedir(), ".multiagents");
 export const STATE_DATABASE = join(STATE_DIRECTORY, "state.db");
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 const MAX_STORED_PROMPT_CHARS = 20_000;
 const MAX_STORED_OUTPUT_CHARS = 1_000_000;
 
@@ -457,7 +463,7 @@ export class StateStore {
   clearForTests() {
     this.transaction(() => {
       this.dropAppendOnlyTriggers();
-      this.database.exec("DELETE FROM notification_audit_events; DELETE FROM notifications; DELETE FROM watch_rule_state; DELETE FROM notification_preferences; DELETE FROM finding_events; DELETE FROM findings; DELETE FROM approval_events; DELETE FROM diff_versions; DELETE FROM step_versions; DELETE FROM task_events; DELETE FROM flow_steps; DELETE FROM tasks; DELETE FROM template_audit_events; DELETE FROM task_template_versions; DELETE FROM repo_template_settings; DELETE FROM task_templates; DELETE FROM profile_audit_events; DELETE FROM project_profile_versions; DELETE FROM project_profiles;");
+      this.database.exec("DELETE FROM outbound_audit_events; DELETE FROM notification_deliveries; DELETE FROM outbound_channel_settings; DELETE FROM notification_audit_events; DELETE FROM notifications; DELETE FROM watch_rule_state; DELETE FROM notification_preferences; DELETE FROM finding_events; DELETE FROM findings; DELETE FROM approval_events; DELETE FROM diff_versions; DELETE FROM step_versions; DELETE FROM task_events; DELETE FROM flow_steps; DELETE FROM tasks; DELETE FROM template_audit_events; DELETE FROM task_template_versions; DELETE FROM repo_template_settings; DELETE FROM task_templates; DELETE FROM profile_audit_events; DELETE FROM project_profile_versions; DELETE FROM project_profiles;");
       this.createAppendOnlyTriggers();
     });
   }
@@ -467,7 +473,7 @@ export class StateStore {
     return row ? { repoId: String(row.repo_id), repoName: String(row.repo_name) } : undefined;
   }
 
-  createBuiltInNotification(input: Omit<AppNotification, "notificationId" | "status" | "createdAt" | "readAt" | "dismissedAt">): boolean {
+  createBuiltInNotification(input: Omit<AppNotification, "notificationId" | "status" | "createdAt" | "readAt" | "dismissedAt" | "deliveries">): AppNotification | undefined {
     if (!notificationTypes.includes(input.type) || !notificationSeverities.includes(input.severity)) throw new Error("Notification type or severity is invalid");
     if (!/^[A-Za-z0-9:._-]{1,500}$/.test(input.dedupeKey)) throw new Error("Notification dedupe key is invalid");
     if (!input.title || input.title.length > 120 || !input.message || input.message.length > 240) throw new Error("Notification content is invalid");
@@ -480,8 +486,9 @@ export class StateStore {
       (notification_id, type, severity, repo_id, repo_name, task_id, finding_id, pr_number, title, message, status, dedupe_key, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unread', ?, ?)`)
       .run(notificationId, input.type, input.severity, input.repoId ?? null, input.repoName?.slice(0, 160) ?? null, input.taskId ?? null, input.findingId ?? null, input.prNumber ?? null, input.title, input.message, input.dedupeKey, createdAt);
-    if (Number(result.changes) === 1) this.appendNotificationAudit("notification_created", notificationId, input.type);
-    return Number(result.changes) === 1;
+    if (Number(result.changes) !== 1) return undefined;
+    this.appendNotificationAudit("notification_created", notificationId, input.type);
+    return this.loadNotification(notificationId);
   }
 
   queryNotifications(input: NotificationQuery): { notifications: AppNotification[]; unreadCount: number } {
@@ -493,7 +500,7 @@ export class StateStore {
     if (input.type) { filters.push("type = ?"); values.push(input.type); }
     const rows = this.database.prepare(`SELECT * FROM notifications WHERE ${filters.join(" AND ")} ORDER BY created_at DESC, notification_id DESC LIMIT ?`).all(...values, input.limit) as TaskRow[];
     const unread = this.database.prepare("SELECT COUNT(*) AS count FROM notifications WHERE status = 'unread'").get() as { count: number };
-    return { notifications: rows.map(rowToNotification), unreadCount: Number(unread.count) };
+    return { notifications: rows.map((row) => ({ ...rowToNotification(row), deliveries: this.loadNotificationDeliveries(String(row.notification_id)) })), unreadCount: Number(unread.count) };
   }
 
   markNotificationRead(notificationId: string): AppNotification | undefined {
@@ -539,6 +546,77 @@ export class StateStore {
     return preferences;
   }
 
+  loadOutboundChannelConfig(): OutboundChannelConfig {
+    const row = this.database.prepare("SELECT settings_json FROM outbound_channel_settings WHERE channel = 'slack'").get() as { settings_json: string } | undefined;
+    if (!row) return { ...defaultOutboundChannelConfig };
+    const value = parseObject(row.settings_json);
+    return {
+      ...defaultOutboundChannelConfig,
+      ...Object.fromEntries(Object.keys(defaultOutboundChannelConfig).map((key) => [key, value[key] ?? defaultOutboundChannelConfig[key as keyof OutboundChannelConfig]])),
+      channel: "slack",
+    } as OutboundChannelConfig;
+  }
+
+  saveOutboundChannelConfig(config: OutboundChannelConfig) {
+    this.database.prepare(`INSERT INTO outbound_channel_settings(channel, settings_json, updated_at) VALUES ('slack', ?, ?)
+      ON CONFLICT(channel) DO UPDATE SET settings_json = excluded.settings_json, updated_at = excluded.updated_at`)
+      .run(JSON.stringify(config), new Date().toISOString());
+    this.appendOutboundAudit("outbound_preferences_updated", undefined, "suppressed");
+    return config;
+  }
+
+  reserveNotificationDelivery(notificationId: string, status: Extract<DeliveryStatus, "pending" | "suppressed">, errorCode?: string) {
+    requireUuid(notificationId, "Notification ID");
+    const result = this.database.prepare(`INSERT OR IGNORE INTO notification_deliveries
+      (notification_id, channel, status, attempted_at, delivered_at, error_code) VALUES (?, 'slack', ?, NULL, NULL, ?)`)
+      .run(notificationId, status, boundedErrorCode(errorCode) ?? null);
+    return Number(result.changes) === 1;
+  }
+
+  markNotificationDeliveryAttempted(notificationId: string) {
+    requireUuid(notificationId, "Notification ID");
+    const result = this.database.prepare("UPDATE notification_deliveries SET attempted_at = ? WHERE notification_id = ? AND channel = 'slack' AND status = 'pending'")
+      .run(new Date().toISOString(), notificationId);
+    if (Number(result.changes) !== 1) throw new Error("Slack delivery is not pending");
+  }
+
+  completeNotificationDelivery(notificationId: string, status: Extract<DeliveryStatus, "delivered" | "failed">, errorCode?: string) {
+    requireUuid(notificationId, "Notification ID");
+    const now = new Date().toISOString();
+    const result = this.database.prepare(`UPDATE notification_deliveries SET status = ?, delivered_at = ?, error_code = ?
+      WHERE notification_id = ? AND channel = 'slack' AND status = 'pending'`)
+      .run(status, status === "delivered" ? now : null, status === "failed" ? boundedErrorCode(errorCode) ?? "unknown" : null, notificationId);
+    if (Number(result.changes) !== 1) throw new Error("Slack delivery completion state is invalid");
+  }
+
+  beginNotificationDeliveryRetry(notificationId: string) {
+    requireUuid(notificationId, "Notification ID");
+    const result = this.database.prepare(`UPDATE notification_deliveries SET status = 'pending', attempted_at = NULL, delivered_at = NULL, error_code = NULL
+      WHERE notification_id = ? AND channel = 'slack' AND status = 'failed'`).run(notificationId);
+    return Number(result.changes) === 1;
+  }
+
+  loadNotificationDelivery(notificationId: string): NotificationDelivery | undefined {
+    requireUuid(notificationId, "Notification ID");
+    const row = this.database.prepare("SELECT * FROM notification_deliveries WHERE notification_id = ? AND channel = 'slack'").get(notificationId) as TaskRow | undefined;
+    return row ? rowToNotificationDelivery(row) : undefined;
+  }
+
+  loadNotificationDeliveries(notificationId: string): NotificationDelivery[] {
+    requireUuid(notificationId, "Notification ID");
+    return (this.database.prepare("SELECT * FROM notification_deliveries WHERE notification_id = ? ORDER BY channel").all(notificationId) as TaskRow[]).map(rowToNotificationDelivery);
+  }
+
+  appendOutboundAudit(eventType: "outbound_delivery_attempted" | "outbound_delivery_succeeded" | "outbound_delivery_failed" | "outbound_delivery_retried" | "outbound_preferences_updated", notificationId: string | undefined, status: DeliveryStatus) {
+    if (notificationId) requireUuid(notificationId, "Notification ID");
+    this.database.prepare("INSERT INTO outbound_audit_events(event_id, event_type, notification_id, channel, status, created_at) VALUES (?, ?, ?, 'slack', ?, ?)")
+      .run(randomUUID(), eventType, notificationId ?? null, status, new Date().toISOString());
+  }
+
+  loadOutboundAuditEvents() {
+    return this.database.prepare("SELECT event_type, notification_id, channel, status, created_at FROM outbound_audit_events ORDER BY sequence").all();
+  }
+
   loadWatchRuleState(subjectType: "task" | "finding", subjectId: string, ruleType: NotificationType) {
     const row = this.database.prepare("SELECT last_state, last_notified_key, updated_at FROM watch_rule_state WHERE subject_type = ? AND subject_id = ? AND rule_type = ?").get(subjectType, subjectId, ruleType) as TaskRow | undefined;
     return row ? { lastState: String(row.last_state), lastNotifiedKey: optionalString(row.last_notified_key), updatedAt: String(row.updated_at) } : undefined;
@@ -554,7 +632,7 @@ export class StateStore {
     return this.database.prepare("SELECT event_type, notification_id, notification_type, created_at FROM notification_audit_events ORDER BY sequence").all();
   }
 
-  private loadNotification(notificationId: string): AppNotification | undefined {
+  loadNotification(notificationId: string): AppNotification | undefined {
     const row = this.database.prepare("SELECT * FROM notifications WHERE notification_id = ?").get(notificationId) as TaskRow | undefined;
     return row ? rowToNotification(row) : undefined;
   }
@@ -1178,11 +1256,43 @@ export class StateStore {
       this.database.prepare("INSERT INTO notification_preferences(singleton, preferences_json, updated_at) VALUES (1, ?, ?)").run(JSON.stringify(defaultNotificationPreferences), new Date().toISOString());
       this.database.prepare("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)").run(7, new Date().toISOString());
     });
+    if (version < 7) version = 7;
+    if (version < 8) this.transaction(() => {
+      this.database.exec(`
+        CREATE TABLE outbound_channel_settings (
+          channel TEXT PRIMARY KEY CHECK(channel = 'slack'),
+          settings_json TEXT NOT NULL CHECK(json_valid(settings_json)),
+          updated_at TEXT NOT NULL
+        );
+        CREATE TABLE notification_deliveries (
+          notification_id TEXT NOT NULL REFERENCES notifications(notification_id),
+          channel TEXT NOT NULL CHECK(channel = 'slack'),
+          status TEXT NOT NULL CHECK(status IN ('pending','delivered','failed','suppressed')),
+          attempted_at TEXT,
+          delivered_at TEXT,
+          error_code TEXT CHECK(error_code IS NULL OR length(error_code) BETWEEN 1 AND 80),
+          PRIMARY KEY(notification_id, channel)
+        );
+        CREATE INDEX notification_deliveries_status_idx ON notification_deliveries(status);
+        CREATE TABLE outbound_audit_events (
+          sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+          event_id TEXT NOT NULL UNIQUE,
+          event_type TEXT NOT NULL CHECK(event_type IN ('outbound_delivery_attempted','outbound_delivery_succeeded','outbound_delivery_failed','outbound_delivery_retried','outbound_preferences_updated')),
+          notification_id TEXT,
+          channel TEXT NOT NULL CHECK(channel = 'slack'),
+          status TEXT NOT NULL CHECK(status IN ('pending','delivered','failed','suppressed')),
+          created_at TEXT NOT NULL
+        );
+      `);
+      this.database.prepare("INSERT INTO outbound_channel_settings(channel, settings_json, updated_at) VALUES ('slack', ?, ?)")
+        .run(JSON.stringify(defaultOutboundChannelConfig), new Date().toISOString());
+      this.database.prepare("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)").run(8, new Date().toISOString());
+    });
     this.createAppendOnlyTriggers();
   }
 
   private createAppendOnlyTriggers() {
-    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events", "task_template_versions", "template_audit_events", "finding_events", "notification_audit_events"]) {
+    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events", "task_template_versions", "template_audit_events", "finding_events", "notification_audit_events", "outbound_audit_events"]) {
       this.database.exec(`
         CREATE TRIGGER IF NOT EXISTS ${table}_no_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT, '${table} is append-only'); END;
         CREATE TRIGGER IF NOT EXISTS ${table}_no_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT, '${table} is append-only'); END;
@@ -1191,7 +1301,7 @@ export class StateStore {
   }
 
   private dropAppendOnlyTriggers() {
-    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events", "task_template_versions", "template_audit_events", "finding_events", "notification_audit_events"]) {
+    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events", "task_template_versions", "template_audit_events", "finding_events", "notification_audit_events", "outbound_audit_events"]) {
       this.database.exec(`DROP TRIGGER IF EXISTS ${table}_no_update; DROP TRIGGER IF EXISTS ${table}_no_delete;`);
     }
   }
@@ -1322,8 +1432,18 @@ function rowToNotification(row: TaskRow): AppNotification {
     createdAt: String(row.created_at), readAt: optionalString(row.read_at), dismissedAt: optionalString(row.dismissed_at),
   };
 }
+function rowToNotificationDelivery(row: TaskRow): NotificationDelivery {
+  return {
+    notificationId: String(row.notification_id), channel: "slack", status: String(row.status) as DeliveryStatus,
+    attemptedAt: optionalString(row.attempted_at), deliveredAt: optionalString(row.delivered_at), errorCode: optionalString(row.error_code),
+  };
+}
 function requireUuid(value: string, label: string) {
   if (!/^[0-9a-f-]{36}$/i.test(value)) throw new Error(`${label} is invalid`);
+}
+function boundedErrorCode(value: string | undefined) {
+  if (value === undefined) return undefined;
+  return /^[a-z0-9_-]{1,80}$/.test(value) ? value : "unknown";
 }
 function parseJson(value: unknown): unknown { try { return JSON.parse(String(value)); } catch { return undefined; } }
 function rowToFlowStep(row: FlowStepRow): FlowStep {
