@@ -4,6 +4,8 @@ import { flowStepIds, rerunnableStepIds, type AgentAdapter, type AgentId, type F
 import { MAX_FLOW_MS, claudePrompt, cursorPrompt, finalPrompt } from "./review";
 import { createEventStream } from "./event-stream";
 import type { RolePolicy } from "../profiles/policy";
+import type { RuntimePolicy } from "../runtime/types";
+import { buildGenericRuntimePolicy } from "../server/runtime-policy";
 
 export const MAX_STEP_OUTPUT_CHARS = 1_000_000;
 type AgentSet = Record<AgentId, AgentAdapter>;
@@ -19,6 +21,8 @@ type RerunOptions = {
   cwd?: string;
   roles?: RolePolicy;
   fingerprint?: () => Promise<string>;
+  runtimePolicies?: Record<AgentId, RuntimePolicy>;
+  executeAgent?: (agent: AgentId, prompt: string, signal: AbortSignal, stepId: RerunnableStepId) => Promise<import("../agents/types").AgentResult>;
 };
 
 export type ReviewRerunRequest = { prompt: string; flowId: string; stepId: RerunnableStepId; steps: FlowStep[] };
@@ -79,22 +83,19 @@ export async function rerunReviewStep(request: ReviewRerunRequest, options: Reru
     target.inputSummary = `${input.length.toLocaleString("en-US")} characters`;
     options.log?.({ flowId: request.flowId, rerunId, stepId: request.stepId, agent: target.agent, status: "running" });
     emit(options.onEvent, { type: "rerun_step_started", flowId: request.flowId, rerunId, step: { ...target } });
-    const configuredRole = options.roles?.[target.agent] ?? (target.agent === "codex" && target.role !== "review" ? "implement" : "review_only");
+    const policy = options.runtimePolicies?.[target.agent] ?? buildGenericRuntimePolicy(target.agent);
+    const configuredRole = policy.role;
     if (configuredRole === "disabled") {
       target.status = "skipped";
       target.output = previousOutput;
       target.error = `${target.agent} is disabled by the task profile`;
     }
     try {
-      const writeAccess = Boolean(options.cwd) && configuredRole === "implement";
-      const before = !writeAccess && options.fingerprint ? await options.fingerprint() : undefined;
-      const result = configuredRole === "disabled" ? undefined : await adapters[target.agent].run(input, { signal: controller.signal, cwd: options.cwd, writeAccess });
+      const result = configuredRole === "disabled" ? undefined : options.executeAgent
+        ? await options.executeAgent(target.agent, input, controller.signal, request.stepId)
+        : await adapters[target.agent].run(input, { signal: controller.signal, policy });
       if (!result) {
         // Disabled roles are never executed.
-      } else if (!writeAccess && before !== undefined && await options.fingerprint!() !== before) {
-        target.status = "error";
-        target.output = previousOutput;
-        target.error = `${target.agent} modified the review-only worktree; the rerun stopped.`;
       } else if (result.status === "completed") {
         target.status = "completed";
         target.output = result.output;
@@ -103,6 +104,7 @@ export async function rerunReviewStep(request: ReviewRerunRequest, options: Reru
         target.status = "error";
         target.output = previousOutput;
         target.error = `Re-run failed: ${result.error ?? "Agent execution failed"}`;
+        target.runtimeViolation = result.runtimeViolation;
       }
     } catch (error) {
       target.status = "error";
@@ -125,7 +127,7 @@ export async function rerunReviewStep(request: ReviewRerunRequest, options: Reru
   }
 }
 
-export function createReviewRerunStream(request: ReviewRerunRequest, requestSignal: AbortSignal, runner = rerunReviewStep, options: { cwd?: string; roles?: RolePolicy; fingerprint?: () => Promise<string>; onComplete?: (result: ReviewRerunResult) => void; onEvent?: (event: ReviewRerunEvent) => void } = {}) {
+export function createReviewRerunStream(request: ReviewRerunRequest, requestSignal: AbortSignal, runner = rerunReviewStep, options: { cwd?: string; roles?: RolePolicy; fingerprint?: () => Promise<string>; runtimePolicies?: Record<AgentId, RuntimePolicy>; executeAgent?: RerunOptions["executeAgent"]; onComplete?: (result: ReviewRerunResult) => void; onEvent?: (event: ReviewRerunEvent) => void } = {}) {
   const { onComplete, onEvent, ...runnerOptions } = options;
   return createEventStream(requestSignal, async ({ signal, send }) => {
     const result = await runner(request, {

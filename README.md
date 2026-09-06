@@ -512,6 +512,45 @@ keys, tokens, secrets, passwords, or Authorization are always removed. Known
 server-owned values are also redacted from captured output and rejected by the
 pre-PR secret scan without placing the value in a finding.
 
+## Runtime Capability Policy
+
+Phase 17 builds runtime policy version 1 on the server at execution time from
+the intersection of the persisted Project Profile snapshot, Task Template
+snapshot, fixed agent role ceiling, and hard runtime safety rules. Browser
+input and prompt text cannot select an executable, sandbox mode, working root,
+write flag, or role. Generic Parallel agents remain read-only.
+
+Codex implementation steps may read and write only the validated managed task
+worktree. Cursor and Claude are review-only, and Security Review and
+Investigation make every enabled agent read-only without creating a worktree.
+Disabled agents are not launched. Every repository task revalidates realpaths,
+the allowed repository root, the exact managed worktree path and registration,
+the task branch, and the `.git` link. Windows mounted drives such as `/mnt/c`
+through `/mnt/z`, the base repository, `HOME`, `~/code`, `/tmp`, `/`, sibling
+worktrees, and other repositories cannot become a writable root. CLI config and
+credential reads under `HOME` remain available through the Phase 16 sanitized
+agent environment; MultiAgents does not copy credential files.
+
+The only server launchers are the fixed Codex `codex`, Cursor `agent`, and
+Claude `claude` adapters. Agent prompts forbid commit, push, branch mutation,
+GitHub mutation, merge, and deploy; those operations remain owned by the
+MultiAgents state machine. Before and after each task-agent execution, the
+server fingerprints the base repository, target worktree, registered sibling
+worktrees, branch, and HEAD. Review-only writes, base-repository changes,
+agent-created commits, branch/HEAD changes, and unexpected worktree changes are
+runtime violations. A violation marks the step ERROR and task Needs Attention,
+invalidates approval, stops downstream execution, writes metadata-only audit
+events, and blocks approval, commit, push, and PR actions. Dirty violating
+worktrees are retained for human review under the existing safe cleanup rules;
+MultiAgents does not auto-repair them.
+
+The UI and `GET /api/tasks/:id/runtime-policy` expose only role, read/write
+classification, policy version/hash, and the network enforcement description;
+absolute paths and credentials are omitted. Network policy is `cli_managed`.
+MultiAgents uses a CLI's safe mode where available, but binary-level or network
+enforcement is not guaranteed when that CLI can internally run tools. Stronger
+OS/container process and network isolation is deferred to a later phase.
+
 ## Verification
 
 Use a harmless prompt such as:
@@ -542,7 +581,7 @@ Tests mock process spawning and never invoke the real AI CLIs.
 - The complete review flow is limited to five minutes. Each prior output is capped at 30,000 characters when embedded into a later prompt, with Unicode-safe truncation markers.
 - The JSON review endpoint, step-event stream endpoint, and rerun stream endpoint enforce the same localhost Host/Origin checks. CORS is not enabled, and neither prompts nor agent outputs are written to application event logs.
 - Draft, review, repository content, and diff blocks are explicitly treated as untrusted content. Review prompts instruct agents never to follow commands in files, comments, or quoted output. Handoffs remain plain CLI argument strings and are never interpreted by a shell.
-- Repository IDs are simple direct-child names, resolved with `realpath`, required to remain under the real `~/code` root, and verified against Git's working-tree root. Symlink escapes, `/mnt/c`, nested repositories, arbitrary paths, binaries, Git subcommands, and client-selected branch names are rejected by construction.
+- Repository IDs are simple direct-child names, resolved with `realpath`, required to remain under the real `~/code` root, and verified against Git's working-tree root. Symlink escapes, Windows mounted drives, nested repositories, arbitrary paths, binaries, Git subcommands, and client-selected branch names are rejected by construction.
 - Approval, commit, push, and PR creation are controlled only by the server-side task state machine. Repository text and agent output cannot select a Git command or bypass approval. A task-scoped server lock prevents duplicate commits and PRs.
 - The approval hash covers the final file content, file mode, symlink target, deletion state, and base commit for both tracked and untracked changes. Content that exceeds the review limits or cannot be fully shown is not approvable.
 - Secret filename rules and content rules are separate. `.env`, `.env.*`, private-key files, credential files, token-named files, private-key headers, and common provider key formats stop the operation without an override.

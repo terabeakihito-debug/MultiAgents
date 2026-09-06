@@ -9,12 +9,13 @@ export type ValidatedRepository = Repository & { path: string };
 
 function isWithin(root: string, candidate: string) {
   const rel = relative(root, candidate);
-  return rel !== "" && !rel.startsWith(`..${sep}`) && rel !== ".." && !resolve(candidate).startsWith("/mnt/c/");
+  return rel !== "" && !rel.startsWith(`..${sep}`) && rel !== ".." && !/^\/mnt\/[a-z](?:\/|$)/i.test(resolve(candidate));
 }
 
 export async function validateRepository(id: string, root = ALLOWED_ROOT): Promise<ValidatedRepository> {
   if (!/^[A-Za-z0-9._-]+$/.test(id) || id === "." || id === "..") throw new Error("Invalid repository id");
   const realRoot = await realpath(root);
+  if (/^\/mnt\/[a-z](?:\/|$)/i.test(realRoot)) throw new Error("Windows mounted drives cannot be repository roots");
   const candidate = await realpath(join(realRoot, id));
   if (!isWithin(realRoot, candidate)) throw new Error("Repository is outside the allowed root");
   if (!(await stat(candidate)).isDirectory()) throw new Error("Repository is not a directory");

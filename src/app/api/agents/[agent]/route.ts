@@ -1,6 +1,7 @@
 import { agents } from "@/agents";
 import { agentIds, type AgentId } from "@/agents/types";
 import { rejectNonLocalRequest } from "@/server/request-security";
+import { buildGenericRuntimePolicy } from "@/server/runtime-policy";
 
 export const runtime = "nodejs";
 
@@ -34,6 +35,7 @@ export async function POST(
   }
 
   const safePrompt = `User request:\n${prompt}\n\nRespond with analysis or an answer only. Do not modify files, run git add, commit, push, create or approve a pull request, merge, deploy, change branches, or call MultiAgents approval or profile APIs.`;
-  const result = await agents[agent as AgentId].run(safePrompt, { signal: request.signal });
+  const id = agent as AgentId;
+  const result = await agents[id].run(safePrompt, { signal: request.signal, policy: buildGenericRuntimePolicy(id) });
   return Response.json(result);
 }

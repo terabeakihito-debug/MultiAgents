@@ -8,6 +8,7 @@ export type AgentResult = {
   status: "completed" | "error";
   output: string;
   error?: string;
+  runtimeViolation?: import("../runtime/types").RuntimeViolation;
 };
 
 export type AgentDefinition = {
@@ -17,7 +18,7 @@ export type AgentDefinition = {
   args: (prompt: string, cwd: string, repositoryTask: boolean, writeAccess: boolean) => string[];
 };
 
-export type AgentRunOptions = { signal?: AbortSignal; cwd?: string; writeAccess?: boolean };
+export type AgentRunOptions = { signal?: AbortSignal; policy?: import("../runtime/types").RuntimePolicy };
 
 export type AgentAdapter = {
   id: AgentId;
@@ -41,6 +42,7 @@ export type FlowStep = {
   startedAt?: string;
   completedAt?: string;
   durationMs?: number;
+  runtimeViolation?: import("../runtime/types").RuntimeViolation;
 };
 
 export type ReviewFlowResult = {

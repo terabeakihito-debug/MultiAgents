@@ -2,6 +2,8 @@ import { createReviewFlowStream } from "@/flows/review-stream";
 import { rejectNonLocalRequest } from "@/server/request-security";
 import { beginTaskReview, completeTaskReview, executionPromptForTask, executionRootForTask, getTask, getTaskDiff, initializeTaskRecovery, recordFlowEvent, requireTaskTemplate } from "@/server/tasks";
 import { createDiffSnapshot } from "@/server/pull-request";
+import { agents } from "@/agents";
+import { prepareTaskRuntime, taskRuntimeExecutor } from "@/server/task-runtime";
 
 export const runtime = "nodejs";
 const MAX_PROMPT_LENGTH = 20_000;
@@ -21,7 +23,8 @@ export async function POST(request: Request) {
 
   const task = typeof taskId === "string" ? getTask(taskId) : undefined;
   if (taskId !== undefined && !task) return Response.json({ error: "Valid repository taskId is required" }, { status: 400 });
-  try { if (task) beginTaskReview(task, prompt); }
+  let taskRuntime: Awaited<ReturnType<typeof prepareTaskRuntime>> | undefined;
+  try { if (task) { taskRuntime = await prepareTaskRuntime(task); beginTaskReview(task, prompt); } }
   catch (error) { return Response.json({ error: error instanceof Error ? error.message : "Task cannot start review" }, { status: 409 }); }
   const executionPrompt = task ? executionPromptForTask(task, prompt) : prompt;
   const template = task ? requireTaskTemplate(task) : undefined;
@@ -29,6 +32,8 @@ export async function POST(request: Request) {
     cwd: executionRootForTask(task),
     roles: template!.roles,
     repositoryReadOnly: template!.readOnly,
+    runtimePolicies: taskRuntime!.policies,
+    executeAgent: taskRuntimeExecutor(taskRuntime!, agents),
     fingerprint: async () => (await createDiffSnapshot(task)).hash,
     getDiff: async () => { const diff = await getTaskDiff(task); return [diff.patch, diff.untrackedPatch].filter(Boolean).join("\n\n"); },
     onEvent: (event) => recordFlowEvent(task, event),

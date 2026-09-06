@@ -10,6 +10,7 @@ import { CredentialStatusPanel } from "./credential-status";
 import { agentRoles, validationSteps, type ProjectProfile, type ProjectProfileSnapshot, type RolePolicy, type ValidationPolicy, type ValidationStep } from "@/profiles/policy";
 import type { RepoTemplateSettings, TaskTemplate, TaskTemplateSnapshot } from "@/templates/policy";
 import { humanPriorities, type Finding, type FindingEvent, type HumanPriority, type RemediationQueueItem } from "@/findings/types";
+import type { PublicRuntimePolicy, RuntimeViolationRecord } from "@/runtime/types";
 
 const labels: Record<AgentId, string> = { codex: "Codex", cursor: "Cursor", claude: "Claude" };
 const roleLabels = { draft: "Draft", review: "Review", final: "Final" } as const;
@@ -34,7 +35,9 @@ type RepoTask = {
   template: TaskTemplateSnapshot;
   sourceFindingId?: string;
   sourceTaskId?: string;
+  runtimeViolation?: RuntimeViolationRecord;
 };
+type RuntimePolicyResponse = { runtimePolicyVersion: number; taskType: string; allAgentsReadOnly: boolean; worktreeRequired: boolean; networkEnforcementDescription: string; policies: PublicRuntimePolicy[] };
 type TaskDiff = {
   trackedFiles: string[]; untrackedFiles: string[]; stat: string; patch: string; untrackedPatch: string;
   truncated: boolean; approvable: boolean; blockedReason?: string;
@@ -80,6 +83,7 @@ export default function Home() {
   const [taskHistory, setTaskHistory] = useState<TaskHistory>(emptyHistory);
   const [historyTitle, setHistoryTitle] = useState("");
   const [findings, setFindings] = useState<FindingDetail[]>([]);
+  const [runtimePolicy, setRuntimePolicy] = useState<RuntimePolicyResponse | null>(null);
   const sendingRef = useRef(false);
   const flowAbortRef = useRef<AbortController | null>(null);
   const currentFlowIdRef = useRef("");
@@ -91,6 +95,17 @@ export default function Home() {
     setRepoId((current) => current || data.repos?.[0]?.id || "");
     setTemplateId((current) => current || data.repos?.[0]?.settings.defaultTemplateId || "");
   }).catch((error) => setTaskError(message(error))); }, []);
+
+  useEffect(() => {
+    if (!task?.id) { setRuntimePolicy(null); return; }
+    const controller = new AbortController();
+    void fetch(`/api/tasks/${task.id}/runtime-policy`, { signal: controller.signal }).then(async (response) => {
+      const data = await response.json() as RuntimePolicyResponse & { error?: string };
+      if (!response.ok) throw new Error(data.error || "Runtime policy could not be loaded");
+      setRuntimePolicy(data);
+    }).catch((error: unknown) => { if (!controller.signal.aborted) setTaskError(message(error)); });
+    return () => controller.abort();
+  }, [task?.id]);
 
   async function loadTaskHistory(taskId: string) {
     const response = await fetch(`/api/tasks/${taskId}/history`);
@@ -168,7 +183,7 @@ export default function Home() {
     if (!activeTask) return;
     const response = await fetch(`/api/tasks/${activeTask.id}`);
     const data = await response.json() as { diff?: TaskDiff; task?: RepoTask; approval?: Approval; error?: string };
-    if (!response.ok || !data.diff) throw new Error(data.error || "Could not load diff");
+    if (!data.diff) throw new Error(data.error || "Could not load diff");
     const previousHash = approval?.diffHash;
     const previousApprovalId = approval?.approvalId;
     setTaskDiff(data.diff);
@@ -176,6 +191,7 @@ export default function Home() {
     setApproval(data.approval ?? null);
     if (!data.approval?.diffHash || data.approval.diffHash !== previousHash || data.approval.approvalId !== previousApprovalId) setReviewedDiff(false);
     await loadTaskHistory(activeTask.id);
+    if (!response.ok && data.error) setTaskError(data.error);
   }
 
   async function deleteWorktree() {
@@ -388,6 +404,8 @@ export default function Home() {
       <div className="actions"><span>{prompt.length.toLocaleString()} / 20,000</span><div className="actionButtons">{sending && mode === "review" && <button className="cancel" type="button" onClick={cancelFlow}>Cancel</button>}<button type="submit" disabled={sending || !prompt.trim() || (mode === "review" && Boolean(task) && !task?.worktreeAvailable && !task?.template.readOnly)}>{sending ? "Running…" : mode === "parallel" ? "Send to all" : "Run review flow"}</button></div></div>
     </form>
     {mode === "parallel" ? <section className="cards" aria-label="Agent responses">{agentIds.map((id) => <AgentCard key={id} name={labels[id]} state={cards[id]} />)}</section> : <FlowTimeline steps={steps} versions={taskHistory.stepVersions} status={flowStatus} finalOutput={finalOutput} sending={sending} activeRerun={activeRerun} onRerun={rerunStep} />}
+    {task && runtimePolicy ? <RuntimePolicyPanel task={task} runtime={runtimePolicy} /> : null}
+    {task?.runtimeViolation ? <section className="runtimeViolation" role="alert"><strong>NEEDS ATTENTION</strong><h2>Runtime policy violation</h2><p>{task.runtimeViolation.message}</p><p>Human review is required. No commit, push, approval, or PR action is permitted.</p></section> : null}
     {task && ["security_review", "investigation"].includes(task.template.taskType) ? <FindingsPanel task={task} templates={selectedRepo?.templates ?? []} findings={findings} busy={sending || reviewProcessing} onFindings={setFindings} onOpenTask={(id) => void resumePersistedTask(id)} onHistoryRefresh={() => void loadTaskHistory(task.id)} onDashboardRefresh={() => setDashboardRefresh((value) => value + 1)} onError={setTaskError} /> : null}
     {taskDiff && <section className="diff card"><h2>Final Diff</h2><h3>Tracked changed files</h3><pre>{taskDiff.trackedFiles.join("\n") || "None."}</pre><h3>Untracked files</h3><pre>{taskDiff.untrackedFiles.join("\n") || "None."}</pre><h3>Changed lines</h3><pre>{taskDiff.stat || "No tracked changes."}</pre><details><summary>View full diff</summary><pre>{[taskDiff.patch, taskDiff.untrackedPatch].filter(Boolean).join("\n\n") || "No changes."}</pre></details>{taskDiff.blockedReason && <p className="staleReason">{taskDiff.blockedReason}</p>}
       {(task?.validation.length || approvalProcessing) && <div className="validation"><h3>Pre-PR Validation</h3>{task?.validation.map((check, index) => <div className="validationRow" key={`${check.name}-${index}`}><span>{check.name}</span><Status value={check.status} /><span>{check.detail}</span></div>)}{approvalProcessing && <p>Server-side checks and PR creation are running…</p>}</div>}
@@ -648,8 +666,16 @@ function TaskHistoryPanel({ history }: { history: TaskHistory }) {
 }
 
 const eventLabels: Record<string, string> = {
-  task_created: "Task created", flow_started: "Review flow started", step_started: "Step started", step_completed: "Step completed", step_failed: "Step failed", step_rerun: "Step re-run started", step_stale: "Step marked stale", flow_completed: "Review flow completed", flow_aborted: "Review flow aborted", approval_issued: "Approval issued", approval_invalidated: "Approval invalidated", approval_accepted: "Approval accepted", approval_failed: "Approval failed", validation_started: "Validation started", validation_passed: "Validation passed", validation_failed: "Validation failed", diff_generated: "Diff generated", commit_created: "Commit created", branch_pushed: "Branch pushed", pr_created: "Pull request created", pr_review_fetched: "PR review fetched", rework_started: "Rework started", rework_completed: "Rework completed", ready_for_human_merge: "Ready for human merge", task_resumed: "Task resumed", worktree_cleanup_requested: "Worktree cleanup requested", worktree_removed: "Worktree removed", pr_status_refreshed: "PR status refreshed", task_archived: "Task archived", template_snapshot_created: "Task template snapshot created", finding_created: "Finding created", finding_status_changed: "Finding status changed", finding_converted: "Finding converted", implementation_task_created: "Implementation task created",
+  task_created: "Task created", flow_started: "Review flow started", step_started: "Step started", step_completed: "Step completed", step_failed: "Step failed", step_rerun: "Step re-run started", step_stale: "Step marked stale", flow_completed: "Review flow completed", flow_aborted: "Review flow aborted", approval_issued: "Approval issued", approval_invalidated: "Approval invalidated", approval_accepted: "Approval accepted", approval_failed: "Approval failed", validation_started: "Validation started", validation_passed: "Validation passed", validation_failed: "Validation failed", diff_generated: "Diff generated", commit_created: "Commit created", branch_pushed: "Branch pushed", pr_created: "Pull request created", pr_review_fetched: "PR review fetched", rework_started: "Rework started", rework_completed: "Rework completed", ready_for_human_merge: "Ready for human merge", task_resumed: "Task resumed", worktree_cleanup_requested: "Worktree cleanup requested", worktree_removed: "Worktree removed", pr_status_refreshed: "PR status refreshed", task_archived: "Task archived", template_snapshot_created: "Task template snapshot created", finding_created: "Finding created", finding_status_changed: "Finding status changed", finding_converted: "Finding converted", implementation_task_created: "Implementation task created", runtime_policy_created: "Runtime policy created", runtime_execution_started: "Runtime execution started", runtime_execution_completed: "Runtime execution completed", runtime_violation_detected: "Runtime violation detected",
 };
+
+function RuntimePolicyPanel({ task, runtime }: { task: RepoTask; runtime: RuntimePolicyResponse }) {
+  return <section className="card runtimePolicy" aria-labelledby="runtime-policy-title"><div className="cardHeader"><div><span className="eyebrow">Server-side capability boundary · v{runtime.runtimePolicyVersion}</span><h2 id="runtime-policy-title">Runtime Policy</h2></div>{runtime.allAgentsReadOnly ? <span className="status completed">ALL READ-ONLY</span> : null}</div>
+    {runtime.allAgentsReadOnly ? <p><strong>{task.template.name}</strong> · All agents read-only · Worktree: not required</p> : null}
+    <div className="runtimePolicyGrid">{runtime.policies.map((policy) => <div key={policy.agent}><strong>{labels[policy.agent]}</strong><span>{policy.role === "review_only" ? "Review only" : policy.role === "implement" ? "Implement" : "Disabled"}</span><span>Write: {policy.writeScope === "task_worktree_only" ? "task worktree only" : "denied"}</span></div>)}</div>
+    <small>{runtime.networkEnforcementDescription} Agent credentials/config remain CLI-managed; server-owned credentials use the sanitized Phase 16 environment.</small>
+  </section>;
+}
 function eventLabel(event: TaskEvent) { return eventLabels[event.type] ?? event.type.replaceAll("_", " "); }
 function metadataLabel(metadata: Record<string, string | number>) { return Object.entries(metadata).map(([key, value]) => `${key}: ${typeof value === "string" && value.length > 16 ? value.slice(0, 12) : value}`).join(" · "); }
 function Status({ value }: { value: string }) { return <span className={`status ${value}`}>{value.toUpperCase()}</span>; }

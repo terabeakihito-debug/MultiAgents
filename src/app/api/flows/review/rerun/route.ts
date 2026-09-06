@@ -2,6 +2,8 @@ import { createReviewRerunStream, parseReviewRerunRequest } from "@/flows/review
 import { rejectNonLocalRequest } from "@/server/request-security";
 import { beginTaskRerun, completeTaskReview, executionPromptForTask, executionRootForTask, getTask, initializeTaskRecovery, recordFlowEvent, requireTaskTemplate } from "@/server/tasks";
 import { createDiffSnapshot } from "@/server/pull-request";
+import { agents } from "@/agents";
+import { prepareTaskRuntime, taskRuntimeExecutor } from "@/server/task-runtime";
 
 export const runtime = "nodejs";
 
@@ -17,7 +19,8 @@ export async function POST(request: Request) {
   const taskId = (body as { taskId?: unknown }).taskId;
   const task = typeof taskId === "string" ? getTask(taskId) : undefined;
   if (taskId !== undefined && !task) return Response.json({ error: "Valid repository taskId is required" }, { status: 400 });
-  try { if (task) beginTaskRerun(task, parsed.prompt); }
+  let taskRuntime: Awaited<ReturnType<typeof prepareTaskRuntime>> | undefined;
+  try { if (task) { taskRuntime = await prepareTaskRuntime(task); beginTaskRerun(task, parsed.prompt); } }
   catch (error) { return Response.json({ error: error instanceof Error ? error.message : "Task cannot rerun review" }, { status: 409 }); }
   const template = task ? requireTaskTemplate(task) : undefined;
   const executionRequest = task ? { ...parsed, prompt: executionPromptForTask(task, parsed.prompt) } : parsed;
@@ -25,6 +28,8 @@ export async function POST(request: Request) {
     cwd: executionRootForTask(task),
     roles: template!.roles,
     fingerprint: async () => (await createDiffSnapshot(task)).hash,
+    runtimePolicies: taskRuntime!.policies,
+    executeAgent: taskRuntimeExecutor(taskRuntime!, agents),
     onEvent: (event) => recordFlowEvent(task, event),
     onComplete: (result) => completeTaskReview(task, result.status === "completed" && result.stepId === "codex_final" && result.steps[3]?.status === "completed"),
   } : {}), {

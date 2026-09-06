@@ -13,6 +13,8 @@ import { selectTaskTemplate } from "./task-templates";
 import { builtInTemplate, mergeTemplateWithProfile, parseTemplateSnapshot, taskExecutionPrompt, type TaskTemplateSnapshot } from "../templates/policy";
 import { evaluateTaskNotifications } from "./notifications";
 import { redactKnownSecrets, redactKnownSecretsInValue } from "./credential-resolver";
+import type { RuntimePolicy, RuntimeViolation, RuntimeViolationRecord } from "../runtime/types";
+import { runtimeViolationMessage } from "./runtime-policy";
 
 export const WORKTREE_ROOT = join(homedir(), "code", ".multiagents-worktrees");
 export const TASK_BRANCH_PATTERN = /^multiagents\/[0-9a-f-]{36}$/;
@@ -103,6 +105,7 @@ export type RepoTask = {
   templateSnapshotValid?: boolean;
   sourceFindingId?: string;
   sourceTaskId?: string;
+  runtimeViolation?: RuntimeViolationRecord;
 };
 
 export type TaskDiff = {
@@ -242,6 +245,7 @@ export function transitionTask(task: RepoTask, next: TaskStatus) {
 }
 
 export function beginTaskReview(task: RepoTask, prompt: string) {
+  requireNoRuntimeViolation(task);
   const template = requireTaskTemplate(task);
   if (!template.readOnly && !task.worktreeAvailable) throw new Error("Managed task worktree is unavailable");
   if (task.commitSha || ["committing", "pushing", "creating_pr", "pr_created", "push_failed", "pr_failed"].includes(task.status)) {
@@ -261,6 +265,7 @@ export function beginTaskReview(task: RepoTask, prompt: string) {
 }
 
 export function beginTaskRerun(task: RepoTask, prompt: string) {
+  requireNoRuntimeViolation(task);
   const template = requireTaskTemplate(task);
   if (!template.readOnly && !task.worktreeAvailable) throw new Error("Managed task worktree is unavailable");
   if (task.commitSha || ["committing", "pushing", "creating_pr", "pr_created", "push_failed", "pr_failed"].includes(task.status)) {
@@ -354,6 +359,7 @@ export function publicTask(task: RepoTask) {
     template: task.template ?? mergeTemplateWithProfile(builtInTemplate(task.repoId, "bug_fix"), task.profile ?? safeDefaultSnapshot(task.repoId)),
     sourceFindingId: task.sourceFindingId,
     sourceTaskId: task.sourceTaskId,
+    runtimeViolation: task.runtimeViolation,
   });
 }
 
@@ -366,6 +372,36 @@ export function getTaskHistory(taskId: string): TaskHistory { return redactKnown
 
 export function recordTaskEvent(task: RepoTask, type: TaskEventType, actor: TaskEventActor, input: { createdAt?: string; stepId?: string; status?: string; metadata?: TaskEventMetadata } = {}) {
   return getStateStore().appendTaskEvent(task.id, { type, actor, ...input });
+}
+
+export function recordRuntimeAudit(task: RepoTask, type: Extract<TaskEventType, "runtime_policy_created" | "runtime_execution_started" | "runtime_execution_completed" | "runtime_violation_detected">, policy: RuntimePolicy, stepId?: string, violationType?: RuntimeViolation) {
+  recordTaskEvent(task, type, policy.agent, {
+    stepId,
+    status: violationType ?? (type === "runtime_execution_started" ? "started" : type === "runtime_execution_completed" ? "completed" : "created"),
+    metadata: {
+      agent: policy.agent,
+      role: policy.role,
+      policyClass: policy.policyClass,
+      runtimePolicyVersion: policy.version,
+      violationType,
+    },
+  });
+}
+
+export function markRuntimeViolation(task: RepoTask, policy: RuntimePolicy, violation: RuntimeViolation) {
+  const message = runtimeViolationMessage(violation);
+  task.runtimeViolation = { type: violation, agent: policy.agent, role: policy.role, policyClass: policy.policyClass, message };
+  task.reviewReady = false;
+  task.flowStatus = "error";
+  task.error = message;
+  task.recoveryStatus = "needs_attention";
+  task.recoveryMessage = message;
+  invalidateApproval(task);
+  persistTask(task);
+}
+
+export function requireNoRuntimeViolation(task: RepoTask) {
+  if (task.runtimeViolation) throw new Error(task.runtimeViolation.message);
 }
 
 export function recordApprovalEvent(
@@ -587,8 +623,8 @@ async function recoverTask(task: RepoTask, allowedRoot: string, worktreeRoot: st
       if (repo.branch !== task.baseBranch || await runGit(repo.path, ["rev-parse", "HEAD"]) !== task.baseSha) throw new Error("Base repository branch or HEAD changed after task creation");
       task.worktreeAvailable = false;
       task.worktreeStatus = "not_required";
-      task.recoveryStatus = "recoverable";
-      task.recoveryMessage = "Read-only template snapshot restored; no managed worktree, commit, push, or PR is permitted.";
+      task.recoveryStatus = task.runtimeViolation ? "needs_attention" : "recoverable";
+      task.recoveryMessage = task.runtimeViolation?.message ?? "Read-only template snapshot restored; no managed worktree, commit, push, or PR is permitted.";
       persistTask(task);
     } catch (error) {
       task.worktreeAvailable = false;
@@ -660,11 +696,11 @@ async function recoverTask(task: RepoTask, allowedRoot: string, worktreeRoot: st
     task.worktreeStatus = "available";
     const approvalWasInvalidated = invalidateApprovalForRestart(task)
       || (task.approvalState === "invalidated" && ["approval_invalidated", "commit_failed"].includes(task.status));
-    task.recoveryStatus = approvalWasInvalidated || Boolean(task.prNumber) || ["ci_pending", "checking_ci", "fetching_review"].includes(task.status)
+    task.recoveryStatus = task.runtimeViolation || approvalWasInvalidated || Boolean(task.prNumber) || ["ci_pending", "checking_ci", "fetching_review"].includes(task.status)
       ? "needs_attention" : "recoverable";
-    task.recoveryMessage = approvalWasInvalidated
+    task.recoveryMessage = task.runtimeViolation?.message ?? (approvalWasInvalidated
       ? "Approval was invalidated after restart. Review the current diff and run validation again."
-      : task.prNumber ? "PR and CI state must be refreshed from GitHub." : undefined;
+      : task.prNumber ? "PR and CI state must be refreshed from GitHub." : undefined);
     persistTask(task);
   } catch (error) {
     task.worktreeAvailable = false;

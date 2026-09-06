@@ -14,7 +14,7 @@ function adapters(run?: (id: AgentId, prompt: string, writeAccess: boolean | und
   const adapter = (id: AgentId): AgentAdapter => ({
     id, name: id,
     run: vi.fn(async (prompt: string, options) => {
-      run?.(id, prompt, options?.writeAccess);
+      run?.(id, prompt, options?.policy?.allowWrite);
       return { agent: id, status: "completed" as const, output: `${id} output` };
     }),
   });
@@ -25,7 +25,8 @@ describe("PR review agent flows", () => {
   it("quotes GitHub comments as untrusted data and runs every intake agent read-only", async () => {
     const calls: Array<{ id: AgentId; prompt: string; write: boolean | undefined }> = [];
     const result = await runPrReviewIntake("fix docs", "diff", review, {
-      cwd: "/task", fingerprint: async () => "same", agents: adapters((id, prompt, write) => calls.push({ id, prompt, write })),
+      cwd: "/task", fingerprint: async () => "same", agents: adapters(),
+      executeAgent: async (id, prompt, write) => { calls.push({ id, prompt, write }); return { agent: id, status: "completed", output: `${id} output` }; },
     });
     expect(result.status).toBe("completed");
     expect(calls.map((call) => call.id)).toEqual(["codex", "cursor", "claude", "codex"]);
@@ -37,12 +38,11 @@ describe("PR review agent flows", () => {
   it("allows only Codex write phases and stops when Cursor changes the worktree", async () => {
     let fingerprint = "clean";
     const writes: Array<[AgentId, boolean | undefined]> = [];
-    const set = adapters((id, _prompt, write) => {
-      writes.push([id, write]);
-      if (id === "cursor") fingerprint = "mutated";
-    });
+    const set = adapters();
     const intake: PrReviewIntake = { status: "completed", steps: [], requiresRework: true, readyForHumanMerge: false };
-    const result = await runPrReworkFlow("fix", "diff", review, intake, { cwd: "/task", fingerprint: async () => fingerprint, agents: set });
+    const result = await runPrReworkFlow("fix", "diff", review, intake, { cwd: "/task", fingerprint: async () => fingerprint, agents: set,
+      executeAgent: async (id, _prompt, write) => { writes.push([id, write]); if (id === "cursor") fingerprint = "mutated"; return { agent: id, status: "completed", output: `${id} output` }; },
+    });
     expect(writes).toEqual([["codex", true], ["cursor", false]]);
     expect(result.status).toBe("error");
     expect(result.steps[1].error).toContain("review-only worktree");

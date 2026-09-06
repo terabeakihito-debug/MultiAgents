@@ -10,6 +10,8 @@ import type { DashboardCounts, DashboardSort, PrFilter, TaskBucket } from "../da
 import { parseProfileSnapshot, safeDefaultSnapshot, type ProjectProfile, type ProjectProfileSnapshot } from "../profiles/policy";
 import { builtInTemplates, mergeTemplateWithProfile, parseTemplateSnapshot, snapshotTemplate, type RepoTemplateSettings, type TaskTemplate, type TaskTemplateSnapshot } from "../templates/policy";
 import type { RepoTask } from "./tasks";
+import type { AgentRole } from "../profiles/policy";
+import type { RuntimePolicyClass, RuntimeViolation } from "../runtime/types";
 import {
   defaultOutboundChannelConfig,
   type DeliveryStatus,
@@ -53,6 +55,7 @@ export const taskEventTypes = [
   "task_resumed", "worktree_cleanup_requested", "worktree_removed", "pr_status_refreshed",
   "profile_snapshot_created", "template_snapshot_created",
   "finding_created", "finding_status_changed", "finding_converted", "implementation_task_created",
+  "runtime_policy_created", "runtime_execution_started", "runtime_execution_completed", "runtime_violation_detected",
 ] as const;
 export type TaskEventType = (typeof taskEventTypes)[number];
 export type TaskEventActor = "user" | "system" | "codex" | "cursor" | "claude";
@@ -70,6 +73,11 @@ export type TaskEventMetadata = Partial<{
   templateVersion: number;
   findingId: string;
   sourceTaskId: string;
+  agent: "codex" | "cursor" | "claude";
+  role: AgentRole;
+  policyClass: RuntimePolicyClass;
+  runtimePolicyVersion: number;
+  violationType: RuntimeViolation;
 }>;
 export type TaskEvent = {
   id: string;
@@ -303,6 +311,7 @@ export class StateStore {
       latestPushedSha: task.latestPushedSha,
       ciMessage: task.ciMessage,
       error: task.error,
+      runtimeViolation: task.runtimeViolation,
       profileSnapshot: profile,
       templateSnapshot: template,
     });
@@ -975,6 +984,7 @@ export class StateStore {
       templateSnapshotValid: parsedTemplate.valid,
       sourceFindingId: optionalString(row.source_finding_id),
       sourceTaskId: optionalString(row.source_task_id),
+      runtimeViolation: objectOrUndefined(payload.runtimeViolation) as RepoTask["runtimeViolation"],
     } as RepoTask;
   }
 
@@ -1392,7 +1402,7 @@ function storedTaskTemplate(row: TaskRow, payload: Record<string, unknown>, prof
     return { template: fallback, valid: false };
   }
 }
-const metadataKeys = new Set(["durationMs", "diffHash", "commitSha", "prNumber", "changedFileCount", "additions", "deletions", "profileId", "profileVersion", "templateId", "templateVersion", "findingId", "sourceTaskId"]);
+const metadataKeys = new Set(["durationMs", "diffHash", "commitSha", "prNumber", "changedFileCount", "additions", "deletions", "profileId", "profileVersion", "templateId", "templateVersion", "findingId", "sourceTaskId", "agent", "role", "policyClass", "runtimePolicyVersion", "violationType"]);
 function validateMetadata(value: TaskEventMetadata | undefined) {
   if (!value) return undefined;
   for (const [key, item] of Object.entries(value)) {
@@ -1407,6 +1417,11 @@ function validateMetadata(value: TaskEventMetadata | undefined) {
     if (key === "templateId" && (typeof item !== "string" || !/^[A-Za-z0-9._-]{1,100}$/.test(item))) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
     if (key === "templateVersion" && (typeof item !== "number" || !Number.isSafeInteger(item) || item < 1)) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
     if (["findingId", "sourceTaskId"].includes(key) && (typeof item !== "string" || !/^[0-9a-f-]{36}$/i.test(item))) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
+    if (key === "agent" && !["codex", "cursor", "claude"].includes(String(item))) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
+    if (key === "role" && !["implement", "review_only", "disabled"].includes(String(item))) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
+    if (key === "policyClass" && !["repository_implementation", "repository_review", "generic_read_only", "disabled"].includes(String(item))) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
+    if (key === "runtimePolicyVersion" && (typeof item !== "number" || !Number.isSafeInteger(item) || item < 1)) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
+    if (key === "violationType" && !["unexpected_write", "head_changed", "branch_changed", "base_repo_changed", "worktree_escape", "unexpected_worktree", "forbidden_runtime_configuration"].includes(String(item))) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
   }
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as TaskEventMetadata;
 }

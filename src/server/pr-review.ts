@@ -19,7 +19,9 @@ import {
 import type { PullRequestCheck, PullRequestReview, PullRequestReviewItem, ReviewDisposition } from "./pr-review-types";
 import { ALLOWED_ROOT, validateRepository } from "./repositories";
 import { acquireTaskLock, isTaskLocked, releaseTaskLock } from "./task-lock";
-import { WORKTREE_ROOT, getTask, getTaskDiff, persistTask, publicTask, recordApprovalEvent, recordDiffVersion, recordTaskEvent, registerRecoveredTask, requireTaskProfile, requireTaskTemplate, transitionTask, type RepoTask } from "./tasks";
+import { WORKTREE_ROOT, getTask, getTaskDiff, persistTask, publicTask, recordApprovalEvent, recordDiffVersion, recordTaskEvent, registerRecoveredTask, requireNoRuntimeViolation, requireTaskProfile, requireTaskTemplate, transitionTask, type RepoTask } from "./tasks";
+import { prepareTaskRuntime } from "./task-runtime";
+import { readOnlyRuntimePolicy } from "./runtime-policy";
 
 const MAX_REVIEW_BODY_CHARS = 10_000;
 const MAX_REVIEW_ITEMS = 200;
@@ -78,11 +80,14 @@ export async function fetchReviewIntake(taskId: string, dependencies: Partial<Pr
       const review = await deps.fetchReview(task);
       await validateExistingPullRequest(task, review);
       const diff = await deps.fetchDiff(task);
+      const runtime = await prepareTaskRuntime(task);
       const intake = await deps.runIntake(task.prompt, diff, review, {
         agents,
         roles: requireTaskTemplate(task).roles,
         cwd: task.worktreeAvailable ? task.worktreePath : task.repoPath,
         fingerprint: async () => reviewFingerprint(task),
+        runtimePolicies: runtime.policies,
+        executeAgent: (agent, prompt, _writeAccess, stepId) => runtime.executePolicy(agents[agent], readOnlyRuntimePolicy(runtime.policies[agent]), prompt, undefined, stepId),
       });
       if (intake.status !== "completed") throw new Error("PR review intake did not complete");
       task.prReview = review;
@@ -128,6 +133,7 @@ export async function applyReviewedFixes(taskId: string, input: { approved: true
     let result;
     try {
       const diff = await deps.fetchDiff(task);
+      const runtime = await prepareTaskRuntime(task);
       result = await deps.runRework(task.prompt, diff, task.prReview, task.reviewIntake, {
         agents,
         roles: template.roles,
@@ -137,6 +143,8 @@ export async function applyReviewedFixes(taskId: string, input: { approved: true
           const current = await getTaskDiffForReview(task);
           return current;
         },
+        runtimePolicies: runtime.policies,
+        executeAgent: (agent, prompt, writeAccess, stepId) => runtime.executePolicy(agents[agent], writeAccess ? runtime.policies[agent] : readOnlyRuntimePolicy(runtime.policies[agent]), prompt, undefined, stepId),
       });
     } catch {
       transitionTask(task, "rework_failed");
@@ -563,6 +571,7 @@ async function getTaskDiffForReview(task: RepoTask) {
 function requireTask(taskId: string) {
   const task = getTask(taskId);
   if (!task) throw new ApprovalError("Task not found", 404);
+  requireNoRuntimeViolation(task);
   return task;
 }
 

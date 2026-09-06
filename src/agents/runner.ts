@@ -1,9 +1,12 @@
 import { spawn, type SpawnOptions } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { AgentAdapter, AgentDefinition, AgentResult } from "./types";
 import { beginAgentExecution } from "../server/agent-execution-guard";
 import { buildChildProcessEnv } from "../server/child-process-env";
 import { redactKnownSecrets } from "../server/credential-resolver";
+import { buildGenericRuntimePolicy } from "../server/runtime-policy";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_OUTPUT_BYTES = 1_000_000;
@@ -20,6 +23,7 @@ export function createAgentAdapter(
     spawnProcess?: SpawnLike;
   } = {},
 ): AgentAdapter {
+  assertFixedLauncher(definition);
   return {
     id: definition.id,
     name: definition.name,
@@ -31,12 +35,17 @@ function runProcess(
   definition: AgentDefinition,
   prompt: string,
   options: { cwd?: string; env?: Readonly<Record<string, string | undefined>>; timeoutMs?: number; spawnProcess?: SpawnLike },
-  runOptions?: { signal?: AbortSignal; cwd?: string; writeAccess?: boolean },
+  runOptions?: import("./types").AgentRunOptions,
 ): Promise<AgentResult> {
   return new Promise((resolve) => {
     const spawnProcess = options.spawnProcess ?? spawn;
     const signal = runOptions?.signal;
-    const cwd = runOptions?.cwd ?? options.cwd ?? process.cwd();
+    const policy = runOptions?.policy ?? buildGenericRuntimePolicy(definition.id, options.cwd ?? process.cwd());
+    if (policy.agent !== definition.id) {
+      resolve(errorResult(definition.id, new Error("Runtime policy agent does not match the fixed launcher")));
+      return;
+    }
+    const cwd = policy.workingRoot;
     const spawnOptions: SpawnOptions = {
       cwd,
       env: buildChildProcessEnv({ purpose: "agent", baseEnv: options.env ?? process.env }),
@@ -48,10 +57,8 @@ function runProcess(
     let child;
     let endAgentExecution: (() => void) | undefined;
     try {
-      // A per-run cwd is supplied only after a server-side repository task lookup.
-      // It is intentionally a boolean capability, not a client-selectable sandbox value.
       const safePrompt = redactKnownSecrets(prompt);
-      child = spawnProcess(definition.binary, definition.args(safePrompt, cwd, Boolean(runOptions?.cwd), runOptions?.writeAccess ?? Boolean(runOptions?.cwd)), spawnOptions);
+      child = spawnProcess(definition.binary, definition.args(safePrompt, cwd, policy.source === "task_snapshots", policy.allowWrite), spawnOptions);
       endAgentExecution = beginAgentExecution();
     } catch (error) {
       resolve(errorResult(definition.id, error));
@@ -134,6 +141,15 @@ function runProcess(
 
     if (signal?.aborted) abort();
   });
+}
+
+function assertFixedLauncher(definition: AgentDefinition) {
+  const expected: Record<AgentDefinition["id"], string> = {
+    codex: "codex",
+    cursor: "agent",
+    claude: join(process.env.HOME || homedir(), ".local", "bin", "claude"),
+  };
+  if (definition.binary !== expected[definition.id]) throw new Error(`Invalid fixed launcher for ${definition.id}`);
 }
 
 class BoundedUtf8Output {

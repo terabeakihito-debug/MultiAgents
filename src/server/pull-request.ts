@@ -22,6 +22,7 @@ import {
   recordTaskEvent,
   requireTaskProfile,
   requireTaskTemplate,
+  requireNoRuntimeViolation,
   transitionTask,
   type RepoTask,
   type SecretFinding,
@@ -101,6 +102,7 @@ export class ApprovalError extends Error {
 }
 
 export async function prepareApproval(task: RepoTask) {
+  requireNoRuntimeViolation(task);
   const diff = await getTaskDiff(task);
   const template = requireTaskTemplate(task);
   if (template.readOnly || !template.requireHumanApproval || !template.requirePr) {
@@ -183,6 +185,7 @@ export async function approveAndCreatePullRequest(taskId: string, input: Approva
   try {
     const task = getTask(taskId);
     if (!task) throw new ApprovalError("Task not found", 404);
+    requireNoRuntimeViolation(task);
     const profile = requireTaskProfile(task);
     const template = requireTaskTemplate(task);
     if (template.readOnly || !template.requireWorktree || !template.requireHumanApproval || !template.requirePr) throw new ApprovalError("Task template forbids commit, push, and PR creation");
@@ -318,6 +321,7 @@ export async function retryPullRequest(taskId: string, dependencies: Partial<App
   try {
     const task = getTask(taskId);
     if (!task) throw new ApprovalError("Task not found", 404);
+    requireNoRuntimeViolation(task);
     const profile = requireTaskProfile(task);
     const template = requireTaskTemplate(task);
     if (template.readOnly || !template.requirePr) throw new ApprovalError("Task template forbids this Git operation");

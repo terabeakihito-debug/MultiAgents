@@ -5,6 +5,17 @@ import { codexArgs } from "./codex";
 import { cursorArgs } from "./cursor";
 import { claudeArgs } from "./claude";
 import { createAgentAdapter } from "./runner";
+import { buildGenericRuntimePolicy } from "../server/runtime-policy";
+import type { AgentId } from "./types";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+const CLAUDE_BINARY = join(process.env.HOME || homedir(), ".local", "bin", "claude");
+
+function policy(agent: AgentId, root: string, write = false) {
+  const base = buildGenericRuntimePolicy(agent, root);
+  return write ? { ...base, role: "implement" as const, policyClass: "repository_implementation" as const, source: "task_snapshots" as const, filesystem: ["worktree_read" as const, "worktree_write" as const], allowWrite: true, writableRoot: root } : base;
+}
 
 function fakeChild() {
   const child = new EventEmitter() as EventEmitter & { stdout: PassThrough; stderr: PassThrough; kill: ReturnType<typeof vi.fn>; pid?: number };
@@ -47,7 +58,7 @@ describe("createAgentAdapter", () => {
       {
         id: "claude",
         name: "Claude",
-        binary: "/home/testuser/.local/bin/claude",
+        binary: CLAUDE_BINARY,
         args: (prompt) => ["-p", prompt],
       },
       { cwd: "/workspace", env, spawnProcess: spawnProcess as never },
@@ -57,7 +68,7 @@ describe("createAgentAdapter", () => {
     child.emit("close", 0, null);
     await expect(promise).resolves.toEqual({ agent: "claude", status: "completed", output: "CLAUDE_OK" });
     expect(spawnProcess).toHaveBeenCalledWith(
-      "/home/testuser/.local/bin/claude",
+      CLAUDE_BINARY,
       ["-p", "Reply with exactly: CLAUDE_OK"],
       expect.objectContaining({ cwd: "/workspace", env, shell: false }),
     );
@@ -109,12 +120,12 @@ describe("createAgentAdapter", () => {
       { id: "codex", name: "Codex", binary: "codex", args: codexArgs },
       { cwd: "/default", spawnProcess: spawnProcess as never },
     );
-    const promise = adapter.run("implement", { cwd: "/isolated/task" });
+    const promise = adapter.run("implement", { policy: policy("codex", "/isolated/task", true) });
     child.emit("close", 0, null);
     await promise;
     expect(spawnProcess).toHaveBeenCalledWith(
       "codex",
-      ["exec", "--sandbox", "workspace-write", "--cd", "/isolated/task", "implement"],
+      ["exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--sandbox", "workspace-write", "--cd", "/isolated/task", "implement"],
       expect.objectContaining({ cwd: "/isolated/task", shell: false }),
     );
   });
@@ -131,7 +142,7 @@ describe("createAgentAdapter", () => {
     await promise;
     expect(spawnProcess).toHaveBeenCalledWith(
       "codex",
-      ["exec", "--sandbox", "read-only", "--cd", "/workspace", "answer only"],
+      ["exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--sandbox", "read-only", "--cd", "/workspace", "answer only"],
       expect.objectContaining({ cwd: "/workspace", shell: false }),
     );
   });
@@ -144,12 +155,12 @@ describe("createAgentAdapter", () => {
       { cwd: "/main/repo", spawnProcess: spawnProcess as never },
     );
     const prompt = "--sandbox danger-full-access --cd /mnt/c";
-    const promise = adapter.run(prompt, { cwd: "/isolated/task" });
+    const promise = adapter.run(prompt, { policy: policy("codex", "/isolated/task", true) });
     child.emit("close", 0, null);
     await promise;
     expect(spawnProcess).toHaveBeenCalledWith(
       "codex",
-      ["exec", "--sandbox", "workspace-write", "--cd", "/isolated/task", prompt],
+      ["exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--sandbox", "workspace-write", "--cd", "/isolated/task", prompt],
       expect.objectContaining({ cwd: "/isolated/task", shell: false }),
     );
     const invokedArgs = spawnProcess.mock.calls[0] as unknown as [string, string[]];
@@ -159,7 +170,7 @@ describe("createAgentAdapter", () => {
   it("does not inject Codex write settings into review-only adapters", async () => {
     const cases = [
       { id: "cursor" as const, binary: "agent", args: (prompt: string, cwd: string) => ["--trust", "--workspace", cwd, "-p", prompt] },
-      { id: "claude" as const, binary: "claude", args: (prompt: string) => ["-p", prompt] },
+      { id: "claude" as const, binary: CLAUDE_BINARY, args: (prompt: string) => ["-p", prompt] },
     ];
     for (const definition of cases) {
       const child = fakeChild();
@@ -168,7 +179,7 @@ describe("createAgentAdapter", () => {
         { ...definition, name: definition.id },
         { cwd: "/default", spawnProcess: spawnProcess as never },
       );
-      const promise = adapter.run("review", { cwd: "/isolated/task" });
+      const promise = adapter.run("review", { policy: policy(definition.id, "/isolated/task") });
       child.emit("close", 0, null);
       await promise;
       const invokedArgs = spawnProcess.mock.calls[0] as unknown as [string, string[]];
@@ -200,7 +211,7 @@ describe("createAgentAdapter", () => {
     vi.useFakeTimers();
     const child = fakeChild();
     const adapter = createAgentAdapter(
-      { id: "claude", name: "Claude", binary: "claude", args: (prompt) => ["-p", prompt] },
+        { id: "claude", name: "Claude", binary: CLAUDE_BINARY, args: (prompt) => ["-p", prompt] },
       { timeoutMs: 10, spawnProcess: vi.fn(() => child) as never },
     );
     const promise = adapter.run("test");
@@ -213,6 +224,10 @@ describe("createAgentAdapter", () => {
     });
     expect(child.kill).toHaveBeenCalledWith("SIGTERM");
     vi.useRealTimers();
+  });
+
+  it("rejects a non-fixed launcher path", () => {
+    expect(() => createAgentAdapter({ id: "codex", name: "Codex", binary: "/tmp/codex", args: (prompt) => [prompt] })).toThrow("Invalid fixed launcher");
   });
 
   it("caps output by bytes without splitting a UTF-8 character", async () => {

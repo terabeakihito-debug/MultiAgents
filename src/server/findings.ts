@@ -11,6 +11,8 @@ import { evaluateFindingNotification } from "./notifications";
 import { selectTaskTemplate } from "./task-templates";
 import { createTask, getTask, requireTaskTemplate, type RepoTask } from "./tasks";
 import { containsKnownSecret } from "./credential-resolver";
+import { prepareTaskRuntime } from "./task-runtime";
+import { readOnlyRuntimePolicy } from "./runtime-policy";
 
 export const MAX_FINDINGS = 50;
 export const MAX_FINDING_TITLE = 200;
@@ -72,7 +74,8 @@ export async function extractTaskFindings(taskId: string, agent: AgentAdapter = 
   const store = getStateStore();
   if (store.loadFindings(task.id).length) throw new Error("Findings were already extracted for this task");
   const before = (await createDiffSnapshot(task)).hash;
-  const result = await agent.run(findingExtractionPrompt(task.finalOutput), { cwd: task.repoPath, writeAccess: false });
+  const runtime = await prepareTaskRuntime(task);
+  const result = await runtime.executePolicy(agent, readOnlyRuntimePolicy(runtime.policies[agent.id]), findingExtractionPrompt(task.finalOutput), undefined, "finding_extraction");
   if ((await createDiffSnapshot(task)).hash !== before) throw new Error("Finding extraction modified the read-only source repository");
   if (result.status !== "completed") throw new Error(result.error || "Structured finding extraction failed");
   const candidates = parseFindingExtraction(result.output);

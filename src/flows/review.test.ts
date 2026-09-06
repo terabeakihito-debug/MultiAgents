@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { AgentAdapter, AgentId, AgentResult, AgentRunOptions, FlowEvent } from "../agents/types";
 import { cursorPrompt, runReviewFlow, truncateForHandoff } from "./review";
+import { buildGenericRuntimePolicy } from "../server/runtime-policy";
 
 function setup(results: Partial<Record<AgentId, AgentResult[]>>) {
   const calls: Record<AgentId, string[]> = { codex: [], cursor: [], claude: [] };
@@ -82,7 +83,10 @@ describe("runReviewFlow", () => {
 
   it("never executes an agent disabled by the task profile", async () => {
     const { adapters, calls } = setup({ codex: [ok("codex", "draft"), ok("codex", "final")], cursor: [ok("cursor", "must-not-run")], claude: [ok("claude", "review")] });
-    const result = await runReviewFlow("request", { agents: adapters, cwd: "/task", roles: { codex: "implement", cursor: "disabled", claude: "review_only" }, fingerprint: async () => "same" });
+    const codex = buildGenericRuntimePolicy("codex", "/task");
+    const cursor = { ...buildGenericRuntimePolicy("cursor", "/task"), role: "disabled" as const, policyClass: "disabled" as const, execution: [] };
+    const claude = buildGenericRuntimePolicy("claude", "/task");
+    const result = await runReviewFlow("request", { agents: adapters, runtimePolicies: { codex, cursor, claude } });
     expect(calls.cursor).toHaveLength(0);
     expect(result.steps[1]).toMatchObject({ status: "skipped", error: "cursor is disabled by the task profile" });
   });
@@ -94,19 +98,19 @@ describe("runReviewFlow", () => {
       const original = adapters[id].run;
       adapters[id].run = vi.fn(async (prompt, runOptions) => { options[id].push(runOptions ?? {}); return original(prompt, runOptions); });
     }
-    await runReviewFlow("request", { agents: adapters, cwd: "/task", roles: { codex: "implement", cursor: "review_only", claude: "review_only" }, fingerprint: async () => "same" });
-    expect(options.codex.every((value) => value.cwd === "/task" && value.writeAccess === true)).toBe(true);
-    expect(options.cursor[0].writeAccess).toBe(false);
-    expect(options.claude[0].writeAccess).toBe(false);
+    const read = (agent: AgentId) => buildGenericRuntimePolicy(agent, "/task");
+    const codex = { ...read("codex"), role: "implement" as const, policyClass: "repository_implementation" as const, source: "task_snapshots" as const, filesystem: ["worktree_read" as const, "worktree_write" as const], allowWrite: true, writableRoot: "/task" };
+    await runReviewFlow("request", { agents: adapters, runtimePolicies: { codex, cursor: read("cursor"), claude: read("claude") } });
+    expect(options.codex.every((value) => value.policy?.workingRoot === "/task" && value.policy?.allowWrite === true)).toBe(true);
+    expect(options.cursor[0].policy?.allowWrite).toBe(false);
+    expect(options.claude[0].policy?.allowWrite).toBe(false);
   });
 
   it("fails closed when a review-only agent changes the worktree fingerprint", async () => {
     const { adapters } = setup({ codex: [ok("codex", "draft"), ok("codex", "final")], cursor: [ok("cursor", "review")] });
-    let fingerprintCalls = 0;
-    const fingerprint = async () => (++fingerprintCalls === 2 ? "before-cursor" : fingerprintCalls === 3 ? "after-cursor" : "stable");
-    const result = await runReviewFlow("request", { agents: adapters, cwd: "/task", roles: { codex: "implement", cursor: "review_only", claude: "disabled" }, fingerprint });
+    const result = await runReviewFlow("request", { agents: adapters, executeAgent: async (agent, input, signal, stepId) => stepId === "cursor_review" ? { agent, status: "error", output: "review", error: "Runtime policy violation", runtimeViolation: "unexpected_write" } : adapters[agent].run(input, { signal }) });
     expect(result.steps[1].status).toBe("error");
-    expect(result.steps[1].error).toContain("modified the review-only worktree");
+    expect(result.steps[1].runtimeViolation).toBe("unexpected_write");
   });
 
   it("continues emitting the final events after a Claude failure", async () => {
