@@ -57,6 +57,7 @@ export async function buildTaskRuntimePolicies(task: RepoTask): Promise<Record<A
       agent, role, policyClass,
       workingRoot: allowWrite ? roots.worktree! : roots.execution,
       writableRoot: allowWrite ? roots.worktree : undefined,
+      baseRepoRoot: allowWrite ? roots.repo : undefined,
       filesystem: role === "disabled" ? [] : allowWrite ? ["worktree_read", "worktree_write"] : [savedTemplate.readOnly ? "repo_read" : "worktree_read"],
       source: "task_snapshots",
       sourceProfileId: profile.profileId,
@@ -85,6 +86,7 @@ export function publicRuntimePolicy(policy: RuntimePolicy): PublicRuntimePolicy 
     filesystem: [...policy.filesystem],
     networkPolicy: policy.networkPolicy,
     networkEnforcement: policy.networkEnforcement,
+    osSandboxProfile: policy.osSandboxProfile,
     execution: [...policy.execution],
     allowWrite: policy.allowWrite,
     environmentPolicy: policy.environmentPolicy,
@@ -107,6 +109,7 @@ export function readOnlyRuntimePolicy(policy: RuntimePolicy): RuntimePolicy {
     policyClass: "repository_review",
     filesystem: policy.source === "task_snapshots" ? ["worktree_read"] : [],
     writableRoot: undefined,
+    baseRepoRoot: undefined,
   });
 }
 
@@ -119,6 +122,7 @@ export async function runTaskAgentWithPolicy(input: {
   stepId?: string;
   onAudit: (type: "runtime_policy_created" | "runtime_execution_started" | "runtime_execution_completed" | "runtime_violation_detected", policy: RuntimePolicy, violation?: RuntimeViolation) => void;
   onViolation: (policy: RuntimePolicy, violation: RuntimeViolation) => void;
+  onSandboxAudit: (event: import("./os-sandbox").OsSandboxAudit) => void;
 }): Promise<AgentResult> {
   const { task, adapter, policy } = input;
   if (adapter.id !== policy.agent || policy.execution.length !== (policy.role === "disabled" ? 0 : 1)) {
@@ -136,7 +140,7 @@ export async function runTaskAgentWithPolicy(input: {
   }
   input.onAudit("runtime_execution_started", policy);
   let result: AgentResult;
-  try { result = await adapter.run(input.prompt, { signal: input.signal, policy }); }
+  try { result = await adapter.run(input.prompt, { signal: input.signal, policy, onSandboxAudit: input.onSandboxAudit }); }
   catch (error) {
     result = { agent: policy.agent, status: "error", output: "", error: error instanceof Error ? error.message : "Agent execution failed" };
   }
@@ -173,12 +177,14 @@ function basePolicy(input: Pick<RuntimePolicy, "agent" | "role" | "policyClass" 
     role: input.role,
     policyClass: input.policyClass,
     filesystem: [...input.filesystem],
-    networkPolicy: "cli_managed" as const,
-    networkEnforcement: "not_guaranteed_by_multiagents" as const,
+    networkPolicy: "provider_required" as const,
+    networkEnforcement: "host_network_residual_risk" as const,
+    osSandboxProfile: input.role === "implement" ? "agent_implement" as const : "agent_read_only" as const,
     execution: input.role === "disabled" ? [] : ["agent_cli" as const],
     allowWrite: input.role === "implement",
     workingRoot: input.workingRoot,
     writableRoot: input.writableRoot,
+    baseRepoRoot: input.baseRepoRoot,
     environmentPolicy: "agent" as const,
     forbiddenOperations: [...FORBIDDEN_OPERATIONS],
     sourceProfileId: input.sourceProfileId,

@@ -18,7 +18,11 @@ export type AgentDefinition = {
   args: (prompt: string, cwd: string, repositoryTask: boolean, writeAccess: boolean) => string[];
 };
 
-export type AgentRunOptions = { signal?: AbortSignal; policy?: import("../runtime/types").RuntimePolicy };
+export type AgentRunOptions = {
+  signal?: AbortSignal;
+  policy?: import("../runtime/types").RuntimePolicy;
+  onSandboxAudit?: (event: import("../server/os-sandbox").OsSandboxAudit) => void;
+};
 
 export type AgentAdapter = {
   id: AgentId;

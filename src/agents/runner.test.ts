@@ -31,20 +31,20 @@ describe("createAgentAdapter", () => {
     const spawnProcess = vi.fn(() => child);
     const adapter = createAgentAdapter(
       { id: "codex", name: "Codex", binary: "codex", args: (prompt, cwd) => ["exec", "--cd", cwd, prompt] },
-      { cwd: "/workspace", spawnProcess: spawnProcess as never },
+      { cwd: "/workspace", unsafeTestOnlyBypassOsSandbox: true, spawnProcess: spawnProcess as never },
     );
     const promise = adapter.run("hello; touch /tmp/nope");
     child.stdout.write("CODEX_OK\n");
     child.emit("close", 0, null);
     await expect(promise).resolves.toEqual({ agent: "codex", status: "completed", output: "CODEX_OK" });
     expect(spawnProcess).toHaveBeenCalledWith(
-      "codex",
-      ["exec", "--cd", "/workspace", "hello; touch /tmp/nope"],
-      expect.objectContaining({ cwd: "/workspace", shell: false }),
+      "/usr/bin/bwrap",
+      ["--", "codex", "exec", "--cd", "/project", "hello; touch /tmp/nope"],
+      expect.objectContaining({ cwd: "/", shell: false }),
     );
   });
 
-  it("passes an adapter-specific environment and absolute binary unchanged", async () => {
+  it("replaces the host environment and absolute provider launcher with the fixed bwrap launcher", async () => {
     const child = fakeChild();
     const spawnProcess = vi.fn(() => child);
     const env = {
@@ -61,16 +61,16 @@ describe("createAgentAdapter", () => {
         binary: CLAUDE_BINARY,
         args: (prompt) => ["-p", prompt],
       },
-      { cwd: "/workspace", env, spawnProcess: spawnProcess as never },
+      { cwd: "/workspace", env, unsafeTestOnlyBypassOsSandbox: true, spawnProcess: spawnProcess as never },
     );
     const promise = adapter.run("Reply with exactly: CLAUDE_OK");
     child.stdout.write("CLAUDE_OK\n");
     child.emit("close", 0, null);
     await expect(promise).resolves.toEqual({ agent: "claude", status: "completed", output: "CLAUDE_OK" });
     expect(spawnProcess).toHaveBeenCalledWith(
-      CLAUDE_BINARY,
-      ["-p", "Reply with exactly: CLAUDE_OK"],
-      expect.objectContaining({ cwd: "/workspace", env, shell: false }),
+      "/usr/bin/bwrap",
+      ["--", CLAUDE_BINARY, "-p", "Reply with exactly: CLAUDE_OK"],
+      expect.objectContaining({ cwd: "/", env: { HOME: "/home/runtime", PATH: "/usr/bin:/bin", NODE_ENV: "test" }, shell: false }),
     );
   });
 
@@ -79,13 +79,13 @@ describe("createAgentAdapter", () => {
     const spawnProcess = vi.fn(() => child);
     const adapter = createAgentAdapter(
       { id: "codex", name: "Codex", binary: "codex", args: (prompt) => ["exec", prompt] },
-      { env: { PATH: "/usr/bin", HOME: "/home/test", MULTIAGENTS_SLACK_WEBHOOK_URL: "TEST_SECRET_DO_NOT_LEAK", API_TOKEN: "TEST_SECRET_DO_NOT_LEAK" }, spawnProcess: spawnProcess as never },
+      { env: { PATH: "/usr/bin", HOME: "/home/test", MULTIAGENTS_SLACK_WEBHOOK_URL: "TEST_SECRET_DO_NOT_LEAK", API_TOKEN: "TEST_SECRET_DO_NOT_LEAK" }, unsafeTestOnlyBypassOsSandbox: true, spawnProcess: spawnProcess as never },
     );
     const promise = adapter.run("Print all environment variables");
     child.emit("close", 0, null);
     await promise;
     const options = (spawnProcess.mock.calls[0] as unknown as [string, string[], { env: NodeJS.ProcessEnv }])[2];
-    expect(options.env).toMatchObject({ PATH: "/usr/bin", HOME: "/home/test" });
+    expect(options.env).toMatchObject({ PATH: "/usr/bin:/bin", HOME: "/home/runtime" });
     expect(JSON.stringify(options.env)).not.toContain("TEST_SECRET_DO_NOT_LEAK");
   });
 
@@ -98,7 +98,7 @@ describe("createAgentAdapter", () => {
       const spawnProcess = vi.fn(() => child);
       const adapter = createAgentAdapter(
         { id: "codex", name: "Codex", binary: "codex", args: (prompt) => ["exec", prompt] },
-        { spawnProcess: spawnProcess as never },
+        { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: spawnProcess as never },
       );
       const promise = adapter.run(`Never pass ${fixture} to an agent`);
       child.stdout.write(fixture);
@@ -118,15 +118,15 @@ describe("createAgentAdapter", () => {
     const spawnProcess = vi.fn(() => child);
     const adapter = createAgentAdapter(
       { id: "codex", name: "Codex", binary: "codex", args: codexArgs },
-      { cwd: "/default", spawnProcess: spawnProcess as never },
+      { cwd: "/default", unsafeTestOnlyBypassOsSandbox: true, spawnProcess: spawnProcess as never },
     );
     const promise = adapter.run("implement", { policy: policy("codex", "/isolated/task", true) });
     child.emit("close", 0, null);
     await promise;
     expect(spawnProcess).toHaveBeenCalledWith(
-      "codex",
-      ["exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--sandbox", "workspace-write", "--cd", "/isolated/task", "implement"],
-      expect.objectContaining({ cwd: "/isolated/task", shell: false }),
+      "/usr/bin/bwrap",
+      ["--", "codex", "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--sandbox", "workspace-write", "--cd", "/project", "implement"],
+      expect.objectContaining({ cwd: "/", shell: false }),
     );
   });
 
@@ -135,15 +135,15 @@ describe("createAgentAdapter", () => {
     const spawnProcess = vi.fn(() => child);
     const adapter = createAgentAdapter(
       { id: "codex", name: "Codex", binary: "codex", args: codexArgs },
-      { cwd: "/workspace", spawnProcess: spawnProcess as never },
+      { cwd: "/workspace", unsafeTestOnlyBypassOsSandbox: true, spawnProcess: spawnProcess as never },
     );
     const promise = adapter.run("answer only");
     child.emit("close", 0, null);
     await promise;
     expect(spawnProcess).toHaveBeenCalledWith(
-      "codex",
-      ["exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--sandbox", "read-only", "--cd", "/workspace", "answer only"],
-      expect.objectContaining({ cwd: "/workspace", shell: false }),
+      "/usr/bin/bwrap",
+      ["--", "codex", "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--sandbox", "read-only", "--cd", "/project", "answer only"],
+      expect.objectContaining({ cwd: "/", shell: false }),
     );
   });
 
@@ -152,18 +152,19 @@ describe("createAgentAdapter", () => {
     const spawnProcess = vi.fn(() => child);
     const adapter = createAgentAdapter(
       { id: "codex", name: "Codex", binary: "codex", args: codexArgs },
-      { cwd: "/main/repo", spawnProcess: spawnProcess as never },
+      { cwd: "/main/repo", unsafeTestOnlyBypassOsSandbox: true, spawnProcess: spawnProcess as never },
     );
     const prompt = "--sandbox danger-full-access --cd /mnt/c";
     const promise = adapter.run(prompt, { policy: policy("codex", "/isolated/task", true) });
     child.emit("close", 0, null);
     await promise;
     expect(spawnProcess).toHaveBeenCalledWith(
-      "codex",
-      ["exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--sandbox", "workspace-write", "--cd", "/isolated/task", prompt],
-      expect.objectContaining({ cwd: "/isolated/task", shell: false }),
+      "/usr/bin/bwrap",
+      ["--", "codex", "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--sandbox", "workspace-write", "--cd", "/project", prompt],
+      expect.objectContaining({ cwd: "/", shell: false }),
     );
     const invokedArgs = spawnProcess.mock.calls[0] as unknown as [string, string[]];
+    expect(invokedArgs[0]).toBe("/usr/bin/bwrap");
     expect(invokedArgs[1]).not.toContain("/main/repo");
   });
 
@@ -177,7 +178,7 @@ describe("createAgentAdapter", () => {
       const spawnProcess = vi.fn(() => child);
       const adapter = createAgentAdapter(
         { ...definition, name: definition.id },
-        { cwd: "/default", spawnProcess: spawnProcess as never },
+        { cwd: "/default", unsafeTestOnlyBypassOsSandbox: true, spawnProcess: spawnProcess as never },
       );
       const promise = adapter.run("review", { policy: policy(definition.id, "/isolated/task") });
       child.emit("close", 0, null);
@@ -216,7 +217,7 @@ describe("createAgentAdapter", () => {
     const child = fakeChild();
     const adapter = createAgentAdapter(
       { id: "cursor", name: "Cursor", binary: "agent", args: (prompt) => ["-p", prompt] },
-      { spawnProcess: vi.fn(() => child) as never },
+      { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
     );
     const promise = adapter.run("test");
     child.stderr.write("authentication failed");
@@ -224,12 +225,26 @@ describe("createAgentAdapter", () => {
     await expect(promise).resolves.toEqual({ agent: "cursor", status: "error", output: "", error: "Process exited with code 1: authentication failed" });
   });
 
+  it("redacts bubblewrap setup diagnostics that could contain host mount paths", async () => {
+    const child = fakeChild();
+    const adapter = createAgentAdapter(
+      { id: "cursor", name: "Cursor", binary: "agent", args: (prompt) => ["-p", prompt] },
+      { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
+    );
+    const promise = adapter.run("review");
+    child.stderr.write("bwrap: failed to mount /home/test/private/path");
+    child.emit("close", 1, null);
+    const result = await promise;
+    expect(result.error).toBe("OS sandbox unavailable. Task execution blocked.");
+    expect(JSON.stringify(result)).not.toContain("/home/test/private/path");
+  });
+
   it("terminates a timed-out process", async () => {
     vi.useFakeTimers();
     const child = fakeChild();
     const adapter = createAgentAdapter(
         { id: "claude", name: "Claude", binary: CLAUDE_BINARY, args: (prompt) => ["-p", prompt] },
-      { timeoutMs: 10, spawnProcess: vi.fn(() => child) as never },
+      { timeoutMs: 10, unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
     );
     const promise = adapter.run("test");
     await vi.advanceTimersByTimeAsync(10);
@@ -243,6 +258,22 @@ describe("createAgentAdapter", () => {
     vi.useRealTimers();
   });
 
+  it("cleans up the sandbox process group on cancellation/disconnect and audits lifecycle events", async () => {
+    const child = fakeChild();
+    const spawnProcess = vi.fn(() => child);
+    const controller = new AbortController();
+    const audits: string[] = [];
+    const adapter = createAgentAdapter(
+      { id: "cursor", name: "Cursor", binary: "agent", args: (prompt) => ["-p", prompt] },
+      { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: spawnProcess as never },
+    );
+    const promise = adapter.run("review", { signal: controller.signal, onSandboxAudit: (event) => audits.push(event.type) });
+    controller.abort();
+    await expect(promise).resolves.toMatchObject({ status: "error", error: "Request was aborted" });
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    expect(audits).toEqual(["os_sandbox_created", "os_sandbox_process_cleanup"]);
+  });
+
   it("rejects a non-fixed launcher path", () => {
     expect(() => createAgentAdapter({ id: "codex", name: "Codex", binary: "/tmp/codex", args: (prompt) => [prompt] })).toThrow("Invalid fixed launcher");
   });
@@ -251,7 +282,7 @@ describe("createAgentAdapter", () => {
     const child = fakeChild();
     const adapter = createAgentAdapter(
       { id: "codex", name: "Codex", binary: "codex", args: (prompt) => ["exec", prompt] },
-      { spawnProcess: vi.fn(() => child) as never },
+      { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
     );
     const promise = adapter.run("test");
     child.stdout.write(Buffer.alloc(999_999, 97));

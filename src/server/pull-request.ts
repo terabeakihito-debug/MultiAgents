@@ -9,6 +9,7 @@ import { containsKnownSecret, redactKnownSecrets } from "./credential-resolver";
 import { validateRepository } from "./repositories";
 import { validationScript, validationTimeoutMs, type ValidationStep } from "../profiles/policy";
 import { acquireTaskLock, clearTaskLocksForTests, isTaskLocked, releaseTaskLock } from "./task-lock";
+import { assertOsSandboxAvailable, buildSandboxCommand, OsSandboxUnavailableError } from "./os-sandbox";
 import {
   MAX_UNTRACKED_FILE_BYTES,
   MAX_UNTRACKED_TOTAL_BYTES,
@@ -646,7 +647,27 @@ export async function checkTaskDependencies(task: RepoTask) {
 export async function runValidationCommand(task: RepoTask, script: ValidationScript, timeoutMs = VALIDATION_TIMEOUT_MS[script]) {
   const npm = npmInvocation(script);
   const envOverrides: NodeJS.ProcessEnv | undefined = script === "build" ? { NODE_ENV: "production" } : undefined;
-  await checkedProcess(npm.binary, npm.args, task.worktreePath, timeoutMs, envOverrides);
+  try {
+    await assertOsSandboxAvailable();
+    recordValidationSandboxAudit(task, "os_sandbox_created", "enforced");
+    await checkedProcess(npm.binary, npm.args, task.worktreePath, timeoutMs, envOverrides);
+  } catch (error) {
+    if (error instanceof OsSandboxUnavailableError) {
+      recordValidationSandboxAudit(task, "os_sandbox_failed", "blocked", error.failureCode);
+    } else if (error instanceof ProcessExecutionError && error.result.stderr.trim().startsWith("bwrap:")) {
+      recordValidationSandboxAudit(task, "os_sandbox_failed", "blocked", "sandbox_launch_failed");
+      recordTaskEvent(task, "os_sandbox_violation", "system", { status: "blocked", metadata: { sandboxProfile: "validation", capabilityClass: "validation", failureCode: "sandbox_launch_failed" } });
+      throw new OsSandboxUnavailableError("sandbox_launch_failed");
+    }
+    throw error;
+  } finally {
+    recordValidationSandboxAudit(task, "os_sandbox_process_cleanup", "cleaned");
+  }
+}
+
+function recordValidationSandboxAudit(task: RepoTask, type: Extract<import("./state-store").TaskEventType, "os_sandbox_created" | "os_sandbox_failed" | "os_sandbox_process_cleanup">, status: string, failureCode?: import("./os-sandbox").SandboxFailureCode) {
+  if (!task.id || getTask(task.id) !== task) return;
+  recordTaskEvent(task, type, "system", { status, metadata: { sandboxProfile: "validation", capabilityClass: "validation", failureCode } });
 }
 
 export function validateGitHubRemote(url: string): GitHubRemote {
@@ -792,11 +813,23 @@ export async function runServerGitMutation(cwd: string, args: readonly string[],
 }
 
 async function runFixedProcessWithEnv(binary: string, args: readonly string[], cwd: string, timeoutMs: number, envOverrides?: NodeJS.ProcessEnv, exactEnv?: NodeJS.ProcessEnv) {
+  const purpose: ChildProcessPurpose = binary === GIT_BINARY ? "git" : binary === GH_BINARY ? "github" : "validation";
+  let launchBinary = binary;
+  let launchArgs = [...args];
+  let launchCwd = cwd;
+  let launchEnv = exactEnv ?? buildChildProcessEnv({ purpose, overrides: envOverrides });
+  if (purpose === "validation") {
+    await assertOsSandboxAvailable();
+    const sandbox = buildSandboxCommand({ profile: "validation", cwd, command: { binary, args }, env: launchEnv });
+    launchBinary = sandbox.binary;
+    launchArgs = sandbox.args;
+    launchCwd = sandbox.cwd;
+    launchEnv = sandbox.env;
+  }
   return new Promise<FixedProcessResult>((resolve, reject) => {
-    const purpose: ChildProcessPurpose = binary === GIT_BINARY ? "git" : binary === GH_BINARY ? "github" : "validation";
-    const child = spawn(binary, [...args], {
-      cwd,
-      env: exactEnv ?? buildChildProcessEnv({ purpose, overrides: envOverrides }),
+    const child = spawn(launchBinary, launchArgs, {
+      cwd: launchCwd,
+      env: launchEnv,
       shell: false,
       detached: process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],

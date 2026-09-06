@@ -10,6 +10,7 @@ This is intentionally a small MVP. The browser calls Next.js server routes; only
 
 - WSL2 with Ubuntu 24.04 (or a compatible Linux environment)
 - Node.js 22.5 or newer and npm (the local state store uses the standard `node:sqlite` module)
+- bubblewrap at the fixed executable path `/usr/bin/bwrap`, with unprivileged user, mount, PID, and network namespaces available
 - Authenticated commands available on `PATH`:
   - `codex exec "..."`
   - `agent --trust --workspace <project-directory> -p "..."`
@@ -250,6 +251,56 @@ commit SHA and PR number act as idempotency barriers. Task snapshots and flow
 step updates use SQLite transactions.
 
 The server remains localhost-only and has no multi-user or remote-sync mode.
+
+## OS sandbox
+
+Phase 18 runs every Agent CLI and project validation command through the fixed
+`/usr/bin/bwrap` launcher with a server-built argument array (`shell: false`).
+Tasks and repository content cannot add bubblewrap flags. If bubblewrap is
+missing, non-executable, or the required user/mount/PID/network namespaces are
+unavailable, execution fails closed with `OS sandbox unavailable. Task
+execution blocked.` There is no production compatibility fallback.
+
+The sandbox exposes the Linux runtime read-only and mounts the selected project
+at `/project`. Review agents receive a read-only project. Codex implementation
+runs receive only the managed task worktree read/write; the base repository is
+mounted read-only solely to support linked-worktree Git metadata, and sibling
+repositories are absent. Validation receives the task worktree read/write only
+for normal test/build artifacts. Post-run Phase 17 fingerprints and Git
+mutation checks remain active as a second boundary.
+
+Each run gets `HOME=/home/runtime`, a private tmpfs `/tmp`, and a `/proc` mount
+for its private PID namespace. The server HOME, `~/.multiagents/state.db`, gh
+configuration, arbitrary user files, and host `/tmp` are not mounted. Symlinks
+inside a task cannot make an unmounted host target visible. Validation receives
+no GitHub or Agent credential files and runs with a separate network namespace,
+so external and localhost connections are denied.
+
+The sandbox clears the inherited environment and reconstructs a Linux-only
+`PATH`. It does not expose `/init`, `/run/WSL`, or `/mnt/c` through `/mnt/z`, and
+does not pass `WSL_INTEROP`. The gh executable is masked inside Agent and
+validation sandboxes; GitHub mutations remain server-state-machine operations
+outside them.
+
+CLI authentication is separated from general HOME. Codex receives only its
+read-only `auth.json`; Claude receives only `.credentials.json`; Cursor receives
+only its auth file. Histories, sessions, projects,
+plugins, rules, and arbitrary config directories are not mounted. Providers may
+change their private credential formats, so startup/runtime compatibility must
+be rechecked after CLI upgrades. MultiAgents never solves a provider
+compatibility issue by mounting the full host HOME.
+
+Agent providers still need their remote services. Phase 18 therefore leaves
+Agent traffic on the host network and reports it as `limited/provider-required`;
+there is no generic outbound proxy or enforceable provider-domain allowlist in
+this phase. This is the principal remaining network risk. Validation network
+denial is OS-enforced. Bubblewrap's PID namespace, `--die-with-parent`, a new
+session/process group, SIGTERM grace period, and SIGKILL fallback clean up
+descendants on completion, timeout, cancellation, and disconnected streams.
+
+Safe, path-free diagnostics are available from
+`GET /api/runtime/sandbox-status` and
+`GET /api/tasks/:id/sandbox-policy`; task details display the same summary.
 
 ## Project Profiles
 

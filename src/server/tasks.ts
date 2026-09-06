@@ -15,6 +15,7 @@ import { evaluateTaskNotifications } from "./notifications";
 import { redactKnownSecrets, redactKnownSecretsInValue } from "./credential-resolver";
 import type { RuntimePolicy, RuntimeViolation, RuntimeViolationRecord } from "../runtime/types";
 import { runtimeViolationMessage } from "./runtime-policy";
+import type { OsSandboxAudit } from "./os-sandbox";
 
 export const WORKTREE_ROOT = join(homedir(), "code", ".multiagents-worktrees");
 export const TASK_BRANCH_PATTERN = /^multiagents\/[0-9a-f-]{36}$/;
@@ -384,6 +385,19 @@ export function recordRuntimeAudit(task: RepoTask, type: Extract<TaskEventType, 
       policyClass: policy.policyClass,
       runtimePolicyVersion: policy.version,
       violationType,
+    },
+  });
+}
+
+export function recordOsSandboxAudit(task: RepoTask, event: OsSandboxAudit, stepId?: string) {
+  recordTaskEvent(task, event.type, event.provider ?? "system", {
+    stepId,
+    status: event.failureCode ?? (event.type === "os_sandbox_created" ? "enforced" : event.type === "os_sandbox_process_cleanup" ? "cleaned" : "blocked"),
+    metadata: {
+      agent: event.provider,
+      sandboxProfile: event.profile,
+      capabilityClass: event.capabilityClass,
+      failureCode: event.failureCode,
     },
   });
 }

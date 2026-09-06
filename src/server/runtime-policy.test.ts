@@ -37,7 +37,7 @@ describe("Phase 17 runtime capability policy", () => {
     const { task } = await fixture();
     const first = await buildTaskRuntimePolicies(task);
     const second = await buildTaskRuntimePolicies(task);
-    expect(first.codex).toMatchObject({ version: 1, role: "implement", allowWrite: true, writableRoot: task.worktreePath, filesystem: ["worktree_read", "worktree_write"], environmentPolicy: "agent" });
+    expect(first.codex).toMatchObject({ version: 2, role: "implement", allowWrite: true, writableRoot: task.worktreePath, filesystem: ["worktree_read", "worktree_write"], environmentPolicy: "agent", osSandboxProfile: "agent_implement" });
     expect(first.cursor).toMatchObject({ role: "review_only", allowWrite: false, filesystem: ["worktree_read"] });
     expect(first.claude).toMatchObject({ role: "review_only", allowWrite: false, filesystem: ["worktree_read"] });
     expect(Object.values(first).map((policy) => policy.policyHash)).toEqual(Object.values(second).map((policy) => policy.policyHash));
@@ -123,6 +123,24 @@ describe("Phase 17 runtime capability policy", () => {
     reloadTasksFromStoreForTests();
     const restored = await resumeTask(task.id, { allowedRoot, worktreeRoot });
     expect(restored).toMatchObject({ recoveryStatus: "needs_attention", runtimeViolation: { type: "unexpected_write" } });
+  });
+
+  it("persists only safe OS sandbox lifecycle metadata", async () => {
+    const { task } = await fixture();
+    const runtime = await prepareTaskRuntime(task);
+    const sandboxed: AgentAdapter = {
+      id: "cursor", name: "cursor",
+      run: async (_prompt, options) => {
+        options?.onSandboxAudit?.({ type: "os_sandbox_created", profile: "agent_read_only", provider: "cursor", capabilityClass: "repository_review" });
+        options?.onSandboxAudit?.({ type: "os_sandbox_process_cleanup", profile: "agent_read_only", provider: "cursor", capabilityClass: "repository_review" });
+        return { agent: "cursor", status: "completed", output: "done" };
+      },
+    };
+    await runtime.execute(sandboxed, "review", undefined, "cursor_review");
+    const events = getTaskHistory(task.id).events.filter((event) => event.type.startsWith("os_sandbox_"));
+    expect(events.map((event) => event.type)).toEqual(["os_sandbox_created", "os_sandbox_process_cleanup"]);
+    expect(events[0].metadata).toEqual({ agent: "cursor", sandboxProfile: "agent_read_only", capabilityClass: "repository_review" });
+    expect(JSON.stringify(events)).not.toContain(task.worktreePath);
   });
 
   it("detects base repository mutation by an implement agent", async () => {

@@ -1,10 +1,10 @@
 import type { AgentId } from "../agents/types";
 import type { AgentRole } from "../profiles/policy";
 
-export const RUNTIME_POLICY_VERSION = 1 as const;
+export const RUNTIME_POLICY_VERSION = 2 as const;
 
 export type RuntimeFilesystemCapability = "repo_read" | "worktree_read" | "worktree_write";
-export type RuntimeNetworkPolicy = "cli_managed";
+export type RuntimeNetworkPolicy = "provider_required";
 export type RuntimeExecutionCapability = "agent_cli";
 export type RuntimePolicyClass = "repository_implementation" | "repository_review" | "generic_read_only" | "disabled";
 export type RuntimeViolation =
@@ -23,13 +23,16 @@ export type RuntimePolicy = {
   policyClass: RuntimePolicyClass;
   filesystem: RuntimeFilesystemCapability[];
   networkPolicy: RuntimeNetworkPolicy;
-  networkEnforcement: "not_guaranteed_by_multiagents";
+  networkEnforcement: "host_network_residual_risk";
+  osSandboxProfile: import("../server/os-sandbox").OsSandboxProfile;
   execution: RuntimeExecutionCapability[];
   allowWrite: boolean;
   /** Server-private validated realpath. Never serialize this field. */
   workingRoot: string;
   /** Server-private validated realpath. Never serialize this field. */
   writableRoot?: string;
+  /** Server-private read-only Git metadata/content mount. Never serialize this field. */
+  baseRepoRoot?: string;
   environmentPolicy: "agent";
   forbiddenOperations: string[];
   sourceProfileId?: string;
@@ -40,7 +43,7 @@ export type RuntimePolicy = {
   policyHash: string;
 };
 
-export type PublicRuntimePolicy = Omit<RuntimePolicy, "workingRoot" | "writableRoot" | "forbiddenOperations"> & {
+export type PublicRuntimePolicy = Omit<RuntimePolicy, "workingRoot" | "writableRoot" | "baseRepoRoot" | "forbiddenOperations"> & {
   writeScope: "task_worktree_only" | "denied";
   forbiddenOperations: string[];
 };

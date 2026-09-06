@@ -56,6 +56,7 @@ export const taskEventTypes = [
   "profile_snapshot_created", "template_snapshot_created",
   "finding_created", "finding_status_changed", "finding_converted", "implementation_task_created",
   "runtime_policy_created", "runtime_execution_started", "runtime_execution_completed", "runtime_violation_detected",
+  "os_sandbox_created", "os_sandbox_failed", "os_sandbox_violation", "os_sandbox_process_cleanup",
   "human_gate_rejected", "approval_snapshot_mismatch", "post_commit_verification_failed",
 ] as const;
 export type TaskEventType = (typeof taskEventTypes)[number];
@@ -79,6 +80,9 @@ export type TaskEventMetadata = Partial<{
   policyClass: RuntimePolicyClass;
   runtimePolicyVersion: number;
   violationType: RuntimeViolation;
+  sandboxProfile: import("./os-sandbox").OsSandboxProfile;
+  capabilityClass: string;
+  failureCode: import("./os-sandbox").SandboxFailureCode;
 }>;
 export type TaskEvent = {
   id: string;
@@ -1403,7 +1407,7 @@ function storedTaskTemplate(row: TaskRow, payload: Record<string, unknown>, prof
     return { template: fallback, valid: false };
   }
 }
-const metadataKeys = new Set(["durationMs", "diffHash", "commitSha", "prNumber", "changedFileCount", "additions", "deletions", "profileId", "profileVersion", "templateId", "templateVersion", "findingId", "sourceTaskId", "agent", "role", "policyClass", "runtimePolicyVersion", "violationType"]);
+const metadataKeys = new Set(["durationMs", "diffHash", "commitSha", "prNumber", "changedFileCount", "additions", "deletions", "profileId", "profileVersion", "templateId", "templateVersion", "findingId", "sourceTaskId", "agent", "role", "policyClass", "runtimePolicyVersion", "violationType", "sandboxProfile", "capabilityClass", "failureCode"]);
 function validateMetadata(value: TaskEventMetadata | undefined) {
   if (!value) return undefined;
   for (const [key, item] of Object.entries(value)) {
@@ -1423,6 +1427,9 @@ function validateMetadata(value: TaskEventMetadata | undefined) {
     if (key === "policyClass" && !["repository_implementation", "repository_review", "generic_read_only", "disabled"].includes(String(item))) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
     if (key === "runtimePolicyVersion" && (typeof item !== "number" || !Number.isSafeInteger(item) || item < 1)) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
     if (key === "violationType" && !["unexpected_write", "head_changed", "branch_changed", "base_repo_changed", "worktree_escape", "unexpected_worktree", "forbidden_runtime_configuration"].includes(String(item))) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
+    if (key === "sandboxProfile" && !["agent_read_only", "agent_implement", "validation"].includes(String(item))) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
+    if (key === "capabilityClass" && !["repository_implementation", "repository_review", "generic_read_only", "disabled", "validation"].includes(String(item))) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
+    if (key === "failureCode" && !["backend_missing", "backend_not_executable", "namespace_unsupported", "invalid_sandbox_configuration", "sandbox_launch_failed"].includes(String(item))) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
   }
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as TaskEventMetadata;
 }

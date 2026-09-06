@@ -1,7 +1,7 @@
 import type { AgentAdapter, AgentId, AgentResult } from "../agents/types";
 import type { RuntimePolicy } from "../runtime/types";
 import { buildTaskRuntimePolicies, runTaskAgentWithPolicy } from "./runtime-policy";
-import { markRuntimeViolation, recordRuntimeAudit, type RepoTask } from "./tasks";
+import { markRuntimeViolation, recordOsSandboxAudit, recordRuntimeAudit, type RepoTask } from "./tasks";
 
 export async function prepareTaskRuntime(task: RepoTask) {
   const policies = await buildTaskRuntimePolicies(task);
@@ -21,6 +21,7 @@ export async function prepareTaskRuntime(task: RepoTask) {
         task, adapter, policy, prompt, signal, stepId,
         onAudit: (type, activePolicy, violation) => recordRuntimeAudit(task, type, activePolicy, stepId, violation),
         onViolation: (activePolicy, violation) => markRuntimeViolation(task, activePolicy, violation),
+        onSandboxAudit: (event) => recordOsSandboxAudit(task, event, stepId),
       });
   }
 }

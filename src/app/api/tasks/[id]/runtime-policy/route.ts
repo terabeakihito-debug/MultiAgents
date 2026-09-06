@@ -2,6 +2,7 @@ import { buildTaskRuntimePolicies, publicRuntimePolicy } from "@/server/runtime-
 import { getTask, initializeTaskRecovery, requireTaskTemplate } from "@/server/tasks";
 import { rejectNonLocalRequest } from "@/server/request-security";
 import { RUNTIME_POLICY_VERSION } from "@/runtime/types";
+import { publicOsSandboxPolicy } from "@/server/os-sandbox";
 
 export const runtime = "nodejs";
 
@@ -19,7 +20,12 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
       taskType: template.taskType,
       allAgentsReadOnly: template.readOnly,
       worktreeRequired: template.requireWorktree,
-      networkEnforcementDescription: "Network access is CLI-managed; enforcement is not guaranteed by MultiAgents.",
+      networkEnforcementDescription: "Validation network is denied by an OS namespace. Agent network remains provider-required residual risk.",
+      osSandbox: {
+        status: "enforced",
+        validation: publicOsSandboxPolicy("validation"),
+        agents: Object.values(policies).filter((policy) => policy.role !== "disabled").map((policy) => ({ agent: policy.agent, ...publicOsSandboxPolicy(policy.osSandboxProfile) })),
+      },
       policies: Object.values(policies).map(publicRuntimePolicy),
     });
   } catch (error) {
