@@ -135,7 +135,7 @@ describe("Phase 14 notification persistence and security", () => {
   it("migrates an existing v6 database to v7 without losing tasks", async () => {
     const root = await mkdtemp(join(tmpdir(), "multiagents-v6-")); const path = join(root, "state.db");
     const initial = new StateStore(path); initial.saveTask(task()); initial.close();
-    const raw = new DatabaseSync(path); raw.exec("DROP TABLE outbound_audit_events; DROP TABLE notification_deliveries; DROP TABLE outbound_channel_settings; DROP TABLE notification_audit_events; DROP TABLE watch_rule_state; DROP TABLE notification_preferences; DROP TABLE notifications; DELETE FROM schema_version WHERE version >= 7;"); raw.close();
+    const raw = new DatabaseSync(path); raw.exec("DROP TABLE credential_audit_events; DROP TABLE outbound_audit_events; DROP TABLE notification_deliveries; DROP TABLE outbound_channel_settings; DROP TABLE notification_audit_events; DROP TABLE watch_rule_state; DROP TABLE notification_preferences; DROP TABLE notifications; DELETE FROM schema_version WHERE version >= 7;"); raw.close();
     const migrated = new StateStore(path);
     expect(migrated.schemaVersion()).toBe(SCHEMA_VERSION); expect(migrated.loadTasks()).toHaveLength(1); expect(migrated.loadNotificationPreferences()).toEqual(defaultNotificationPreferences);
     migrated.close();

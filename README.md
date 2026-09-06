@@ -462,11 +462,14 @@ Critical findings, high findings, Needs Attention, PR changes requested, failed
 required CI, and Ready for Human Merge are enabled by default. Ready for
 Approval, inactive tasks, orphaned worktrees, and invalidated approvals default
 to suppressed. Preferences and a display-only channel label are stored in
-SQLite. The webhook secret is read only from
-`MULTIAGENTS_SLACK_WEBHOOK_URL`; it is never saved in SQLite, returned by an
-API, rendered in the UI, or written to application/audit logs. The adapter
-accepts only HTTPS `hooks.slack.com/services/...` URLs, preventing the setting
-from becoming an SSRF primitive. The UI never accepts a webhook URL.
+SQLite. The Slack adapter requests the `slack_outbound` capability from the
+server-only Credential Resolver and never reads an environment variable
+directly. The resolver's fixed server registry maps that capability to the
+`MULTIAGENTS_SLACK_WEBHOOK_URL` environment source. The secret is never saved
+in SQLite, returned by an API, rendered in the UI, or written to
+application/audit logs. The adapter still accepts only HTTPS
+`hooks.slack.com/services/...` URLs, preventing the credential from becoming an
+SSRF primitive. The UI never accepts a webhook URL.
 
 `notification_deliveries` stores only notification ID, channel, status,
 attempt/delivery timestamps, and a bounded error code. Its composite primary
@@ -483,6 +486,31 @@ alerts. **Send test notification** is also human-only and sends exactly a fixed,
 context-free test string. Settings updates, test sends, and retry actions are
 blocked while an agent process is running. Audit rows record only notification
 ID, `slack`, status, event type, and timestamp.
+
+## Credential isolation
+
+Phase 16 routes server-owned credentials through a server-only Credential
+Resolver with a fixed capability allowlist. `slack_outbound`, `github_cli`,
+`agent_codex`, `agent_cursor`, and `agent_claude` are separate capabilities;
+the Slack adapter can request only `slack_outbound`. Environment is the only
+implemented secret-value source. OS credential stores are reserved for a
+future phase, and environment secret changes require a server restart.
+
+GitHub CLI, Codex, Cursor, and Claude authentication remains externally managed
+by each CLI. MultiAgents does not invoke token-export commands, extract those
+credentials, or persist them. The Credentials security panel and
+`GET /api/credentials/status` expose only capability, configured status, and
+source category. There is no reveal, copy, download, or edit path, and no
+credential-value column exists in SQLite. Credential audit rows contain only
+event type, capability, status, and timestamp.
+
+Agent, validation, Git, and GitHub child processes receive a purpose-specific
+allowlisted environment. `HOME`, `PATH`, locale, temporary-directory, and the
+minimum filesystem-backed CLI configuration paths are retained for CLI
+compatibility. MultiAgents-owned registry variables and names matching API
+keys, tokens, secrets, passwords, or Authorization are always removed. Known
+server-owned values are also redacted from captured output and rejected by the
+pre-PR secret scan without placing the value in a finding.
 
 ## Verification
 
@@ -509,7 +537,7 @@ Tests mock process spawning and never invoke the real AI CLIs.
 
 - Prompts are passed as a single argument using `spawn(binary, args, { shell: false })`; they are never concatenated into a shell command.
 - The executable names and fixed arguments are defined server-side in agent adapters.
-- The Claude adapter resolves its binary as `~/.local/bin/claude` from `HOME` (falling back to the operating system home directory); it otherwise inherits the server process environment, including `PATH`.
+- The Claude adapter resolves its binary as `~/.local/bin/claude` from `HOME` (falling back to the operating system home directory); all agents receive the purpose-specific credential-safe environment allowlist.
 - Prompts are required and limited to 20,000 characters; CLI execution is limited to 120 seconds and captured output to 1 MB per stream.
 - The complete review flow is limited to five minutes. Each prior output is capped at 30,000 characters when embedded into a later prompt, with Unicode-safe truncation markers.
 - The JSON review endpoint, step-event stream endpoint, and rerun stream endpoint enforce the same localhost Host/Origin checks. CORS is not enabled, and neither prompts nor agent outputs are written to application event logs.
@@ -533,4 +561,5 @@ agent conversations, agent-selected or recursive handoffs, automatic retry
 loops, merges, remote cloning, recursive repository
 discovery, full diff-body history, event editing/deletion, long-term memory, token/cost
 tracking, token-level streaming, production deployment, and Docker are not
-implemented.
+implemented. Windows Credential Manager, Linux Secret Service, Vault, and cloud
+secret-manager integrations are also not implemented.

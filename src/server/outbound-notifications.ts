@@ -9,6 +9,7 @@ import {
 } from "../outbound/types";
 import { getStateStore } from "./state-store";
 import { sendSlackNotification, sendSlackTestNotification, slackWebhookConfigured, type SlackDeliveryResult } from "./slack-adapter";
+import { auditCredentialResolutionFailure } from "./credential-status";
 
 const policyField: Record<NotificationType, keyof OutboundChannelConfig> = {
   finding_critical_created: "sendCriticalFindings",
@@ -75,6 +76,7 @@ export async function dispatchOutboundNotification(notificationId: string, depen
   const allowed = config.enabled && config[policyField[notification.type]] === true;
   const configured = dependencies.configured ?? (process.env.NODE_ENV === "test" ? false : slackWebhookConfigured());
   if (!allowed || !configured) {
+    if (allowed && dependencies.configured === undefined) auditCredentialResolutionFailure("slack_outbound");
     store.reserveNotificationDelivery(notificationId, "suppressed", allowed ? "not_configured" : "policy_suppressed");
     return store.loadNotificationDelivery(notificationId)!;
   }
@@ -88,13 +90,19 @@ export async function retryOutboundNotification(notificationId: string, dependen
   if (!notification) throw new OutboundInputError("Notification not found");
   const config = store.loadOutboundChannelConfig();
   if (!config.enabled || config[policyField[notification.type]] !== true) throw new OutboundInputError("Slack delivery is disabled by outbound policy");
-  if (!(dependencies.configured ?? slackWebhookConfigured())) throw new OutboundInputError("Slack is not configured");
+  if (!(dependencies.configured ?? slackWebhookConfigured())) {
+    if (dependencies.configured === undefined) auditCredentialResolutionFailure("slack_outbound");
+    throw new OutboundInputError("Slack credential is not configured.");
+  }
   if (!store.beginNotificationDeliveryRetry(notificationId)) throw new OutboundInputError("Only a failed Slack delivery can be retried");
   return attemptDelivery(notification, dependencies.send ?? sendSlackNotification, true);
 }
 
 export async function sendFixedSlackTest(dependencies: { send?: () => Promise<SlackDeliveryResult>; configured?: boolean } = {}) {
-  if (!(dependencies.configured ?? slackWebhookConfigured())) throw new OutboundInputError("Slack is not configured");
+  if (!(dependencies.configured ?? slackWebhookConfigured())) {
+    if (dependencies.configured === undefined) auditCredentialResolutionFailure("slack_outbound");
+    throw new OutboundInputError("Slack credential is not configured.");
+  }
   const auditId = randomUUID();
   const store = getStateStore();
   store.appendOutboundAudit("outbound_delivery_attempted", auditId, "pending");

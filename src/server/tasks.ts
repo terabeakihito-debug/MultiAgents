@@ -12,6 +12,7 @@ import { getOrCreateRepoProfile, requireUsableTaskProfile, taskProfileSnapshot }
 import { selectTaskTemplate } from "./task-templates";
 import { builtInTemplate, mergeTemplateWithProfile, parseTemplateSnapshot, taskExecutionPrompt, type TaskTemplateSnapshot } from "../templates/policy";
 import { evaluateTaskNotifications } from "./notifications";
+import { redactKnownSecrets, redactKnownSecretsInValue } from "./credential-resolver";
 
 export const WORKTREE_ROOT = join(homedir(), "code", ".multiagents-worktrees");
 export const TASK_BRANCH_PATTERN = /^multiagents\/[0-9a-f-]{36}$/;
@@ -317,7 +318,7 @@ export function registerRecoveredTask(task: RepoTask) {
 }
 
 export function publicTask(task: RepoTask) {
-  return {
+  return redactKnownSecretsInValue({
     id: task.id,
     repoId: task.repoId,
     repoName: task.repoName,
@@ -353,7 +354,7 @@ export function publicTask(task: RepoTask) {
     template: task.template ?? mergeTemplateWithProfile(builtInTemplate(task.repoId, "bug_fix"), task.profile ?? safeDefaultSnapshot(task.repoId)),
     sourceFindingId: task.sourceFindingId,
     sourceTaskId: task.sourceTaskId,
-  };
+  });
 }
 
 export function persistTask(task: RepoTask) {
@@ -361,7 +362,7 @@ export function persistTask(task: RepoTask) {
   evaluateTaskNotifications(task);
 }
 
-export function getTaskHistory(taskId: string): TaskHistory { return getStateStore().loadTaskHistory(taskId); }
+export function getTaskHistory(taskId: string): TaskHistory { return redactKnownSecretsInValue(getStateStore().loadTaskHistory(taskId)); }
 
 export function recordTaskEvent(task: RepoTask, type: TaskEventType, actor: TaskEventActor, input: { createdAt?: string; stepId?: string; status?: string; metadata?: TaskEventMetadata } = {}) {
   return getStateStore().appendTaskEvent(task.id, { type, actor, ...input });
@@ -501,7 +502,7 @@ export async function getTaskDiff(task: RepoTask): Promise<TaskDiff> {
       sections.push(`diff --git a/${name} b/${name}\nnew file mode ${info.mode & 0o111 ? "100755" : "100644"}\n--- /dev/null\n+++ b/${name}\n@@ untracked file @@\n${lines}${limited ? "\n[untracked file truncated]" : ""}`);
     } finally { await handle.close(); }
   }
-  return {
+  return redactKnownSecretsInValue({
     trackedFiles,
     untrackedFiles,
     stat: statOutput,
@@ -510,7 +511,7 @@ export async function getTaskDiff(task: RepoTask): Promise<TaskDiff> {
     truncated,
     approvable: !blockedReason,
     blockedReason,
-  };
+  });
 }
 
 export async function deleteTask(id: string, input: { confirmedPrCleanup?: boolean } = {}) {
@@ -736,7 +737,7 @@ export function requireTaskTemplate(task: RepoTask): TaskTemplateSnapshot {
 }
 
 export function executionPromptForTask(task: RepoTask, prompt: string) {
-  return taskExecutionPrompt(requireTaskTemplate(task), prompt);
+  return taskExecutionPrompt(requireTaskTemplate(task), redactKnownSecrets(prompt));
 }
 
 export function executionRootForTask(task: RepoTask) {

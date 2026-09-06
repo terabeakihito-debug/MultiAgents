@@ -1,14 +1,14 @@
 import type { SanitizedOutboundNotification } from "../outbound/types";
+import { CredentialAccessError, credentialResolver, type CredentialResolver } from "./credential-resolver";
 
-export const SLACK_WEBHOOK_ENV = "MULTIAGENTS_SLACK_WEBHOOK_URL";
 export const SLACK_TIMEOUT_MS = 10_000;
 export const SLACK_TEST_TEXT = "MultiAgents test notification.\nExternal Slack notifications are configured.";
 
 export type SlackDeliveryResult = { delivered: true } | { delivered: false; errorCode: string };
-type SlackDependencies = { fetchImpl?: typeof fetch; timeoutMs?: number; webhookUrl?: string };
+type SlackDependencies = { fetchImpl?: typeof fetch; timeoutMs?: number; resolver?: CredentialResolver };
 
-export function slackWebhookConfigured(value = process.env[SLACK_WEBHOOK_ENV]) {
-  return validSlackWebhookUrl(value) !== undefined;
+export function slackWebhookConfigured(resolver: CredentialResolver = credentialResolver) {
+  return resolver.status("slack_outbound").status === "configured";
 }
 
 export async function sendSlackNotification(payload: SanitizedOutboundNotification, dependencies: SlackDependencies = {}): Promise<SlackDeliveryResult> {
@@ -28,22 +28,29 @@ function formatSlackNotification(payload: SanitizedOutboundNotification) {
 }
 
 async function postSlackText(text: string, dependencies: SlackDependencies): Promise<SlackDeliveryResult> {
-  const webhookUrl = validSlackWebhookUrl(dependencies.webhookUrl ?? process.env[SLACK_WEBHOOK_ENV]);
-  if (!webhookUrl) return { delivered: false, errorCode: "not_configured" };
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), dependencies.timeoutMs ?? SLACK_TIMEOUT_MS);
   try {
-    const response = await (dependencies.fetchImpl ?? fetch)(webhookUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
-      signal: controller.signal,
+    return await (dependencies.resolver ?? credentialResolver).withCredential("slack_outbound", async (credential) => {
+      const webhookUrl = validSlackWebhookUrl(credential.revealForCapability("slack_outbound"));
+      if (!webhookUrl) return { delivered: false, errorCode: "invalid_credential" };
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), dependencies.timeoutMs ?? SLACK_TIMEOUT_MS);
+      try {
+        const response = await (dependencies.fetchImpl ?? fetch)(webhookUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text }),
+          signal: controller.signal,
+        });
+        return response.ok ? { delivered: true } : { delivered: false, errorCode: `http_${response.status}` };
+      } catch (error) {
+        return { delivered: false, errorCode: isAbortError(error, controller.signal) ? "timeout" : "network_error" };
+      } finally {
+        clearTimeout(timer);
+      }
     });
-    return response.ok ? { delivered: true } : { delivered: false, errorCode: `http_${response.status}` };
   } catch (error) {
-    return { delivered: false, errorCode: isAbortError(error, controller.signal) ? "timeout" : "network_error" };
-  } finally {
-    clearTimeout(timer);
+    if (error instanceof CredentialAccessError) return { delivered: false, errorCode: "not_configured" };
+    return { delivered: false, errorCode: "credential_unavailable" };
   }
 }
 

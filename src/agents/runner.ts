@@ -2,6 +2,8 @@ import { spawn, type SpawnOptions } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import type { AgentAdapter, AgentDefinition, AgentResult } from "./types";
 import { beginAgentExecution } from "../server/agent-execution-guard";
+import { buildChildProcessEnv } from "../server/child-process-env";
+import { redactKnownSecrets } from "../server/credential-resolver";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_OUTPUT_BYTES = 1_000_000;
@@ -13,7 +15,7 @@ export function createAgentAdapter(
   definition: AgentDefinition,
   options: {
     cwd?: string;
-    env?: NodeJS.ProcessEnv;
+    env?: Readonly<Record<string, string | undefined>>;
     timeoutMs?: number;
     spawnProcess?: SpawnLike;
   } = {},
@@ -28,7 +30,7 @@ export function createAgentAdapter(
 function runProcess(
   definition: AgentDefinition,
   prompt: string,
-  options: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number; spawnProcess?: SpawnLike },
+  options: { cwd?: string; env?: Readonly<Record<string, string | undefined>>; timeoutMs?: number; spawnProcess?: SpawnLike },
   runOptions?: { signal?: AbortSignal; cwd?: string; writeAccess?: boolean },
 ): Promise<AgentResult> {
   return new Promise((resolve) => {
@@ -37,7 +39,7 @@ function runProcess(
     const cwd = runOptions?.cwd ?? options.cwd ?? process.cwd();
     const spawnOptions: SpawnOptions = {
       cwd,
-      env: options.env ?? process.env,
+      env: buildChildProcessEnv({ purpose: "agent", baseEnv: options.env ?? process.env }),
       shell: false,
       detached: process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],
@@ -48,7 +50,8 @@ function runProcess(
     try {
       // A per-run cwd is supplied only after a server-side repository task lookup.
       // It is intentionally a boolean capability, not a client-selectable sandbox value.
-      child = spawnProcess(definition.binary, definition.args(prompt, cwd, Boolean(runOptions?.cwd), runOptions?.writeAccess ?? Boolean(runOptions?.cwd)), spawnOptions);
+      const safePrompt = redactKnownSecrets(prompt);
+      child = spawnProcess(definition.binary, definition.args(safePrompt, cwd, Boolean(runOptions?.cwd), runOptions?.writeAccess ?? Boolean(runOptions?.cwd)), spawnOptions);
       endAgentExecution = beginAgentExecution();
     } catch (error) {
       resolve(errorResult(definition.id, error));
@@ -79,7 +82,7 @@ function runProcess(
     child.on("close", (code, signal) => {
       if (forceKillTimer) clearTimeout(forceKillTimer);
       if (code === 0) {
-        finish({ agent: definition.id, status: "completed", output: stdout.value().trim() });
+        finish({ agent: definition.id, status: "completed", output: redactKnownSecrets(stdout.value()).trim() });
         return;
       }
       const exit = `Process exited with code ${code ?? "unknown"}${signal ? ` (${signal})` : ""}`;
@@ -87,8 +90,8 @@ function runProcess(
       finish({
         agent: definition.id,
         status: "error",
-        output: stdout.value().trim(),
-        error: diagnostic ? `${exit}: ${diagnostic}` : exit,
+        output: redactKnownSecrets(stdout.value()).trim(),
+        error: diagnostic ? `${exit}: ${redactKnownSecrets(diagnostic)}` : exit,
       });
     });
 
@@ -114,7 +117,7 @@ function runProcess(
 
     const abort = () => {
       terminate();
-      finish({ agent: definition.id, status: "error", output: stdout.value().trim(), error: "Request was aborted" });
+      finish({ agent: definition.id, status: "error", output: redactKnownSecrets(stdout.value()).trim(), error: "Request was aborted" });
     };
     signal?.addEventListener("abort", abort, { once: true });
 
@@ -123,7 +126,7 @@ function runProcess(
       finish({
         agent: definition.id,
         status: "error",
-        output: stdout.value().trim(),
+        output: redactKnownSecrets(stdout.value()).trim(),
         error: `Process timed out after ${options.timeoutMs ?? DEFAULT_TIMEOUT_MS} ms`,
       });
     }, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
@@ -165,6 +168,6 @@ function errorResult(agent: AgentDefinition["id"], error: unknown): AgentResult 
     agent,
     status: "error",
     output: "",
-    error: error instanceof Error ? error.message : "Failed to start process",
+    error: error instanceof Error ? redactKnownSecrets(error.message) : "Failed to start process",
   };
 }

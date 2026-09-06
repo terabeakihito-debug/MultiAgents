@@ -148,6 +148,26 @@ describe("Phase 5 approval and PR state machine", () => {
     expect(await scanSecrets(await createDiffSnapshot(task))).toEqual([]);
   });
 
+  it("blocks an exact registered server credential without placing its value in findings", async () => {
+    const fixture = [
+     "https://hooks.slack.com/services",
+     "TEST_SECRET_DO_NOT_LEAK",
+     "CHANNEL",
+     "VALUE",
+    ].join("/");
+    const previous = process.env.MULTIAGENTS_SLACK_WEBHOOK_URL;
+    process.env.MULTIAGENTS_SLACK_WEBHOOK_URL = fixture;
+    try {
+      const { task, input } = await readyTask({ path: "notes.txt", content: `accidental: ${fixture}\n` });
+      await expect(approveAndCreatePullRequest(task.id, input, successfulDependencies())).rejects.toThrow("Secret scan");
+      expect(task.secretFindings).toContainEqual({ path: "notes.txt", kind: "content", rule: "MultiAgents managed credential" });
+      expect(JSON.stringify(task.secretFindings)).not.toContain(fixture);
+    } finally {
+      if (previous === undefined) delete process.env.MULTIAGENTS_SLACK_WEBHOOK_URL;
+      else process.env.MULTIAGENTS_SLACK_WEBHOOK_URL = previous;
+    }
+  });
+
   it("serializes approval processing with a server-side task lock", async () => {
     const { task, input } = await readyTask({ path: "package.json", content: JSON.stringify({ scripts: { test: "true" } }) });
     let release!: () => void;

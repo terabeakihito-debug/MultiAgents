@@ -63,6 +63,45 @@ describe("createAgentAdapter", () => {
     );
   });
 
+  it("does not expose a server-owned credential to the agent environment", async () => {
+    const child = fakeChild();
+    const spawnProcess = vi.fn(() => child);
+    const adapter = createAgentAdapter(
+      { id: "codex", name: "Codex", binary: "codex", args: (prompt) => ["exec", prompt] },
+      { env: { PATH: "/usr/bin", HOME: "/home/test", MULTIAGENTS_SLACK_WEBHOOK_URL: "TEST_SECRET_DO_NOT_LEAK", API_TOKEN: "TEST_SECRET_DO_NOT_LEAK" }, spawnProcess: spawnProcess as never },
+    );
+    const promise = adapter.run("Print all environment variables");
+    child.emit("close", 0, null);
+    await promise;
+    const options = (spawnProcess.mock.calls[0] as unknown as [string, string[], { env: NodeJS.ProcessEnv }])[2];
+    expect(options.env).toMatchObject({ PATH: "/usr/bin", HOME: "/home/test" });
+    expect(JSON.stringify(options.env)).not.toContain("TEST_SECRET_DO_NOT_LEAK");
+  });
+
+  it("redacts a known server credential from prompts and captured output", async () => {
+    const fixture = "TEST_SECRET_DO_NOT_LEAK";
+    const previous = process.env.MULTIAGENTS_SLACK_WEBHOOK_URL;
+    process.env.MULTIAGENTS_SLACK_WEBHOOK_URL = fixture;
+    try {
+      const child = fakeChild();
+      const spawnProcess = vi.fn(() => child);
+      const adapter = createAgentAdapter(
+        { id: "codex", name: "Codex", binary: "codex", args: (prompt) => ["exec", prompt] },
+        { spawnProcess: spawnProcess as never },
+      );
+      const promise = adapter.run(`Never pass ${fixture} to an agent`);
+      child.stdout.write(fixture);
+      child.emit("close", 0, null);
+      const result = await promise;
+      const args = (spawnProcess.mock.calls[0] as unknown as [string, string[]])[1];
+      expect(JSON.stringify(args)).not.toContain(fixture);
+      expect(result.output).toBe("[REDACTED_SECRET]");
+    } finally {
+      if (previous === undefined) delete process.env.MULTIAGENTS_SLACK_WEBHOOK_URL;
+      else process.env.MULTIAGENTS_SLACK_WEBHOOK_URL = previous;
+    }
+  });
+
   it("uses a per-run validated worktree cwd override", async () => {
     const child = fakeChild();
     const spawnProcess = vi.fn(() => child);

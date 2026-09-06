@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppNotification, NotificationSeverity, NotificationType } from "../notifications/types";
 import { defaultOutboundChannelConfig } from "../outbound/types";
 import { beginAgentExecution } from "./agent-execution-guard";
+import { createCredentialResolver } from "./credential-resolver";
 import {
   dispatchOutboundNotification,
   parseOutboundChannelConfig,
@@ -18,12 +19,16 @@ import { sendSlackNotification, sendSlackTestNotification, SLACK_TEST_TEXT } fro
 import { SCHEMA_VERSION, StateStore, replaceStateStoreForTests } from "./state-store";
 
 let store: StateStore;
+
 const webhookUrl = [
   "https://hooks.slack.com/services",
   "T00000000",
   "B00000000",
   "TEST_ONLY_NOT_A_SECRET",
 ].join("/");
+
+
+const resolverFor = (value = webhookUrl) => createCredentialResolver({ MULTIAGENTS_SLACK_WEBHOOK_URL: value });
 
 beforeEach(() => { store = new StateStore(":memory:"); replaceStateStoreForTests(store); });
 afterEach(() => { replaceStateStoreForTests(new StateStore(":memory:")); });
@@ -87,7 +92,7 @@ describe("Phase 15A Slack adapter", () => {
   it("treats 2xx as delivered and sends only the sanitized text body", async () => {
     const calls: RequestInit[] = [];
     const fetchImpl: typeof fetch = async (_input, init) => { calls.push(init ?? {}); return new Response("ok", { status: 200 }); };
-    const result = await sendSlackNotification(sanitizeOutboundNotification(create("task_needs_attention", "warning")), { webhookUrl, fetchImpl });
+    const result = await sendSlackNotification(sanitizeOutboundNotification(create("task_needs_attention", "warning")), { resolver: resolverFor(), fetchImpl });
     expect(result).toEqual({ delivered: true });
     const body = String(calls[0].body);
     expect(body).toContain("Open MultiAgents locally for details.");
@@ -97,7 +102,7 @@ describe("Phase 15A Slack adapter", () => {
   it("treats non-2xx as failed and never persists the response body", async () => {
     const notification = create("ci_failed");
     const fetchImpl = vi.fn(async () => new Response("credential=RESPONSE_BODY_SECRET", { status: 500 }));
-    const send = (payload: Parameters<typeof sendSlackNotification>[0]) => sendSlackNotification(payload, { webhookUrl, fetchImpl });
+    const send = (payload: Parameters<typeof sendSlackNotification>[0]) => sendSlackNotification(payload, { resolver: resolverFor(), fetchImpl });
     const delivery = await dispatchOutboundNotification(notification.notificationId, { configured: true, send });
     expect(delivery).toMatchObject({ status: "failed", errorCode: "http_500" });
     expect(JSON.stringify([delivery, store.loadOutboundAuditEvents()])).not.toContain("RESPONSE_BODY_SECRET");
@@ -107,20 +112,20 @@ describe("Phase 15A Slack adapter", () => {
     const fetchImpl = vi.fn((_url: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
       init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
     }));
-    expect(await sendSlackNotification(sanitizeOutboundNotification(create("ci_failed")), { webhookUrl, fetchImpl: fetchImpl as typeof fetch, timeoutMs: 5 })).toEqual({ delivered: false, errorCode: "timeout" });
+    expect(await sendSlackNotification(sanitizeOutboundNotification(create("ci_failed")), { resolver: resolverFor(), fetchImpl: fetchImpl as typeof fetch, timeoutMs: 5 })).toEqual({ delivered: false, errorCode: "timeout" });
   });
 
   it("rejects arbitrary and non-Slack webhook hosts before fetch", async () => {
     const fetchImpl = vi.fn(async () => new Response("ok"));
-    const result = await sendSlackNotification(sanitizeOutboundNotification(create("ci_failed")), { webhookUrl: "http://127.0.0.1/internal", fetchImpl });
-    expect(result).toEqual({ delivered: false, errorCode: "not_configured" });
+    const result = await sendSlackNotification(sanitizeOutboundNotification(create("ci_failed")), { resolver: resolverFor("http://127.0.0.1/internal"), fetchImpl });
+    expect(result).toEqual({ delivered: false, errorCode: "invalid_credential" });
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it("uses an immutable, context-free test notification", async () => {
     const calls: RequestInit[] = [];
     const fetchImpl: typeof fetch = async (_input, init) => { calls.push(init ?? {}); return new Response("ok"); };
-    expect(await sendSlackTestNotification({ webhookUrl, fetchImpl })).toEqual({ delivered: true });
+    expect(await sendSlackTestNotification({ resolver: resolverFor(), fetchImpl })).toEqual({ delivered: true });
     const body = String(calls[0].body);
     expect(JSON.parse(body)).toEqual({ text: SLACK_TEST_TEXT });
     for (const forbidden of ["prompt", "repository", "credential", "token", "/home/"]) expect(body.toLowerCase()).not.toContain(forbidden);
@@ -164,7 +169,7 @@ describe("Phase 15A delivery lifecycle, human gates, and migration", () => {
     const initial = new StateStore(path); replaceStateStoreForTests(initial); store = initial;
     const historical = create("finding_critical_created", "critical"); replaceStateStoreForTests();
     const raw = new DatabaseSync(path);
-    raw.exec("DROP TABLE outbound_audit_events; DROP TABLE notification_deliveries; DROP TABLE outbound_channel_settings; DELETE FROM schema_version WHERE version = 8;"); raw.close();
+    raw.exec("DROP TABLE credential_audit_events; DROP TABLE outbound_audit_events; DROP TABLE notification_deliveries; DROP TABLE outbound_channel_settings; DELETE FROM schema_version WHERE version >= 8;"); raw.close();
     const migrated = new StateStore(path); replaceStateStoreForTests(migrated); store = migrated;
     expect(store.schemaVersion()).toBe(SCHEMA_VERSION);
     expect(store.loadNotification(historical.notificationId)).toBeDefined();

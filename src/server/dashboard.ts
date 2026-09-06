@@ -4,6 +4,7 @@ import { runGit } from "./git";
 import { getStateStore, type DashboardQuery, type DashboardRow } from "./state-store";
 import { getTask, type RepoTask, type TaskStatus } from "./tasks";
 import { evaluateInactiveTasks } from "./notifications";
+import { redactKnownSecrets } from "./credential-resolver";
 
 const MAX_DASHBOARD_LIMIT = 100;
 const DEFAULT_DASHBOARD_LIMIT = 50;
@@ -69,7 +70,7 @@ export async function getDashboard(query: DashboardQuery, now = new Date()): Pro
 }
 
 export function summarizeTaskPrompt(prompt: string): string {
-  const collapsed = prompt.replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim();
+  const collapsed = redactKnownSecrets(prompt).replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim();
   const redacted = collapsed
     .replace(/\b(password|passwd|secret|token|credential|api[_ -]?key)\s*[:=]\s*\S+/gi, "$1: [redacted]")
     .replace(/\b(?:gh[opusr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,})\b/g, "[redacted]");

@@ -4,6 +4,8 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { FlowStep } from "../agents/types";
+import type { CredentialCapability, CredentialStatus } from "../credentials/types";
+import { redactKnownSecrets, redactKnownSecretsInValue } from "./credential-resolver";
 import type { DashboardCounts, DashboardSort, PrFilter, TaskBucket } from "../dashboard/types";
 import { parseProfileSnapshot, safeDefaultSnapshot, type ProjectProfile, type ProjectProfileSnapshot } from "../profiles/policy";
 import { builtInTemplates, mergeTemplateWithProfile, parseTemplateSnapshot, snapshotTemplate, type RepoTemplateSettings, type TaskTemplate, type TaskTemplateSnapshot } from "../templates/policy";
@@ -39,7 +41,7 @@ import {
 
 export const STATE_DIRECTORY = join(homedir(), ".multiagents");
 export const STATE_DATABASE = join(STATE_DIRECTORY, "state.db");
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 const MAX_STORED_PROMPT_CHARS = 20_000;
 const MAX_STORED_OUTPUT_CHARS = 1_000_000;
 
@@ -285,7 +287,7 @@ export class StateStore {
     const template = parseTemplateSnapshot(task.template ?? mergeTemplateWithProfile(snapshotTemplate(builtInTemplates(task.repoId)[0]), profile));
     if (template.repoId !== task.repoId) throw new Error("Task template snapshot repository does not match the task");
     task.template = template;
-    const payload = {
+    const payload = redactKnownSecretsInValue({
       reviewReady: task.reviewReady,
       validation: task.validation,
       secretFindings: task.secretFindings,
@@ -303,7 +305,7 @@ export class StateStore {
       error: task.error,
       profileSnapshot: profile,
       templateSnapshot: template,
-    };
+    });
     this.transaction(() => {
       this.database.prepare(`
         INSERT INTO tasks (
@@ -342,14 +344,14 @@ export class StateStore {
         task.id, task.repoId, task.repoName, task.repoPath, task.allowedRoot, task.baseBranch, task.branch,
         task.baseSha, task.originUrl ?? null, task.worktreePath, task.worktreeRoot,
         task.worktreeAvailable ? 1 : 0, task.worktreeStatus, task.status,
-        bounded(task.prompt, MAX_STORED_PROMPT_CHARS), task.createdAt, task.updatedAt,
-        task.flowId ?? null, task.flowStatus ?? null, bounded(task.finalOutput ?? "", MAX_STORED_OUTPUT_CHARS),
+        bounded(redactKnownSecrets(task.prompt), MAX_STORED_PROMPT_CHARS), task.createdAt, task.updatedAt,
+        task.flowId ?? null, task.flowStatus ?? null, bounded(redactKnownSecrets(task.finalOutput ?? ""), MAX_STORED_OUTPUT_CHARS),
         task.diffHash ?? null, task.approvalState, task.approvalPurpose ?? null, task.approvalId ?? null,
         task.commitSha ?? null, task.prNumber ?? null, task.prUrl ?? null,
         review?.headSha ?? task.latestPushedSha ?? task.commitSha ?? null,
         reviewDisposition ?? null, review?.unresolvedCount ?? null, ciStatus ?? null,
         task.status === "ready_for_human_merge" ? "ready_for_human_merge" : null,
-        task.recoveryStatus, task.recoveryMessage ?? null, JSON.stringify(payload),
+        task.recoveryStatus, task.recoveryMessage ? redactKnownSecrets(task.recoveryMessage) : null, JSON.stringify(payload),
         profile.profileId, profile.version, JSON.stringify(profile),
         template.templateId, template.version, JSON.stringify(template),
         task.sourceFindingId ?? null, task.sourceTaskId ?? null,
@@ -463,7 +465,7 @@ export class StateStore {
   clearForTests() {
     this.transaction(() => {
       this.dropAppendOnlyTriggers();
-      this.database.exec("DELETE FROM outbound_audit_events; DELETE FROM notification_deliveries; DELETE FROM outbound_channel_settings; DELETE FROM notification_audit_events; DELETE FROM notifications; DELETE FROM watch_rule_state; DELETE FROM notification_preferences; DELETE FROM finding_events; DELETE FROM findings; DELETE FROM approval_events; DELETE FROM diff_versions; DELETE FROM step_versions; DELETE FROM task_events; DELETE FROM flow_steps; DELETE FROM tasks; DELETE FROM template_audit_events; DELETE FROM task_template_versions; DELETE FROM repo_template_settings; DELETE FROM task_templates; DELETE FROM profile_audit_events; DELETE FROM project_profile_versions; DELETE FROM project_profiles;");
+      this.database.exec("DELETE FROM credential_audit_events; DELETE FROM outbound_audit_events; DELETE FROM notification_deliveries; DELETE FROM outbound_channel_settings; DELETE FROM notification_audit_events; DELETE FROM notifications; DELETE FROM watch_rule_state; DELETE FROM notification_preferences; DELETE FROM finding_events; DELETE FROM findings; DELETE FROM approval_events; DELETE FROM diff_versions; DELETE FROM step_versions; DELETE FROM task_events; DELETE FROM flow_steps; DELETE FROM tasks; DELETE FROM template_audit_events; DELETE FROM task_template_versions; DELETE FROM repo_template_settings; DELETE FROM task_templates; DELETE FROM profile_audit_events; DELETE FROM project_profile_versions; DELETE FROM project_profiles;");
       this.createAppendOnlyTriggers();
     });
   }
@@ -617,6 +619,15 @@ export class StateStore {
     return this.database.prepare("SELECT event_type, notification_id, channel, status, created_at FROM outbound_audit_events ORDER BY sequence").all();
   }
 
+  appendCredentialAudit(eventType: "credential_resolution_failed" | "credential_status_checked", capability: CredentialCapability, status: CredentialStatus) {
+    this.database.prepare("INSERT INTO credential_audit_events(event_id, event_type, capability, status, created_at) VALUES (?, ?, ?, ?, ?)")
+      .run(randomUUID(), eventType, capability, status, new Date().toISOString());
+  }
+
+  loadCredentialAuditEvents() {
+    return this.database.prepare("SELECT event_type, capability, status, created_at FROM credential_audit_events ORDER BY sequence").all();
+  }
+
   loadWatchRuleState(subjectType: "task" | "finding", subjectId: string, ruleType: NotificationType) {
     const row = this.database.prepare("SELECT last_state, last_notified_key, updated_at FROM watch_rule_state WHERE subject_type = ? AND subject_id = ? AND rule_type = ?").get(subjectType, subjectId, ruleType) as TaskRow | undefined;
     return row ? { lastState: String(row.last_state), lastNotifiedKey: optionalString(row.last_notified_key), updatedAt: String(row.updated_at) } : undefined;
@@ -663,8 +674,8 @@ export class StateStore {
     this.database.prepare(`
       INSERT INTO step_versions (version_id, task_id, step_id, version, agent, created_at, output, status, duration_ms)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(id, taskId, step.id, version, step.agent, createdAt, bounded(step.output, MAX_STORED_OUTPUT_CHARS), step.status, step.durationMs ?? null);
-    return { id, taskId, stepId: step.id, version, agent: step.agent, createdAt, output: bounded(step.output, MAX_STORED_OUTPUT_CHARS), status: step.status, durationMs: step.durationMs } satisfies StepVersion;
+    `).run(id, taskId, step.id, version, step.agent, createdAt, bounded(redactKnownSecrets(step.output), MAX_STORED_OUTPUT_CHARS), step.status, step.durationMs ?? null);
+    return { id, taskId, stepId: step.id, version, agent: step.agent, createdAt, output: bounded(redactKnownSecrets(step.output), MAX_STORED_OUTPUT_CHARS), status: step.status, durationMs: step.durationMs } satisfies StepVersion;
   }
 
   appendDiffVersion(taskId: string, input: Omit<DiffVersion, "id" | "taskId" | "version" | "createdAt"> & { createdAt?: string }) {
@@ -707,12 +718,12 @@ export class StateStore {
   }
 
   loadFindings(sourceTaskId: string): Finding[] {
-    return (this.database.prepare("SELECT * FROM findings WHERE source_task_id = ? ORDER BY created_at, finding_id").all(sourceTaskId) as TaskRow[]).map(rowToFinding);
+    return redactKnownSecretsInValue((this.database.prepare("SELECT * FROM findings WHERE source_task_id = ? ORDER BY created_at, finding_id").all(sourceTaskId) as TaskRow[]).map(rowToFinding));
   }
 
   loadFinding(findingId: string): Finding | undefined {
     const row = this.database.prepare("SELECT * FROM findings WHERE finding_id = ?").get(findingId) as TaskRow | undefined;
-    return row ? rowToFinding(row) : undefined;
+    return row ? redactKnownSecretsInValue(rowToFinding(row)) : undefined;
   }
 
   updateFindingStatus(findingId: string, expected: readonly Finding["status"][], status: Finding["status"], convertedTaskId?: string) {
@@ -924,9 +935,9 @@ export class StateStore {
     `);
     steps.forEach((step, ordinal) => insert.run(
       taskId, step.id, ordinal, step.agent, step.role, step.status,
-      bounded(step.output, MAX_STORED_OUTPUT_CHARS), step.error ?? null,
+      bounded(redactKnownSecrets(step.output), MAX_STORED_OUTPUT_CHARS), step.error ? redactKnownSecrets(step.error) : null,
       step.durationMs ?? null, step.startedAt ?? null, step.completedAt ?? null,
-      step.status === "stale" ? step.error ?? null : null,
+      step.status === "stale" && step.error ? redactKnownSecrets(step.error) : null,
     ));
   }
 
@@ -1288,11 +1299,25 @@ export class StateStore {
         .run(JSON.stringify(defaultOutboundChannelConfig), new Date().toISOString());
       this.database.prepare("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)").run(8, new Date().toISOString());
     });
+    if (version < 8) version = 8;
+    if (version < 9) this.transaction(() => {
+      this.database.exec(`
+        CREATE TABLE credential_audit_events (
+          sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+          event_id TEXT NOT NULL UNIQUE,
+          event_type TEXT NOT NULL CHECK(event_type IN ('credential_resolution_failed','credential_status_checked')),
+          capability TEXT NOT NULL CHECK(capability IN ('slack_outbound','github_cli','agent_codex','agent_cursor','agent_claude')),
+          status TEXT NOT NULL CHECK(status IN ('configured','not_configured','externally_managed','unavailable')),
+          created_at TEXT NOT NULL
+        );
+      `);
+      this.database.prepare("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)").run(9, new Date().toISOString());
+    });
     this.createAppendOnlyTriggers();
   }
 
   private createAppendOnlyTriggers() {
-    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events", "task_template_versions", "template_audit_events", "finding_events", "notification_audit_events", "outbound_audit_events"]) {
+    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events", "task_template_versions", "template_audit_events", "finding_events", "notification_audit_events", "outbound_audit_events", "credential_audit_events"]) {
       this.database.exec(`
         CREATE TRIGGER IF NOT EXISTS ${table}_no_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT, '${table} is append-only'); END;
         CREATE TRIGGER IF NOT EXISTS ${table}_no_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT, '${table} is append-only'); END;
@@ -1301,7 +1326,7 @@ export class StateStore {
   }
 
   private dropAppendOnlyTriggers() {
-    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events", "task_template_versions", "template_audit_events", "finding_events", "notification_audit_events", "outbound_audit_events"]) {
+    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events", "task_template_versions", "template_audit_events", "finding_events", "notification_audit_events", "outbound_audit_events", "credential_audit_events"]) {
       this.database.exec(`DROP TRIGGER IF EXISTS ${table}_no_update; DROP TRIGGER IF EXISTS ${table}_no_delete;`);
     }
   }

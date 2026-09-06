@@ -18,11 +18,4 @@ export const claudeAgent = createAgentAdapter({
   name: "Claude",
   binary: CLAUDE_BINARY,
   args: claudeArgs,
-}, {
-  cwd: workspaceDirectory,
-  env: {
-    ...process.env,
-    HOME: CLAUDE_HOME,
-    PATH: process.env.PATH,
-  },
-});
+}, { cwd: workspaceDirectory });

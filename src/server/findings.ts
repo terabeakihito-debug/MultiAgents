@@ -10,6 +10,7 @@ import { getStateStore } from "./state-store";
 import { evaluateFindingNotification } from "./notifications";
 import { selectTaskTemplate } from "./task-templates";
 import { createTask, getTask, requireTaskTemplate, type RepoTask } from "./tasks";
+import { containsKnownSecret } from "./credential-resolver";
 
 export const MAX_FINDINGS = 50;
 export const MAX_FINDING_TITLE = 200;
@@ -243,6 +244,7 @@ function optionalBoundedText(value: unknown, limit: number, label: string, index
 function parseStrictJson(value: string): unknown { try { return JSON.parse(value); } catch { throw new Error("Finding extraction did not return valid JSON"); } }
 function isObject(value: unknown): value is Record<string, unknown> { return Boolean(value) && typeof value === "object" && !Array.isArray(value); }
 function assertNoSecrets(values: Array<string | undefined>, labelPrefix: string) {
+  if (values.some((value) => value && containsKnownSecret(value))) throw new Error(`${labelPrefix} contains a managed credential; refusing to persist it`);
   for (const [label, pattern] of secretPatterns) if (values.some((value) => value && pattern.test(value))) throw new Error(`${labelPrefix} contains a possible ${label}; refusing to persist it`);
 }
 function ensureWithin(root: string, candidate: string) {

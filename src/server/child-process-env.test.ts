@@ -1,0 +1,63 @@
+import { describe, expect, it } from "vitest";
+import { buildChildProcessEnv, type ChildProcessPurpose } from "./child-process-env";
+import { runFixedProcess } from "./pull-request";
+
+const fixture = "TEST_SECRET_DO_NOT_LEAK";
+const parent = {
+  PATH: "/usr/bin",
+  HOME: "/home/test",
+  USER: "test",
+  SHELL: "/bin/bash",
+  LANG: "C.UTF-8",
+  XDG_CONFIG_HOME: "/home/test/.config",
+  CODEX_HOME: "/home/test/.codex",
+  CLAUDE_CONFIG_DIR: "/home/test/.claude",
+  CURSOR_CONFIG_DIR: "/home/test/.cursor",
+  GH_CONFIG_DIR: "/home/test/.config/gh",
+  SSH_AUTH_SOCK: "/tmp/agent.sock",
+  MULTIAGENTS_SLACK_WEBHOOK_URL: fixture,
+  OPENAI_API_KEY: fixture,
+  SERVICE_TOKEN: fixture,
+  DATABASE_PASSWORD: fixture,
+  AUTHORIZATION: fixture,
+};
+
+describe("Phase 16 child process environment isolation", () => {
+  it.each(["agent", "validation", "git", "github"] as ChildProcessPurpose[])("removes server and pattern-matched secrets for %s", (purpose) => {
+    const env = buildChildProcessEnv({ purpose, baseEnv: parent });
+    expect(JSON.stringify(env)).not.toContain(fixture);
+    expect(env.PATH).toBe(parent.PATH);
+    expect(env.HOME).toBe(parent.HOME);
+  });
+
+  it("preserves filesystem-backed CLI authentication paths only for agents", () => {
+    const agent = buildChildProcessEnv({ purpose: "agent", baseEnv: parent });
+    expect(agent).toMatchObject({ HOME: parent.HOME, PATH: parent.PATH, XDG_CONFIG_HOME: parent.XDG_CONFIG_HOME, CODEX_HOME: parent.CODEX_HOME, CLAUDE_CONFIG_DIR: parent.CLAUDE_CONFIG_DIR, CURSOR_CONFIG_DIR: parent.CURSOR_CONFIG_DIR });
+    expect(agent).not.toHaveProperty("GH_CONFIG_DIR");
+  });
+
+  it("preserves external git and gh auth brokers without credential values", () => {
+    const git = buildChildProcessEnv({ purpose: "git", baseEnv: parent });
+    const github = buildChildProcessEnv({ purpose: "github", baseEnv: parent });
+    expect(git.SSH_AUTH_SOCK).toBe(parent.SSH_AUTH_SOCK);
+    expect(github).toMatchObject({ HOME: parent.HOME, GH_CONFIG_DIR: parent.GH_CONFIG_DIR, SSH_AUTH_SOCK: parent.SSH_AUTH_SOCK });
+  });
+
+  it("does not expose the Slack secret to a validation subprocess", async () => {
+    const previous = process.env.MULTIAGENTS_SLACK_WEBHOOK_URL;
+    process.env.MULTIAGENTS_SLACK_WEBHOOK_URL = fixture;
+    try {
+      const result = await runFixedProcess(process.execPath, ["-e", "require('node:fs').writeSync(1, process.env.MULTIAGENTS_SLACK_WEBHOOK_URL || 'ABSENT')"], process.cwd(), 5_000);
+      expect(result).toMatchObject({ code: 0, timedOut: false, stdout: "ABSENT" });
+    } finally {
+      if (previous === undefined) delete process.env.MULTIAGENTS_SLACK_WEBHOOK_URL;
+      else process.env.MULTIAGENTS_SLACK_WEBHOOK_URL = previous;
+    }
+  });
+
+  it("cannot reintroduce a secret through overrides", () => {
+    const env = buildChildProcessEnv({ purpose: "validation", baseEnv: parent, overrides: { SERVICE_TOKEN: fixture, NODE_ENV: "production" } });
+    expect(env.NODE_ENV).toBe("production");
+    expect(env.SERVICE_TOKEN).toBeUndefined();
+  });
+});

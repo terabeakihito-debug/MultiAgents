@@ -3,6 +3,8 @@ import { spawn } from "node:child_process";
 import { lstat, readFile, readlink, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { GIT_BINARY, runGit } from "./git";
+import { buildChildProcessEnv, type ChildProcessPurpose } from "./child-process-env";
+import { containsKnownSecret, redactKnownSecrets } from "./credential-resolver";
 import { validateRepository } from "./repositories";
 import { validationScript, validationTimeoutMs, type ValidationStep } from "../profiles/policy";
 import { acquireTaskLock, clearTaskLocksForTests, isTaskLocked, releaseTaskLock } from "./task-lock";
@@ -484,6 +486,7 @@ export async function scanSecrets(snapshot: DiffSnapshot): Promise<SecretFinding
       ["SECRET assignment", /^\s*(?:export\s+)?SECRET\s*=\s*['"]?[^\s'"]{4,}/im],
     ];
     for (const [rule, pattern] of rules) if (pattern.test(text)) findings.push({ path: entry.path, kind: "content", rule });
+    if (containsKnownSecret(entry.content)) findings.push({ path: entry.path, kind: "content", rule: "MultiAgents managed credential" });
   }
   return findings;
 }
@@ -670,9 +673,10 @@ export async function runFixedProcess(binary: string, args: readonly string[], c
 
 async function runFixedProcessWithEnv(binary: string, args: readonly string[], cwd: string, timeoutMs: number, envOverrides?: NodeJS.ProcessEnv) {
   return new Promise<FixedProcessResult>((resolve, reject) => {
+    const purpose: ChildProcessPurpose = binary === GIT_BINARY ? "git" : binary === GH_BINARY ? "github" : "validation";
     const child = spawn(binary, [...args], {
       cwd,
-      env: { ...process.env, ...envOverrides },
+      env: buildChildProcessEnv({ purpose, overrides: envOverrides }),
       shell: false,
       detached: process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],
@@ -714,8 +718,8 @@ async function runFixedProcessWithEnv(binary: string, args: readonly string[], c
       if (forceCloseTimer) clearTimeout(forceCloseTimer);
     };
     const result = (): FixedProcessResult => ({
-      stdout: stdout.toString("utf8"),
-      stderr: stderr.toString("utf8"),
+      stdout: redactKnownSecrets(stdout.toString("utf8")),
+      stderr: redactKnownSecrets(stderr.toString("utf8")),
       code: exitCode,
       signal: exitSignal,
       timedOut,
@@ -793,7 +797,7 @@ function validationFailureDetail(error: unknown, timeoutMs: number) {
 }
 
 export function summarizeStderr(value: string) {
-  const clean = redactSecrets(value)
+  const clean = redactKnownSecrets(redactSecrets(value))
     .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
     .replace(/^[A-Za-z_][A-Za-z0-9_]*=.*$/gm, (line) => `${line.slice(0, line.indexOf("="))}=[redacted]`)
     .replace(/:\/\/[^\s/:@]+:[^\s/@]+@/g, "://[redacted]@")
