@@ -1,12 +1,12 @@
 import { approveRework } from "@/server/pr-review";
 import { ApprovalError } from "@/server/pull-request";
-import { rejectNonLocalRequest } from "@/server/request-security";
+import { requireHumanMutation } from "@/server/request-security";
 import { initializeTaskRecovery } from "@/server/tasks";
 
 export const runtime = "nodejs";
 
 export async function POST(request: Request, context: { params: Promise<{ id: string }> }) {
-  const rejection = rejectNonLocalRequest(request);
+  const rejection = requireHumanMutation(request, "task-approve-rework", { label: "Rework approval" });
   if (rejection) return rejection;
   await initializeTaskRecovery();
   let body: unknown;

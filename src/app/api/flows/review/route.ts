@@ -1,11 +1,11 @@
 import { runReviewFlow } from "@/flows/review";
-import { rejectNonLocalRequest } from "@/server/request-security";
+import { requireHumanMutation } from "@/server/request-security";
 
 export const runtime = "nodejs";
 const MAX_PROMPT_LENGTH = 20_000;
 
 export async function POST(request: Request) {
-  const rejection = rejectNonLocalRequest(request);
+  const rejection = requireHumanMutation(request, "review-run", { label: "Review execution" });
   if (rejection) return rejection;
 
   let body: unknown;

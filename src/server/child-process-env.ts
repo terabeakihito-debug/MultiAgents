@@ -34,3 +34,19 @@ export function buildChildProcessEnv(input: {
   }
   return output as NodeJS.ProcessEnv;
 }
+
+export function buildServerGitMutationEnv(baseEnv: Readonly<Record<string, string | undefined>> = process.env): NodeJS.ProcessEnv {
+  const output = buildChildProcessEnv({ purpose: "git", baseEnv });
+  for (const key of Object.keys(output)) {
+    if (key === "GIT_DIR" || key === "GIT_WORK_TREE" || key === "GIT_INDEX_FILE" || key.startsWith("GIT_CONFIG_")) delete output[key];
+  }
+  delete output.GIT_SSH;
+  delete output.GIT_SSH_COMMAND;
+  delete output.GIT_ASKPASS;
+  delete output.SSH_ASKPASS;
+  output.GIT_CONFIG_NOSYSTEM = "1";
+  output.GIT_CONFIG_SYSTEM = "/dev/null";
+  output.GIT_CONFIG_GLOBAL = "/dev/null";
+  output.GIT_NO_REPLACE_OBJECTS = "1";
+  return output;
+}

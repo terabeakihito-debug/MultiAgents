@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { lstat, readFile, readlink, realpath } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { GIT_BINARY, runGit } from "./git";
+import { GIT_BINARY, runGit, runGitBytes, serverGitMutationInvocation } from "./git";
 import { buildChildProcessEnv, type ChildProcessPurpose } from "./child-process-env";
 import { containsKnownSecret, redactKnownSecrets } from "./credential-resolver";
 import { validateRepository } from "./repositories";
@@ -34,8 +35,8 @@ const MAX_COMMAND_OUTPUT_BYTES = 200_000;
 const PROCESS_TERMINATION_GRACE_MS = 5_000;
 const STDERR_SUMMARY_CHARS = 1_200;
 
-type SnapshotEntry = { path: string; kind: "file" | "symlink" | "deleted"; mode: string; content: Buffer };
-export type DiffSnapshot = { hash: string; empty: boolean; entries: SnapshotEntry[] };
+type SnapshotEntry = { status: string; oldPath?: string; path: string; kind: "file" | "symlink" | "deleted"; mode: string; content: Buffer };
+export type DiffSnapshot = { hash: string; empty: boolean; baseHead: string; treeId: string; entries: SnapshotEntry[] };
 export type ApprovalInput = { approved: true; diffHash: string; approvalId: string };
 export type PullRequestResult = ReturnType<typeof publicTask>;
 
@@ -75,9 +76,9 @@ export class ProcessExecutionError extends Error {
 }
 
 const defaultDependencies: ApprovalDependencies = {
-  stage: async (task) => { await checkedProcess(GIT_BINARY, ["add", "--all"], task.worktreePath, COMMAND_TIMEOUT_MS); },
-  commit: async (task, message) => { await checkedProcess(GIT_BINARY, ["commit", "-m", message], task.worktreePath, COMMAND_TIMEOUT_MS); },
-  push: async (task) => { await checkedProcess(GIT_BINARY, ["push", "-u", "origin", task.branch], task.worktreePath, COMMAND_TIMEOUT_MS); },
+  stage: async (task) => { await runServerGitMutation(task.worktreePath, ["add", "--all"]); },
+  commit: async (task, message) => { await runServerGitMutation(task.worktreePath, ["commit", "-m", message]); },
+  push: async (task) => { await runServerGitMutation(task.worktreePath, ["push", "-u", "origin", task.branch]); },
   checkGhAuth: async (task) => { await checkedProcess(GH_BINARY, ["auth", "status", "--hostname", "github.com"], task.worktreePath, 30_000); },
   createPr: async (task, remote, title, body) => {
     const output = await checkedProcess(GH_BINARY, [
@@ -224,8 +225,11 @@ export async function approveAndCreatePullRequest(taskId: string, input: Approva
       await runProjectValidation(task, deps);
       let remote: GitHubRemote;
       try {
-        const currentOrigin = await runGit(task.worktreePath, ["remote", "get-url", "origin"]);
-        if (!task.originUrl || currentOrigin !== task.originUrl) throw new Error("origin changed after task creation");
+        const [currentOrigin, pushOrigin] = await Promise.all([
+          runGit(task.worktreePath, ["remote", "get-url", "origin"]),
+          runGit(task.worktreePath, ["remote", "get-url", "--push", "origin"]),
+        ]);
+        if (!task.originUrl || currentOrigin !== task.originUrl || pushOrigin !== task.originUrl) throw new Error("origin changed after task creation");
         remote = validateGitHubRemote(currentOrigin);
         pass(task, "GitHub origin", `${remote.owner}/${remote.repo}`);
       } catch {
@@ -256,8 +260,10 @@ export async function approveAndCreatePullRequest(taskId: string, input: Approva
         await deps.stage(task);
         const beforeCommit = await createDiffSnapshot(task);
         if (beforeCommit.hash !== input.diffHash) throw invalidate(task, "Approval invalidated because the worktree changed. Review the latest diff again.");
+        const stagedTree = await verifyStagedApproval(task, beforeCommit);
         await deps.commit(task, commitMessage(task.prompt));
         task.commitSha = await runGit(task.worktreePath, ["rev-parse", "HEAD"]);
+        await verifyCommittedApproval(task, beforeCommit, stagedTree, task.commitSha);
         task.approvalState = "used";
         persistTask(task);
         recordTaskEvent(task, "commit_created", "system", { status: "created", metadata: { commitSha: task.commitSha } });
@@ -410,47 +416,111 @@ function resolveGitPath(worktreePath: string, value: string) {
 
 export async function createDiffSnapshot(task: RepoTask): Promise<DiffSnapshot> {
   const root = await realpath(task.worktreePath);
-  const [tracked, untracked, head] = await Promise.all([
-    runGit(root, ["diff", "--name-only", "-z", "HEAD", "--"]),
-    runGit(root, ["ls-files", "--others", "--exclude-standard", "-z"]),
-    runGit(root, ["rev-parse", "HEAD"]),
-  ]);
-  const paths = [...new Set([...tracked.split("\0"), ...untracked.split("\0")].filter(Boolean))].sort();
-  const entries: SnapshotEntry[] = [];
-  let totalBytes = 0;
-  for (const path of paths) {
-    if (isAbsolute(path) || path === ".git" || path.startsWith(".git/") || path.split("/").includes("..")) throw new Error("Invalid changed path");
-    const absolute = join(root, path);
-    try {
-      const info = await lstat(absolute);
-      if (info.isSymbolicLink()) {
-        const content = Buffer.from(await readlink(absolute), "utf8");
-        entries.push({ path, kind: "symlink", mode: "120000", content });
-        totalBytes += content.length;
-      } else if (info.isFile()) {
-        if (info.size > MAX_UNTRACKED_FILE_BYTES) throw new Error(`Changed file ${JSON.stringify(path)} exceeds the approval limit`);
-        const content = await readFile(absolute);
-        entries.push({ path, kind: "file", mode: info.mode & 0o111 ? "100755" : "100644", content });
-        totalBytes += content.length;
-      } else {
-        throw new Error(`Changed path ${JSON.stringify(path)} is not a regular file or symlink`);
+  const head = (await runServerGitMutation(root, ["rev-parse", "HEAD"])).stdout.trim();
+  return createCanonicalDiffSnapshot(root, head);
+}
+
+export async function createCommittedDiffSnapshot(task: RepoTask, baseHead: string, commitSha: string): Promise<DiffSnapshot> {
+  const root = await realpath(task.worktreePath);
+  if ((await runServerGitMutation(root, ["rev-parse", "HEAD"])).stdout.trim() !== commitSha) throw new Error("Committed snapshot HEAD mismatch");
+  return createCanonicalDiffSnapshot(root, baseHead, commitSha);
+}
+
+async function createCanonicalDiffSnapshot(root: string, baseHead: string, target?: string): Promise<DiffSnapshot> {
+  const temporary = await mkdtemp(join(tmpdir(), "multiagents-approval-index-"));
+  const indexPath = join(temporary, "index");
+  try {
+    const invocation = await serverGitMutationInvocation(root, []);
+    const context = { args: invocation.args, env: { ...invocation.env, GIT_INDEX_FILE: indexPath } };
+    await runSnapshotGit(root, context, ["read-tree", target ?? baseHead]);
+    if (!target) await runSnapshotGit(root, context, ["add", "--all", "--"]);
+    const [tracked, treeIdBuffer] = await Promise.all([
+      runSnapshotGit(root, context, ["diff", "--cached", "--name-status", "-z", "--find-renames", "--find-copies", "--find-copies-harder", baseHead, "--"]),
+      runSnapshotGit(root, context, ["write-tree"]),
+    ]);
+    const changes = parseNameStatus(tracked.toString("utf8"));
+    changes.sort((left, right) => `${left.status}\0${left.oldPath ?? ""}\0${left.path}`.localeCompare(`${right.status}\0${right.oldPath ?? ""}\0${right.path}`));
+    const changedPaths = changes.filter((change) => change.status !== "D").map((change) => change.path);
+    const indexed = changedPaths.length
+      ? await runSnapshotGit(root, context, ["ls-files", "--stage", "-z", "--", ...changedPaths])
+      : Buffer.alloc(0);
+    const indexEntries = parseIndexEntries(indexed.toString("utf8"));
+    const entries: SnapshotEntry[] = [];
+    let totalBytes = 0;
+    for (const change of changes) {
+      validateChangedPath(change.path);
+      if (change.oldPath) validateChangedPath(change.oldPath);
+      if (change.status === "D") {
+        entries.push({ ...change, kind: "deleted", mode: "000000", content: Buffer.alloc(0) });
+        continue;
       }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") entries.push({ path, kind: "deleted", mode: "000000", content: Buffer.alloc(0) });
-      else throw error;
+      const indexedEntry = indexEntries.get(change.path);
+      if (!indexedEntry) throw new Error(`Changed path ${JSON.stringify(change.path)} is absent from the approval index`);
+      const kind = indexedEntry.mode === "120000" ? "symlink" : indexedEntry.mode === "100644" || indexedEntry.mode === "100755" ? "file" : undefined;
+      if (!kind) throw new Error(`Changed path ${JSON.stringify(change.path)} is not a regular file or symlink`);
+      const content = await runSnapshotGit(root, context, ["cat-file", "blob", indexedEntry.objectId]);
+      if (content.length > MAX_UNTRACKED_FILE_BYTES) throw new Error(`Changed file ${JSON.stringify(change.path)} exceeds the approval limit`);
+      entries.push({ ...change, kind, mode: indexedEntry.mode, content });
+      totalBytes += content.length;
+      if (totalBytes > MAX_UNTRACKED_TOTAL_BYTES) throw new Error("Changed content exceeds the approval limit");
     }
-    if (totalBytes > MAX_UNTRACKED_TOTAL_BYTES) throw new Error("Changed content exceeds the approval limit");
+    const treeId = treeIdBuffer.toString("utf8").trim();
+    const hash = createHash("sha256");
+    addPart(hash, Buffer.from("multiagents-diff-v3\0"));
+    addPart(hash, Buffer.from(baseHead));
+    addPart(hash, Buffer.from(treeId));
+    for (const entry of entries) {
+      addPart(hash, Buffer.from(entry.status));
+      addPart(hash, Buffer.from(entry.oldPath ?? ""));
+      addPart(hash, Buffer.from(entry.path));
+      addPart(hash, Buffer.from(entry.kind));
+      addPart(hash, Buffer.from(entry.mode));
+      addPart(hash, entry.content);
+    }
+    return { hash: hash.digest("hex"), empty: entries.length === 0, baseHead, treeId, entries };
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
   }
-  const hash = createHash("sha256");
-  addPart(hash, Buffer.from("multiagents-diff-v1\0"));
-  addPart(hash, Buffer.from(head));
-  for (const entry of entries) {
-    addPart(hash, Buffer.from(entry.path));
-    addPart(hash, Buffer.from(entry.kind));
-    addPart(hash, Buffer.from(entry.mode));
-    addPart(hash, entry.content);
+}
+
+async function runSnapshotGit(root: string, context: { args: readonly string[]; env: NodeJS.ProcessEnv }, args: readonly string[]) {
+  return runGitBytes(root, [...context.args, ...args], context.env);
+}
+
+function parseIndexEntries(value: string) {
+  const entries = new Map<string, { mode: string; objectId: string }>();
+  for (const token of value.split("\0").filter(Boolean)) {
+    const match = token.match(/^(\d{6}) ([0-9a-f]+) 0\t([\s\S]+)$/);
+    if (!match) throw new Error("Invalid Git approval index entry");
+    validateChangedPath(match[3]);
+    if (entries.has(match[3])) throw new Error("Duplicate Git approval index entry");
+    entries.set(match[3], { mode: match[1], objectId: match[2] });
   }
-  return { hash: hash.digest("hex"), empty: entries.length === 0, entries };
+  return entries;
+}
+
+function parseNameStatus(value: string) {
+  const tokens = value.split("\0").filter((token) => token.length > 0);
+  const changes: Array<{ status: string; oldPath?: string; path: string }> = [];
+  for (let index = 0; index < tokens.length;) {
+    const status = tokens[index++];
+    if (!/^(?:[ACDMRTUXB]|[RC][0-9]{1,3})$/.test(status)) throw new Error("Invalid Git change status");
+    if (/^[RC][0-9]{1,3}$/.test(status)) {
+      const oldPath = tokens[index++];
+      const path = tokens[index++];
+      if (oldPath === undefined || path === undefined) throw new Error("Incomplete Git rename/copy topology");
+      changes.push({ status, oldPath, path });
+    } else {
+      const path = tokens[index++];
+      if (path === undefined) throw new Error("Incomplete Git change topology");
+      changes.push({ status, path });
+    }
+  }
+  return changes;
+}
+
+function validateChangedPath(path: string) {
+  if (isAbsolute(path) || path === ".git" || path.startsWith(".git/") || path.split("/").includes("..") || path.includes("\0")) throw new Error("Invalid changed path");
 }
 
 function addPart(hash: ReturnType<typeof createHash>, value: Buffer) {
@@ -668,19 +738,65 @@ function invalidate(task: RepoTask, message: string) {
   task.approvalState = "invalidated";
   transitionTask(task, "approval_invalidated");
   task.error = message;
+  recordTaskEvent(task, "approval_snapshot_mismatch", "system", { status: "rejected", metadata: task.diffHash ? { diffHash: task.diffHash } : undefined });
   return new ApprovalError(message);
+}
+
+export async function verifyStagedApproval(task: RepoTask, approved: DiffSnapshot) {
+  try {
+    const stagedSnapshot = await createDiffSnapshot(task);
+    const [unstaged, untracked, tree] = await Promise.all([
+      runServerGitMutation(task.worktreePath, ["diff", "--name-only", "-z", "--"]),
+      runServerGitMutation(task.worktreePath, ["ls-files", "--others", "--exclude-standard", "-z"]),
+      runServerGitMutation(task.worktreePath, ["write-tree"]),
+    ]);
+    const stagedTree = tree.stdout.trim();
+    if (stagedSnapshot.hash !== approved.hash || stagedSnapshot.treeId !== stagedTree || approved.treeId !== stagedTree || unstaged.stdout || untracked.stdout) throw new Error("staged content mismatch");
+    return stagedTree;
+  } catch {
+    throw invalidate(task, "Approval invalidated because the staged index does not equal the approved snapshot.");
+  }
+}
+
+export async function verifyCommittedApproval(task: RepoTask, approved: DiffSnapshot, stagedTree: string, commitSha: string) {
+  try {
+    const [parent, committedTree, committed, remaining] = await Promise.all([
+      runServerGitMutation(task.worktreePath, ["rev-parse", `${commitSha}^`]),
+      runServerGitMutation(task.worktreePath, ["rev-parse", `${commitSha}^{tree}`]),
+      createCommittedDiffSnapshot(task, approved.baseHead, commitSha),
+      runServerGitMutation(task.worktreePath, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]),
+    ]);
+    if (parent.stdout.trim() === approved.baseHead && committedTree.stdout.trim() === stagedTree && committed.treeId === stagedTree && committed.hash === approved.hash && !remaining.stdout) return;
+  } catch { /* convert every verification failure into the fail-closed security state below */ }
+  task.commitSha = commitSha;
+  task.approvalState = "invalidated";
+  transitionTask(task, "commit_failed");
+  task.recoveryStatus = "needs_attention";
+  task.recoveryMessage = "Security violation: committed content does not equal the human-approved snapshot. Push and PR creation are blocked.";
+  task.error = task.recoveryMessage;
+  persistTask(task);
+  recordTaskEvent(task, "approval_snapshot_mismatch", "system", { status: "post_commit", metadata: { diffHash: approved.hash, commitSha } });
+  recordTaskEvent(task, "post_commit_verification_failed", "system", { status: "blocked", metadata: { diffHash: approved.hash, commitSha } });
+  throw new ApprovalError(task.error);
 }
 
 export async function runFixedProcess(binary: string, args: readonly string[], cwd: string, timeoutMs: number) {
   return runFixedProcessWithEnv(binary, args, cwd, timeoutMs);
 }
 
-async function runFixedProcessWithEnv(binary: string, args: readonly string[], cwd: string, timeoutMs: number, envOverrides?: NodeJS.ProcessEnv) {
+export async function runServerGitMutation(cwd: string, args: readonly string[], timeoutMs = COMMAND_TIMEOUT_MS) {
+  const invocation = await serverGitMutationInvocation(cwd, args);
+  const result = await runFixedProcessWithEnv(GIT_BINARY, invocation.args, cwd, timeoutMs, undefined, invocation.env);
+  if (result.timedOut || result.code !== 0) throw new ProcessExecutionError(result);
+  return result;
+}
+
+async function runFixedProcessWithEnv(binary: string, args: readonly string[], cwd: string, timeoutMs: number, envOverrides?: NodeJS.ProcessEnv, exactEnv?: NodeJS.ProcessEnv) {
   return new Promise<FixedProcessResult>((resolve, reject) => {
     const purpose: ChildProcessPurpose = binary === GIT_BINARY ? "git" : binary === GH_BINARY ? "github" : "validation";
     const child = spawn(binary, [...args], {
       cwd,
-      env: buildChildProcessEnv({ purpose, overrides: envOverrides }),
+      env: exactEnv ?? buildChildProcessEnv({ purpose, overrides: envOverrides }),
       shell: false,
       detached: process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],

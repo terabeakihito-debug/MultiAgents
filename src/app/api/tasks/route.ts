@@ -1,5 +1,5 @@
 import { createTask, initializeTaskRecovery, listTasks, publicTask } from "@/server/tasks";
-import { rejectNonLocalRequest } from "@/server/request-security";
+import { rejectNonLocalRequest, requireHumanMutation } from "@/server/request-security";
 
 export const runtime = "nodejs";
 export async function GET(request: Request) {
@@ -8,7 +8,7 @@ export async function GET(request: Request) {
   return Response.json({ tasks: listTasks().map(publicTask) });
 }
 export async function POST(request: Request) {
-  const rejection = rejectNonLocalRequest(request); if (rejection) return rejection;
+  const rejection = requireHumanMutation(request, "task-create", { label: "Task creation" }); if (rejection) return rejection;
   await initializeTaskRecovery();
   let body: unknown; try { body = await request.json(); } catch { return Response.json({ error: "Request body must be valid JSON" }, { status: 400 }); }
   const repoId = (body as { repoId?: unknown })?.repoId;

@@ -14,7 +14,7 @@ import {
   sanitizeOutboundNotification,
   sendFixedSlackTest,
 } from "./outbound-notifications";
-import { rejectNonHumanOutboundMutation } from "./request-security";
+import { issueHumanMutationNonce, rejectNonHumanOutboundMutation } from "./request-security";
 import { sendSlackNotification, sendSlackTestNotification, SLACK_TEST_TEXT } from "./slack-adapter";
 import { SCHEMA_VERSION, StateStore, replaceStateStoreForTests } from "./state-store";
 
@@ -142,11 +142,14 @@ describe("Phase 15A delivery lifecycle, human gates, and migration", () => {
     ]);
   });
 
-  it("requires same-origin human action and blocks agents from retry/test/preferences", () => {
+  it("requires same-origin human action and blocks agents from retry/test/preferences", async () => {
     const url = "http://localhost:3000/api/outbound/slack/test";
     const direct = new Request(url, { method: "POST", headers: { host: "localhost:3000" } });
     expect(rejectNonHumanOutboundMutation(direct, "outbound-test")?.status).toBe(403);
-    const human = new Request(url, { method: "POST", headers: { host: "localhost:3000", origin: "http://localhost:3000", "sec-fetch-site": "same-origin", "x-multiagents-human-action": "outbound-test" } });
+    const nonceResponse = issueHumanMutationNonce(new Request("http://localhost:3000/api/human-session", { headers: { host: "localhost:3000", referer: "http://localhost:3000/", "sec-fetch-site": "same-origin" } }));
+    const nonce = (await nonceResponse.json() as { nonce: string }).nonce;
+    const cookie = nonceResponse.headers.get("set-cookie")!.split(";")[0];
+    const human = new Request(url, { method: "POST", headers: { host: "localhost:3000", origin: "http://localhost:3000", "sec-fetch-site": "same-origin", "x-multiagents-human-action": "outbound-test", "x-multiagents-human-nonce": nonce, cookie } });
     expect(rejectNonHumanOutboundMutation(human, "outbound-test")).toBeUndefined();
     const end = beginAgentExecution(); expect(rejectNonHumanOutboundMutation(human, "outbound-test")?.status).toBe(423); end();
   });

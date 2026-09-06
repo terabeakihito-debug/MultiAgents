@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -8,11 +8,13 @@ import {
   checkTaskDependencies,
   clearApprovalLocksForTests,
   commitMessage,
+  createCommittedDiffSnapshot,
   createDiffSnapshot,
   isTaskLockedForTests,
   prepareApproval,
   ProcessExecutionError,
   runFixedProcess,
+  runServerGitMutation,
   runValidationCommand,
   scanSecrets,
   summarizeStderr,
@@ -25,6 +27,7 @@ import {
   clearTasksForTests,
   completeTaskReview,
   createTask,
+  getTaskHistory,
   transitionTask,
   type RepoTask,
 } from "./tasks";
@@ -37,7 +40,7 @@ async function createRoot() {
   return value;
 }
 
-async function createRepo(origin = "https://github.com/example/project.git") {
+async function createRepo(origin = "https://github.com/example/project.git", seed: Record<string, string> = {}) {
   const allowedRoot = await createRoot();
   const repoPath = join(allowedRoot, "project");
   await mkdir(repoPath);
@@ -45,7 +48,8 @@ async function createRepo(origin = "https://github.com/example/project.git") {
   await runGit(repoPath, ["config", "user.email", "test@example.com"]);
   await runGit(repoPath, ["config", "user.name", "Test"]);
   await writeFile(join(repoPath, "README.md"), "initial\n");
-  await runGit(repoPath, ["add", "README.md"]);
+  for (const [path, content] of Object.entries(seed)) await writeFile(join(repoPath, path), content);
+  await runGit(repoPath, ["add", "--all"]);
   await runGit(repoPath, ["commit", "-m", "initial"]);
   await runGit(repoPath, ["remote", "add", "origin", origin]);
   const task = await createTask("project", { allowedRoot, worktreeRoot: join(await createRoot(), "worktrees") });
@@ -127,6 +131,98 @@ describe("Phase 5 approval and PR state machine", () => {
     const second = await createDiffSnapshot(task);
     expect(first.hash).not.toBe(second.hash);
     expect(first.empty).toBe(false);
+  });
+
+  it("distinguishes identical-content renames by their source path", async () => {
+    const { task } = await createRepo(undefined, { "a.txt": "same\n", "b.txt": "same\n" });
+    await runGit(task.worktreePath, ["mv", "a.txt", "c.txt"]);
+    const fromA = await createDiffSnapshot(task);
+    await runGit(task.worktreePath, ["reset", "--hard", "HEAD"]);
+    await runGit(task.worktreePath, ["mv", "b.txt", "c.txt"]);
+    const fromB = await createDiffSnapshot(task);
+    expect(fromA.hash).not.toBe(fromB.hash);
+    expect(fromA.entries[0]).toMatchObject({ status: "R100", oldPath: "a.txt", path: "c.txt" });
+    expect(fromB.entries[0]).toMatchObject({ status: "R100", oldPath: "b.txt", path: "c.txt" });
+  });
+
+  it("records copy topology with old and new paths", async () => {
+    const { task } = await createRepo(undefined, { "a.txt": "from-a\n", "b.txt": "from-b\n" });
+    await copyFile(join(task.worktreePath, "a.txt"), join(task.worktreePath, "c.txt"));
+    const approved = await createDiffSnapshot(task);
+    expect(approved.entries).toContainEqual(expect.objectContaining({ status: "C100", oldPath: "a.txt", path: "c.txt" }));
+    await runServerGitMutation(task.worktreePath, ["add", "--all"]);
+    const staged = await createDiffSnapshot(task);
+    expect(staged).toMatchObject({ hash: approved.hash, treeId: approved.treeId });
+  });
+
+  it("disables repository hooks for the real server commit path", async () => {
+    const { task, input, repoPath } = await readyTask();
+    const hook = join(repoPath, ".git", "hooks", "pre-commit");
+    await writeFile(hook, "#!/bin/sh\nprintf 'unapproved\\n' > unapproved.txt\ngit add unapproved.txt\n");
+    await chmod(hook, 0o755);
+    const dependencies = successfulDependencies();
+    delete dependencies.stage;
+    delete dependencies.commit;
+    await approveAndCreatePullRequest(task.id, input, dependencies);
+    expect(await runGit(task.worktreePath, ["show", "--name-only", "--format=", "HEAD"])).toBe("README.md");
+    expect(await runGit(task.worktreePath, ["status", "--porcelain"])).toBe("");
+  });
+
+  it("ignores GIT_CONFIG environment injection for the real server commit path", async () => {
+    const { task, input, repoPath } = await readyTask();
+    const hookDirectory = join(repoPath, ".git", "injected-hooks");
+    await mkdir(hookDirectory);
+    const hook = join(hookDirectory, "pre-commit");
+    await writeFile(hook, "#!/bin/sh\nprintf 'unapproved\\n' > env-injected.txt\ngit add env-injected.txt\n");
+    await chmod(hook, 0o755);
+    const previous = [process.env.GIT_CONFIG_COUNT, process.env.GIT_CONFIG_KEY_0, process.env.GIT_CONFIG_VALUE_0];
+    process.env.GIT_CONFIG_COUNT = "1";
+    process.env.GIT_CONFIG_KEY_0 = "core.hooksPath";
+    process.env.GIT_CONFIG_VALUE_0 = hookDirectory;
+    try {
+      const dependencies = successfulDependencies();
+      delete dependencies.stage;
+      delete dependencies.commit;
+      await approveAndCreatePullRequest(task.id, input, dependencies);
+      expect(await runGit(task.worktreePath, ["show", "--name-only", "--format=", "HEAD"])).toBe("README.md");
+    } finally {
+      for (const [key, value] of [["GIT_CONFIG_COUNT", previous[0]], ["GIT_CONFIG_KEY_0", previous[1]], ["GIT_CONFIG_VALUE_0", previous[2]]] as const) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+    }
+  });
+
+  it("blocks push and PR when a commit implementation injects unapproved staged content", async () => {
+    const { task, input } = await readyTask();
+    const push = vi.fn(async () => undefined);
+    const createPr = vi.fn(async () => ({ url: "https://github.com/example/project/pull/42", number: 42 }));
+    const commit = async (received: RepoTask, message: string) => {
+      await runGit(received.worktreePath, ["commit", "-m", message]);
+      await writeFile(join(received.worktreePath, "unapproved.txt"), "hook payload\n");
+      await runGit(received.worktreePath, ["add", "unapproved.txt"]);
+      await runGit(received.worktreePath, ["commit", "--amend", "--no-edit"]);
+    };
+    await expect(approveAndCreatePullRequest(task.id, input, successfulDependencies({ commit, push, createPr }))).rejects.toThrow("committed content does not equal");
+    expect(push).not.toHaveBeenCalled();
+    expect(createPr).not.toHaveBeenCalled();
+    expect(task).toMatchObject({ status: "commit_failed", recoveryStatus: "needs_attention", approvalState: "invalidated" });
+    expect(getTaskHistory(task.id).events.map((event) => event.type)).toEqual(expect.arrayContaining(["approval_snapshot_mismatch", "post_commit_verification_failed"]));
+  });
+
+  it("verifies the committed delta equals the approved staged tree", async () => {
+    const { task, input } = await readyTask();
+    const approved = await createDiffSnapshot(task);
+    await approveAndCreatePullRequest(task.id, input, successfulDependencies());
+    const committed = await createCommittedDiffSnapshot(task, approved.baseHead, task.commitSha!);
+    expect(committed.hash).toBe(approved.hash);
+  });
+
+  it("rejects malicious local Git configuration before mutation", async () => {
+    for (const [key, value] of [["core.hooksPath", "/tmp/evil-hooks"], ["filter.evil.clean", "/tmp/evil-filter"]] as const) {
+      const { task } = await createRepo();
+      await runGit(task.worktreePath, ["config", key, value]);
+      await expect(runServerGitMutation(task.worktreePath, ["add", "--all"])).rejects.toThrow("Git config is not allowed");
+    }
   });
 
   it.each([

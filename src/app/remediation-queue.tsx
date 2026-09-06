@@ -10,6 +10,7 @@ import {
   type RemediationQueueItem,
   type RemediationQueueResponse,
 } from "@/findings/types";
+import { humanMutationFetch } from "./human-mutation";
 
 type Repo = { id: string; name: string };
 type Props = {
@@ -107,7 +108,7 @@ function QueueRow({ finding, busy, onOpenTask, onHistory, onError, onChanged }: 
   async function savePriority() {
     setProcessing(true); onError("");
     try {
-      const response = await fetch(`/api/findings/${finding.findingId}/priority`, { method: "POST", headers: { "Content-Type": "application/json", "X-MultiAgents-Human-Action": "finding-priority" }, body: JSON.stringify({ confirmed: true, priority: selectedPriority }) });
+      const response = await humanMutationFetch(`/api/findings/${finding.findingId}/priority`, "finding-priority", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmed: true, priority: selectedPriority }) });
       const data = await response.json() as { error?: string };
       if (!response.ok) throw new Error(data.error || "Priority update failed");
       onChanged();
@@ -119,7 +120,7 @@ function QueueRow({ finding, busy, onOpenTask, onHistory, onError, onChanged }: 
     if (!finding.implementationTaskId) return;
     setProcessing(true); onError("");
     try {
-      const response = await fetch(`/api/tasks/${finding.implementationTaskId}/refresh-pr`, { method: "POST" });
+      const response = await humanMutationFetch(`/api/tasks/${finding.implementationTaskId}/refresh-pr`, "task-refresh-pr", { method: "POST" });
       const data = await response.json() as { error?: string };
       if (!response.ok) throw new Error(data.error || "PR status refresh failed");
       onChanged();
@@ -131,7 +132,7 @@ function QueueRow({ finding, busy, onOpenTask, onHistory, onError, onChanged }: 
     if (!window.confirm("Mark this merged finding resolved? This is a human audit action.")) return;
     setProcessing(true); onError("");
     try {
-      const response = await fetch(`/api/findings/${finding.findingId}/resolve`, { method: "POST", headers: { "Content-Type": "application/json", "X-MultiAgents-Human-Action": "finding-resolve" }, body: JSON.stringify({ confirmed: true }) });
+      const response = await humanMutationFetch(`/api/findings/${finding.findingId}/resolve`, "finding-resolve", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmed: true }) });
       const data = await response.json() as { error?: string };
       if (!response.ok) throw new Error(data.error || "Finding resolution failed");
       onChanged();

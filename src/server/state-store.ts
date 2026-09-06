@@ -56,6 +56,7 @@ export const taskEventTypes = [
   "profile_snapshot_created", "template_snapshot_created",
   "finding_created", "finding_status_changed", "finding_converted", "implementation_task_created",
   "runtime_policy_created", "runtime_execution_started", "runtime_execution_completed", "runtime_violation_detected",
+  "human_gate_rejected", "approval_snapshot_mismatch", "post_commit_verification_failed",
 ] as const;
 export type TaskEventType = (typeof taskEventTypes)[number];
 export type TaskEventActor = "user" | "system" | "codex" | "cursor" | "claude";

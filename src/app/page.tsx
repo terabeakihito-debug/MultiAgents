@@ -11,6 +11,7 @@ import { agentRoles, validationSteps, type ProjectProfile, type ProjectProfileSn
 import type { RepoTemplateSettings, TaskTemplate, TaskTemplateSnapshot } from "@/templates/policy";
 import { humanPriorities, type Finding, type FindingEvent, type HumanPriority, type RemediationQueueItem } from "@/findings/types";
 import type { PublicRuntimePolicy, RuntimeViolationRecord } from "@/runtime/types";
+import { humanMutationFetch } from "./human-mutation";
 
 const labels: Record<AgentId, string> = { codex: "Codex", cursor: "Cursor", claude: "Claude" };
 const roleLabels = { draft: "Draft", review: "Review", final: "Final" } as const;
@@ -65,7 +66,6 @@ export default function Home() {
   const [steps, setSteps] = useState(initialSteps);
   const [flowStatus, setFlowStatus] = useState<ReviewFlowResult["status"] | "idle" | "running">("idle");
   const [finalOutput, setFinalOutput] = useState("");
-  const [flowPrompt, setFlowPrompt] = useState("");
   const [activeRerun, setActiveRerun] = useState<RerunnableStepId | null>(null);
   const [sending, setSending] = useState(false);
   const [repos, setRepos] = useState<Repo[]>([]);
@@ -86,7 +86,6 @@ export default function Home() {
   const [runtimePolicy, setRuntimePolicy] = useState<RuntimePolicyResponse | null>(null);
   const sendingRef = useRef(false);
   const flowAbortRef = useRef<AbortController | null>(null);
-  const currentFlowIdRef = useRef("");
 
   useEffect(() => { void fetch("/api/repos").then(async (response) => {
     const data = await response.json() as { repos?: Repo[]; error?: string };
@@ -130,14 +129,14 @@ export default function Home() {
   async function resumePersistedTask(taskId: string) {
     setTaskError(""); setTaskDiff(null); setApproval(null); setReviewedDiff(false); setTaskHistory(emptyHistory()); setFindings([]);
     try {
-      const response = await fetch(`/api/tasks/${taskId}/resume`, { method: "POST" });
+      const response = await humanMutationFetch(`/api/tasks/${taskId}/resume`, "task-resume", { method: "POST" });
       const data = await response.json() as { diff?: TaskDiff; task?: RepoTask; approval?: Approval; error?: string };
       if (!data.task) throw new Error(data.error || "Task resume failed");
       const restored = data.task;
-      setTask(restored); setRepoId(restored.repoId); setTemplateId(restored.template.templateId); setMode(restored.template.executionMode === "parallel" ? "parallel" : "review"); setPrompt(restored.prompt); setFlowPrompt(restored.prompt);
+      setTask(restored); setRepoId(restored.repoId); setTemplateId(restored.template.templateId); setMode(restored.template.executionMode === "parallel" ? "parallel" : "review"); setPrompt(restored.prompt);
       setSteps(restored.flowSteps?.length ? restored.flowSteps : initialSteps());
       setFlowStatus((restored.flowStatus as ReviewFlowResult["status"] | "idle" | "running") ?? "idle");
-      setFinalOutput(restored.finalOutput ?? ""); currentFlowIdRef.current = restored.flowId ?? "";
+      setFinalOutput(restored.finalOutput ?? "");
       setTaskDiff(data.diff ?? null); setApproval(data.approval ?? null);
       if (data.error) setTaskError(data.error);
       await loadTaskHistory(restored.id); setHistoryTitle(""); setDashboardRefresh((value) => value + 1);
@@ -148,7 +147,7 @@ export default function Home() {
   async function createIsolatedTask() {
     setTaskError(""); setTaskDiff(null); setApproval(null); setReviewedDiff(false); setOpenPulls([]); setTaskHistory(emptyHistory()); setFindings([]);
     try {
-      const response = await fetch("/api/tasks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repoId, templateId, prompt }) });
+      const response = await humanMutationFetch("/api/tasks", "task-create", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repoId, templateId, prompt }) });
       const data = await response.json() as { task?: RepoTask; error?: string };
       if (!response.ok || !data.task) throw new Error(data.error || "Task creation failed");
       setTask(data.task); setMode(data.task.template.executionMode === "parallel" ? "parallel" : "review"); await loadTaskHistory(data.task.id); setDashboardRefresh((value) => value + 1);
@@ -171,7 +170,7 @@ export default function Home() {
     if (!repoId || reviewProcessing) return;
     setReviewProcessing(true); setTaskError("");
     try {
-      const response = await fetch("/api/tasks/recover-pr", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repoId, prNumber }) });
+      const response = await humanMutationFetch("/api/tasks/recover-pr", "task-recover-pr", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repoId, prNumber }) });
       const data = await response.json() as { task?: RepoTask; error?: string };
       if (!response.ok || !data.task) throw new Error(data.error || "PR task recovery failed");
       setTask(data.task); setMode("review"); setOpenPulls([]); if (data.task.worktreeAvailable) await refreshDiff(data.task); else await loadTaskHistory(data.task.id);
@@ -181,7 +180,7 @@ export default function Home() {
 
   async function refreshDiff(activeTask = task) {
     if (!activeTask) return;
-    const response = await fetch(`/api/tasks/${activeTask.id}`);
+    const response = await humanMutationFetch(`/api/tasks/${activeTask.id}/prepare-approval`, "task-prepare-approval", { method: "POST" });
     const data = await response.json() as { diff?: TaskDiff; task?: RepoTask; approval?: Approval; error?: string };
     if (!data.diff) throw new Error(data.error || "Could not load diff");
     const previousHash = approval?.diffHash;
@@ -197,7 +196,7 @@ export default function Home() {
   async function deleteWorktree() {
     if (!task) return;
     setTaskError("");
-    const response = await fetch(`/api/tasks/${task.id}`, { method: "DELETE" });
+    const response = await humanMutationFetch(`/api/tasks/${task.id}`, "task-delete", { method: "DELETE" });
     if (!response.ok) { const data = await response.json() as { error?: string }; setTaskError(data.error || "Cleanup failed"); return; }
     setTask(null); setTaskDiff(null); setApproval(null); setReviewedDiff(false); setTaskHistory(emptyHistory()); setFindings([]);
     setDashboardRefresh((value) => value + 1);
@@ -213,25 +212,24 @@ export default function Home() {
 
   async function runParallel() {
     setCards(Object.fromEntries(agentIds.map((id) => [id, { status: "running", output: "" }])) as Record<AgentId, CardState>);
-    await Promise.allSettled(agentIds.map(async (id) => {
-      try {
-        const response = await fetch(`/api/agents/${id}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt }) });
-        const data = await response.json() as AgentResult | { error: string };
-        if (!response.ok || !("agent" in data)) throw new Error(data.error || `Request failed (${response.status})`);
-        setCards((current) => ({ ...current, [id]: { status: data.status, output: data.output, error: data.error } }));
-      } catch (error) { setCards((current) => ({ ...current, [id]: { status: "error", output: "", error: message(error) } })); }
-    }));
+    try {
+      const response = await humanMutationFetch("/api/agents/parallel", "agent-run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt }) });
+      const data = await response.json() as { results?: AgentResult[]; error?: string };
+      if (!response.ok || !data.results || data.results.length !== agentIds.length) throw new Error(data.error || `Request failed (${response.status})`);
+      setCards(Object.fromEntries(data.results.map((result) => [result.agent, { status: result.status, output: result.output, error: result.error }])) as Record<AgentId, CardState>);
+    } catch (error) {
+      setCards(Object.fromEntries(agentIds.map((id) => [id, { status: "error", output: "", error: message(error) }])) as Record<AgentId, CardState>);
+    }
   }
 
   async function runFlow() {
     setFlowStatus("running");
     setSteps(initialSteps());
     setFinalOutput("");
-    setFlowPrompt(prompt);
     const abortController = new AbortController();
     flowAbortRef.current = abortController;
     try {
-      const response = await fetch("/api/flows/review/stream", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt, taskId: task?.id }), signal: abortController.signal });
+      const response = await humanMutationFetch("/api/flows/review/stream", "review-run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt, taskId: task?.id }), signal: abortController.signal });
       if (!response.ok) {
         const data = await response.json() as { error?: string };
         throw new Error(data.error || `Request failed (${response.status})`);
@@ -258,15 +256,15 @@ export default function Home() {
   }
 
   async function rerunStep(stepId: RerunnableStepId) {
-    if (!flowPrompt || !acquireRunLock(sendingRef)) return;
+    if (!task || !acquireRunLock(sendingRef)) return;
     setSending(true);
     setActiveRerun(stepId);
     const abortController = new AbortController();
     flowAbortRef.current = abortController;
     try {
-      const response = await fetch("/api/flows/review/rerun", {
+      const response = await humanMutationFetch("/api/flows/review/rerun", "review-rerun", {
         method: "POST", headers: { "Content-Type": "application/json" }, signal: abortController.signal,
-        body: JSON.stringify({ prompt: flowPrompt, flowId: currentFlowIdRef.current, stepId, steps, taskId: task?.id }),
+        body: JSON.stringify({ taskId: task.id, stepId }),
       });
       if (!response.ok) {
         const data = await response.json() as { error?: string };
@@ -296,7 +294,7 @@ export default function Home() {
   }
 
   function applyFlowEvent(event: FlowEvent) {
-    if (event.type === "flow_started") { currentFlowIdRef.current = event.flowId; setFlowStatus("running"); return; }
+    if (event.type === "flow_started") { setFlowStatus("running"); return; }
     if ("step" in event) {
       setSteps((current) => current.map((step) => step.id === event.step.id ? event.step : step));
       return;
@@ -330,7 +328,7 @@ export default function Home() {
     }, 1_000);
     try {
       const rework = task.approvalPurpose === "rework";
-      const response = await fetch(`/api/tasks/${task.id}/${rework ? "approve-rework" : "approve"}`, {
+      const response = await humanMutationFetch(`/api/tasks/${task.id}/${rework ? "approve-rework" : "approve"}`, rework ? "task-approve-rework" : "task-approve", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ approved: true, diffHash: approval.diffHash, approvalId: approval.approvalId }),
@@ -354,7 +352,7 @@ export default function Home() {
     if (!task || reviewProcessing) return;
     setReviewProcessing(true); setTaskError("");
     try {
-      const response = await fetch(`/api/tasks/${task.id}/fetch-review`, { method: "POST" });
+      const response = await humanMutationFetch(`/api/tasks/${task.id}/fetch-review`, "task-fetch-review", { method: "POST" });
       const data = await response.json() as { task?: RepoTask; error?: string };
       if (!response.ok || !data.task) throw new Error(data.error || "PR review fetch failed");
       setTask(data.task); setReviewedDiff(false); await loadTaskHistory(data.task.id);
@@ -366,7 +364,7 @@ export default function Home() {
     if (!task || reviewProcessing) return;
     setReviewProcessing(true); setTaskError("");
     try {
-      const response = await fetch(`/api/tasks/${task.id}/apply-review`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ approved: true }) });
+      const response = await humanMutationFetch(`/api/tasks/${task.id}/apply-review`, "task-apply-review", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ approved: true }) });
       const data = await response.json() as { task?: RepoTask; error?: string };
       if (!response.ok || !data.task) throw new Error(data.error || "PR rework failed");
       setTask(data.task); await refreshDiff(data.task);
@@ -379,7 +377,7 @@ export default function Home() {
     setApprovalProcessing(true);
     setTaskError("");
     try {
-      const response = await fetch(`/api/tasks/${task.id}/create-pr`, { method: "POST" });
+      const response = await humanMutationFetch(`/api/tasks/${task.id}/create-pr`, "task-create-pr", { method: "POST" });
       const data = await response.json() as { task?: RepoTask; error?: string };
       if (!response.ok || !data.task) throw new Error(data.error || "PR retry failed");
       setTask(data.task); await loadTaskHistory(data.task.id);
@@ -403,7 +401,7 @@ export default function Home() {
       <textarea id="prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} maxLength={20_000} rows={6} placeholder="Describe the repository task, or ask Codex, Cursor, and Claude…" />
       <div className="actions"><span>{prompt.length.toLocaleString()} / 20,000</span><div className="actionButtons">{sending && mode === "review" && <button className="cancel" type="button" onClick={cancelFlow}>Cancel</button>}<button type="submit" disabled={sending || !prompt.trim() || (mode === "review" && Boolean(task) && !task?.worktreeAvailable && !task?.template.readOnly)}>{sending ? "Running…" : mode === "parallel" ? "Send to all" : "Run review flow"}</button></div></div>
     </form>
-    {mode === "parallel" ? <section className="cards" aria-label="Agent responses">{agentIds.map((id) => <AgentCard key={id} name={labels[id]} state={cards[id]} />)}</section> : <FlowTimeline steps={steps} versions={taskHistory.stepVersions} status={flowStatus} finalOutput={finalOutput} sending={sending} activeRerun={activeRerun} onRerun={rerunStep} />}
+    {mode === "parallel" ? <section className="cards" aria-label="Agent responses">{agentIds.map((id) => <AgentCard key={id} name={labels[id]} state={cards[id]} />)}</section> : <FlowTimeline steps={steps} versions={taskHistory.stepVersions} status={flowStatus} finalOutput={finalOutput} sending={sending} activeRerun={activeRerun} rerunAvailable={Boolean(task)} onRerun={rerunStep} />}
     {task && runtimePolicy ? <RuntimePolicyPanel task={task} runtime={runtimePolicy} /> : null}
     {task?.runtimeViolation ? <section className="runtimeViolation" role="alert"><strong>NEEDS ATTENTION</strong><h2>Runtime policy violation</h2><p>{task.runtimeViolation.message}</p><p>Human review is required. No commit, push, approval, or PR action is permitted.</p></section> : null}
     {task && ["security_review", "investigation"].includes(task.template.taskType) ? <FindingsPanel task={task} templates={selectedRepo?.templates ?? []} findings={findings} busy={sending || reviewProcessing} onFindings={setFindings} onOpenTask={(id) => void resumePersistedTask(id)} onHistoryRefresh={() => void loadTaskHistory(task.id)} onDashboardRefresh={() => setDashboardRefresh((value) => value + 1)} onError={setTaskError} /> : null}
@@ -441,7 +439,7 @@ function FindingsPanel({ task, templates, findings, busy, onFindings, onOpenTask
   async function extract() {
     setProcessing("extract"); onError("");
     try {
-      const response = await fetch(`/api/tasks/${task.id}/findings/extract`, { method: "POST", headers: { "Content-Type": "application/json", "X-MultiAgents-Human-Action": "finding-extract" }, body: JSON.stringify({ confirmed: true }) });
+      const response = await humanMutationFetch(`/api/tasks/${task.id}/findings/extract`, "finding-extract", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmed: true }) });
       const data = await response.json() as { findings?: FindingDetail[]; error?: string };
       if (!response.ok || !data.findings) throw new Error(data.error || "Finding extraction failed");
       onFindings(data.findings); onHistoryRefresh();
@@ -458,9 +456,9 @@ function FindingsPanel({ task, templates, findings, busy, onFindings, onOpenTask
     }
     setProcessing(finding.findingId); onError("");
     try {
-      const response = await fetch(`/api/findings/${finding.findingId}/${action}`, {
+      const response = await humanMutationFetch(`/api/findings/${finding.findingId}/${action}`, `finding-${action}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-MultiAgents-Human-Action": `finding-${action}` },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(action === "accept" ? { confirmed: true } : { confirmed: true, reason }),
       });
       const data = await response.json() as { finding?: Finding; remediation?: RemediationQueueItem; history?: FindingEvent[]; error?: string };
@@ -481,9 +479,9 @@ function FindingsPanel({ task, templates, findings, busy, onFindings, onOpenTask
     if (!conversion) return;
     setProcessing(conversion.findingId); onError("");
     try {
-      const response = await fetch(`/api/findings/${conversion.findingId}/convert`, {
+      const response = await humanMutationFetch(`/api/findings/${conversion.findingId}/convert`, "finding-convert", {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-MultiAgents-Human-Action": "finding-convert" },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ confirmed: true, templateId: conversionTemplate, objective }),
       });
       const data = await response.json() as { finding?: Finding; task?: RepoTask; remediation?: RemediationQueueItem; history?: FindingEvent[]; error?: string };
@@ -498,8 +496,8 @@ function FindingsPanel({ task, templates, findings, busy, onFindings, onOpenTask
     const priority = priorityDrafts[finding.findingId] ?? finding.humanPriority;
     setProcessing(finding.findingId); onError("");
     try {
-      const response = await fetch(`/api/findings/${finding.findingId}/priority`, {
-        method: "POST", headers: { "Content-Type": "application/json", "X-MultiAgents-Human-Action": "finding-priority" },
+      const response = await humanMutationFetch(`/api/findings/${finding.findingId}/priority`, "finding-priority", {
+        method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ confirmed: true, priority }),
       });
       const data = await response.json() as { finding?: Finding; remediation?: RemediationQueueItem; history?: FindingEvent[]; error?: string };
@@ -514,8 +512,8 @@ function FindingsPanel({ task, templates, findings, busy, onFindings, onOpenTask
     if (!window.confirm("Mark this finding resolved after its merged PR?")) return;
     setProcessing(finding.findingId); onError("");
     try {
-      const response = await fetch(`/api/findings/${finding.findingId}/resolve`, {
-        method: "POST", headers: { "Content-Type": "application/json", "X-MultiAgents-Human-Action": "finding-resolve" },
+      const response = await humanMutationFetch(`/api/findings/${finding.findingId}/resolve`, "finding-resolve", {
+        method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ confirmed: true }),
       });
       const data = await response.json() as { finding?: Finding; remediation?: RemediationQueueItem; history?: FindingEvent[]; error?: string };
@@ -562,9 +560,9 @@ function TemplatePanel({ repo, selectedTemplateId, disabled, onSelected, onSaved
   async function save(input: { templateId?: string; enabled?: boolean; defaultTemplateId?: string }, key: string) {
     setSaving(key); onError("");
     try {
-      const response = await fetch(`/api/repos/${encodeURIComponent(repo.id)}/templates`, {
+      const response = await humanMutationFetch(`/api/repos/${encodeURIComponent(repo.id)}/templates`, "template-save", {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-MultiAgents-Human-Action": "template-save" },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ confirmation: true, ...input }),
       });
       const data = await response.json() as TemplateData & { error?: string };
@@ -603,9 +601,9 @@ function ProfilePanelContent({ repoId, profile, onSaved, onError }: ProfilePanel
     if (!window.confirm(`Save ${name} as the human-managed profile for this repository? Existing tasks will keep their snapshots.`)) return;
     setSaving(true); onError("");
     try {
-      const response = await fetch(`/api/repos/${encodeURIComponent(repoId)}/profile`, {
+      const response = await humanMutationFetch(`/api/repos/${encodeURIComponent(repoId)}/profile`, "profile-save", {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-MultiAgents-Human-Action": "profile-save" },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ confirmation: true, name, enabled, roles, validation }),
       });
       const data = await response.json() as { profile?: ProjectProfile; error?: string };
@@ -653,7 +651,7 @@ function PrReviewPanel({ task, processing, onFetch, onApply }: { task: RepoTask;
 }
 
 function AgentCard({ name, state }: { name: string; state: CardState }) { return <article className="card"><div className="cardHeader"><h2>{name}</h2><Status value={state.status} /></div>{state.error && <ErrorBlock error={state.error} />}<pre className="output">{state.output || fallback(state.status)}</pre></article>; }
-function FlowTimeline({ steps, versions, status, finalOutput, sending, activeRerun, onRerun }: { steps: FlowStep[]; versions: StepVersion[]; status: ReviewFlowResult["status"] | "idle" | "running"; finalOutput: string; sending: boolean; activeRerun: RerunnableStepId | null; onRerun: (id: RerunnableStepId) => void }) { return <section className="flow" aria-label="Review flow"><div className="flowTitle"><h2>Review Flow</h2><Status value={status} /></div>{flowStepIds.map((id, index) => { const step = steps.find((item) => item.id === id)!; const stepVersions = versions.filter((item) => item.stepId === id); const rerunnable = rerunnableStepIds.includes(id as RerunnableStepId) && ["completed", "stale", "error"].includes(step.status) && Boolean(step.output); return <div key={id}><article className={`card flowStep ${step.role === "final" ? "finalStep" : ""}`}><div className="cardHeader"><div><span className="stepNumber">Step {index + 1}</span><h2>{labels[step.agent]} — {roleLabels[step.role]}</h2></div><Status value={step.status} /></div><div className="duration">{step.status === "running" ? activeRerun === id ? "Re-running..." : "Running..." : <>Duration: {step.durationMs === undefined ? "—" : formatDuration(step.durationMs)}</>}</div>{step.error && (step.status === "stale" ? <div className="staleReason">{step.error}</div> : <ErrorBlock error={step.error} />)}{stepVersions.length > 1 ? <StepVersionViewer key={`${id}-${stepVersions.at(-1)?.version}`} versions={stepVersions} /> : <pre className="output">{step.output || fallback(step.status)}</pre>}{rerunnable && <button className="rerun" type="button" disabled={sending} onClick={() => onRerun(id as RerunnableStepId)}>Re-run</button>}</article>{index < steps.length - 1 && <div className="arrow" aria-hidden="true">↓</div>}</div>; })}{finalOutput && <article className="card finalOutput"><h2>Final Output</h2><pre className="output">{finalOutput}</pre></article>}</section>; }
+function FlowTimeline({ steps, versions, status, finalOutput, sending, activeRerun, rerunAvailable, onRerun }: { steps: FlowStep[]; versions: StepVersion[]; status: ReviewFlowResult["status"] | "idle" | "running"; finalOutput: string; sending: boolean; activeRerun: RerunnableStepId | null; rerunAvailable: boolean; onRerun: (id: RerunnableStepId) => void }) { return <section className="flow" aria-label="Review flow"><div className="flowTitle"><h2>Review Flow</h2><Status value={status} /></div>{flowStepIds.map((id, index) => { const step = steps.find((item) => item.id === id)!; const stepVersions = versions.filter((item) => item.stepId === id); const rerunnable = rerunAvailable && rerunnableStepIds.includes(id as RerunnableStepId) && ["completed", "stale", "error"].includes(step.status) && Boolean(step.output); return <div key={id}><article className={`card flowStep ${step.role === "final" ? "finalStep" : ""}`}><div className="cardHeader"><div><span className="stepNumber">Step {index + 1}</span><h2>{labels[step.agent]} — {roleLabels[step.role]}</h2></div><Status value={step.status} /></div><div className="duration">{step.status === "running" ? activeRerun === id ? "Re-running..." : "Running..." : <>Duration: {step.durationMs === undefined ? "—" : formatDuration(step.durationMs)}</>}</div>{step.error && (step.status === "stale" ? <div className="staleReason">{step.error}</div> : <ErrorBlock error={step.error} />)}{stepVersions.length > 1 ? <StepVersionViewer key={`${id}-${stepVersions.at(-1)?.version}`} versions={stepVersions} /> : <pre className="output">{step.output || fallback(step.status)}</pre>}{rerunnable && <button className="rerun" type="button" disabled={sending} onClick={() => onRerun(id as RerunnableStepId)}>Re-run</button>}</article>{index < steps.length - 1 && <div className="arrow" aria-hidden="true">↓</div>}</div>; })}{finalOutput && <article className="card finalOutput"><h2>Final Output</h2><pre className="output">{finalOutput}</pre></article>}</section>; }
 
 function StepVersionViewer({ versions }: { versions: StepVersion[] }) {
   const [selected, setSelected] = useState(versions.at(-1)?.version ?? 1);

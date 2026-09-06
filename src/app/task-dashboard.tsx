@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { taskBuckets, type DashboardCounts, type DashboardResponse, type DashboardTask, type TaskBucket } from "@/dashboard/types";
 import { RemediationQueue } from "./remediation-queue";
+import { humanMutationFetch } from "./human-mutation";
 
 type Repo = { id: string; name: string };
 type Props = {
@@ -81,7 +82,7 @@ function TaskDashboardContent({ repos, busy, refreshToken, onResume, onHistory, 
   async function refreshPr(task: DashboardTask) {
     setActionTaskId(task.id);
     try {
-      const response = await fetch(`/api/tasks/${task.id}/refresh-pr`, { method: "POST" });
+      const response = await humanMutationFetch(`/api/tasks/${task.id}/refresh-pr`, "task-refresh-pr", { method: "POST" });
       const data = await response.json() as { error?: string };
       if (!response.ok) throw new Error(data.error || "PR status refresh failed");
       setRefreshSequence((value) => value + 1);
@@ -92,7 +93,7 @@ function TaskDashboardContent({ repos, busy, refreshToken, onResume, onHistory, 
   async function cleanup(task: DashboardTask) {
     setActionTaskId(task.id);
     try {
-      const response = await fetch(`/api/tasks/${task.id}`, {
+      const response = await humanMutationFetch(`/api/tasks/${task.id}`, "task-delete", {
         method: "DELETE",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ confirmedPrCleanup: Boolean(task.prNumber) }),

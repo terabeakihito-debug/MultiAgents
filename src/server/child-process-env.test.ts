@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildChildProcessEnv, type ChildProcessPurpose } from "./child-process-env";
+import { buildChildProcessEnv, buildServerGitMutationEnv, type ChildProcessPurpose } from "./child-process-env";
 import { runFixedProcess } from "./pull-request";
 
 const fixture = "TEST_SECRET_DO_NOT_LEAK";
@@ -59,5 +59,17 @@ describe("Phase 16 child process environment isolation", () => {
     const env = buildChildProcessEnv({ purpose: "validation", baseEnv: parent, overrides: { SERVICE_TOKEN: fixture, NODE_ENV: "production" } });
     expect(env.NODE_ENV).toBe("production");
     expect(env.SERVICE_TOKEN).toBeUndefined();
+  });
+
+  it("isolates server Git mutations from config and repository path injection", () => {
+    const env = buildServerGitMutationEnv({
+      HOME: "/home/test", PATH: "/usr/bin", SSH_AUTH_SOCK: "/run/user/1000/agent",
+      GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "core.hooksPath", GIT_CONFIG_VALUE_0: "/tmp/hooks",
+      GIT_DIR: "/tmp/evil.git", GIT_WORK_TREE: "/tmp/evil", GIT_INDEX_FILE: "/tmp/index",
+      GIT_SSH_COMMAND: "/tmp/evil-ssh", GIT_ASKPASS: "/tmp/askpass",
+    });
+    expect(env).toMatchObject({ HOME: "/home/test", PATH: "/usr/bin", SSH_AUTH_SOCK: "/run/user/1000/agent", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_SYSTEM: "/dev/null", GIT_CONFIG_GLOBAL: "/dev/null", GIT_NO_REPLACE_OBJECTS: "1" });
+    expect(Object.keys(env).some((key) => key === "GIT_CONFIG_COUNT" || key.startsWith("GIT_CONFIG_KEY_"))).toBe(false);
+    for (const key of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_SSH_COMMAND", "GIT_ASKPASS"]) expect(env).not.toHaveProperty(key);
   });
 });

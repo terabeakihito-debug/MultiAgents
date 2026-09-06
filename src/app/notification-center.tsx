@@ -3,6 +3,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { defaultNotificationPreferences, notificationTypes, type AppNotification, type NotificationPreferences, type NotificationSeverity, type NotificationType } from "@/notifications/types";
 import { defaultOutboundChannelConfig, type OutboundChannelConfig } from "@/outbound/types";
+import { humanMutationFetch } from "./human-mutation";
+import type { HumanMutationAction } from "@/security/human-actions";
 
 type Repo = { id: string; name: string };
 type Props = { repos: Repo[]; refreshToken: number; onOpenTask: (taskId: string) => void; onError: (message: string) => void };
@@ -74,8 +76,8 @@ export function NotificationCenter({ repos, refreshToken, onOpenTask, onError }:
     ]).catch((error: unknown) => onError(error instanceof Error ? error.message : "Could not load notification settings"));
   }, [onError, open]);
 
-  async function mutate(path: string, action: string) {
-    const response = await fetch(path, { method: "POST", headers: { "X-MultiAgents-Human-Action": action } });
+  async function mutate(path: string, action: HumanMutationAction) {
+    const response = await humanMutationFetch(path, action, { method: "POST" });
     const data = await response.json() as { error?: string };
     if (!response.ok) throw new Error(data.error || "Notification update failed");
     await load();
@@ -83,8 +85,8 @@ export function NotificationCenter({ repos, refreshToken, onOpenTask, onError }:
 
   async function savePreferences(next: NotificationPreferences) {
     setPreferences(next);
-    const response = await fetch("/api/notification-preferences", {
-      method: "POST", headers: { "Content-Type": "application/json", "X-MultiAgents-Human-Action": "notification-preferences" }, body: JSON.stringify(next),
+    const response = await humanMutationFetch("/api/notification-preferences", "notification-preferences", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(next),
     });
     const data = await response.json() as { preferences?: NotificationPreferences; error?: string };
     if (!response.ok || !data.preferences) throw new Error(data.error || "Could not save notification preferences");
@@ -92,8 +94,8 @@ export function NotificationCenter({ repos, refreshToken, onOpenTask, onError }:
 
   async function saveOutboundConfig(next: OutboundChannelConfig) {
     setOutboundConfig(next);
-    const response = await fetch("/api/outbound/slack/settings", {
-      method: "POST", headers: { "Content-Type": "application/json", "X-MultiAgents-Human-Action": "outbound-preferences" }, body: JSON.stringify(next),
+    const response = await humanMutationFetch("/api/outbound/slack/settings", "outbound-preferences", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(next),
     });
     const data = await response.json() as { configured?: boolean; config?: OutboundChannelConfig; error?: string };
     if (!response.ok || !data.config || typeof data.configured !== "boolean") throw new Error(data.error || "Could not save Slack settings");
@@ -103,7 +105,7 @@ export function NotificationCenter({ repos, refreshToken, onOpenTask, onError }:
   async function sendSlackTest() {
     setSendingTest(true);
     try {
-      const response = await fetch("/api/outbound/slack/test", { method: "POST", headers: { "X-MultiAgents-Human-Action": "outbound-test" } });
+      const response = await humanMutationFetch("/api/outbound/slack/test", "outbound-test", { method: "POST" });
       const data = await response.json() as { error?: string };
       if (!response.ok) throw new Error(data.error || "Slack test delivery failed");
     } finally { setSendingTest(false); }

@@ -26,35 +26,41 @@ type RerunOptions = {
 };
 
 export type ReviewRerunRequest = { prompt: string; flowId: string; stepId: RerunnableStepId; steps: FlowStep[] };
+export type ReviewRerunCommand = { taskId: string; stepId: RerunnableStepId };
 
-export function parseReviewRerunRequest(body: unknown): ReviewRerunRequest | { error: string } {
+export function parseReviewRerunCommand(body: unknown): ReviewRerunCommand | { error: string } {
   if (!body || typeof body !== "object") return { error: "Request body must be an object" };
   const value = body as Record<string, unknown>;
-  if (typeof value.prompt !== "string" || !value.prompt.trim()) return { error: "Prompt is required" };
-  if (value.prompt.length > 20_000) return { error: "Prompt must be 20000 characters or fewer" };
-  if (typeof value.flowId !== "string" || !value.flowId.trim() || value.flowId.length > 200) return { error: "A valid flowId is required" };
+  if (Object.keys(value).some((key) => !["taskId", "stepId"].includes(key))) return { error: "Rerun accepts only taskId and stepId" };
+  if (typeof value.taskId !== "string" || !/^[0-9a-f-]{36}$/i.test(value.taskId)) return { error: "A valid taskId is required" };
   if (typeof value.stepId !== "string" || !rerunnableStepIds.includes(value.stepId as RerunnableStepId)) return { error: "Invalid rerun stepId" };
-  if (!Array.isArray(value.steps) || value.steps.length !== flowStepIds.length) return { error: "Exactly four flow steps are required" };
+  return { taskId: value.taskId, stepId: value.stepId as RerunnableStepId };
+}
 
+export function reconstructReviewRerunRequest(
+  persisted: { prompt?: string; flowId?: string; flowSteps?: FlowStep[] },
+  stepId: RerunnableStepId,
+): ReviewRerunRequest | { error: string } {
+  if (typeof persisted.prompt !== "string" || !persisted.prompt.trim() || persisted.prompt.length > 20_000) return { error: "Persisted task prompt is unavailable" };
+  if (typeof persisted.flowId !== "string" || !persisted.flowId.trim() || persisted.flowId.length > 200) return { error: "Persisted flow is unavailable" };
+  if (!Array.isArray(persisted.flowSteps) || persisted.flowSteps.length !== flowStepIds.length) return { error: "Persisted flow must contain exactly four steps" };
   const steps: FlowStep[] = [];
   for (let index = 0; index < flowStepIds.length; index += 1) {
-    const raw = value.steps[index];
+    const raw = persisted.flowSteps[index];
     if (!raw || typeof raw !== "object") return { error: "Invalid flow step data" };
     const item = raw as Record<string, unknown>;
-    if (item.id !== flowStepIds[index] || typeof item.output !== "string") return { error: "Flow steps must use the fixed review order" };
+    if (item.id !== flowStepIds[index] || typeof item.output !== "string") return { error: "Persisted flow steps do not use the fixed review order" };
     if (item.output.length > MAX_STEP_OUTPUT_CHARS) return { error: `Step output must be ${MAX_STEP_OUTPUT_CHARS} characters or fewer` };
     const source = item as unknown as FlowStep;
-    // Agent and role are canonicalized below; client-provided executable identity is ignored.
     const canonical = canonicalStep(source.id);
     steps.push({ ...source, ...canonical, output: item.output });
   }
-  const stepId = value.stepId as RerunnableStepId;
   const missing = requiredUpstream(stepId).find((id) => {
     const step = steps.find((item) => item.id === id)!;
     return !step.output || !["completed", "stale"].includes(step.status);
   });
   if (missing) return { error: `Missing usable upstream data: ${missing}` };
-  return { prompt: value.prompt, flowId: value.flowId, stepId, steps };
+  return { prompt: persisted.prompt, flowId: persisted.flowId, stepId, steps };
 }
 
 export async function rerunReviewStep(request: ReviewRerunRequest, options: RerunOptions = {}): Promise<ReviewRerunResult> {

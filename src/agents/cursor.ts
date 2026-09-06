@@ -1,10 +1,11 @@
 import { createAgentAdapter } from "./runner";
 import { workspaceDirectory } from "./workspace";
 
-export function cursorArgs(prompt: string, cwd: string, _repositoryTask: boolean, writeAccess: boolean) {
+export function cursorArgs(prompt: string, cwd: string, _repositoryTask: boolean, _writeAccess: boolean) {
+  void _repositoryTask; void _writeAccess;
   return [
-    "--trust", "--workspace", cwd,
-    ...(!writeAccess ? ["--mode", "ask", "--sandbox", "enabled"] : []),
+    "--trust", "--workspace", cwd, "--skip-worktree-setup",
+    "--mode", "ask", "--sandbox", "enabled",
     "-p", prompt,
   ];
 }

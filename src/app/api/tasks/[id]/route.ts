@@ -1,6 +1,5 @@
 import { deleteTask, getTask, getTaskDiff, initializeTaskRecovery, publicTask } from "@/server/tasks";
-import { prepareApproval } from "@/server/pull-request";
-import { rejectNonLocalRequest } from "@/server/request-security";
+import { rejectNonLocalRequest, requireHumanMutation } from "@/server/request-security";
 
 export const runtime = "nodejs";
 export async function GET(request: Request, context: { params: Promise<{ id: string }> }) {
@@ -11,13 +10,13 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
     diff: { trackedFiles: [], untrackedFiles: [], stat: "", patch: "", untrackedPatch: "", truncated: false, approvable: false, blockedReason: "Managed task worktree is unavailable in this review-only session." },
     task: publicTask(task),
   });
-  try { return Response.json(await prepareApproval(task)); }
+  try { return Response.json({ diff: await getTaskDiff(task), task: publicTask(task) }); }
   catch (error) {
-    return Response.json({ diff: await getTaskDiff(task), task: publicTask(task), error: error instanceof Error ? error.message : "Could not prepare approval" }, { status: 409 });
+    return Response.json({ diff: await getTaskDiff(task), task: publicTask(task), error: error instanceof Error ? error.message : "Could not load task diff" }, { status: 409 });
   }
 }
 export async function DELETE(request: Request, context: { params: Promise<{ id: string }> }) {
-  const rejection = rejectNonLocalRequest(request); if (rejection) return rejection;
+  const rejection = requireHumanMutation(request, "task-delete", { method: "DELETE", label: "Task cleanup" }); if (rejection) return rejection;
   await initializeTaskRecovery();
   let input: { confirmedPrCleanup?: boolean } = {};
   try {

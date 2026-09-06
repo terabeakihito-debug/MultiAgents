@@ -1,5 +1,5 @@
 import { createReviewFlowStream } from "@/flows/review-stream";
-import { rejectNonLocalRequest } from "@/server/request-security";
+import { requireHumanMutation } from "@/server/request-security";
 import { beginTaskReview, completeTaskReview, executionPromptForTask, executionRootForTask, getTask, getTaskDiff, initializeTaskRecovery, recordFlowEvent, requireTaskTemplate } from "@/server/tasks";
 import { createDiffSnapshot } from "@/server/pull-request";
 import { agents } from "@/agents";
@@ -9,7 +9,7 @@ export const runtime = "nodejs";
 const MAX_PROMPT_LENGTH = 20_000;
 
 export async function POST(request: Request) {
-  const rejection = rejectNonLocalRequest(request);
+  const rejection = requireHumanMutation(request, "review-run", { label: "Review execution" });
   if (rejection) return rejection;
   await initializeTaskRecovery();
 

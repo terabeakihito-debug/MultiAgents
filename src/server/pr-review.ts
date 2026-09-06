@@ -9,6 +9,9 @@ import {
   GH_BINARY,
   ApprovalError,
   createDiffSnapshot,
+  runServerGitMutation,
+  verifyCommittedApproval,
+  verifyStagedApproval,
   runFixedProcess,
   runProjectValidation,
   scanSecrets,
@@ -50,9 +53,9 @@ const defaults: PrReviewDependencies = {
   fetchDiff: fetchPullRequestDiff,
   runIntake: runPrReviewIntake,
   runRework: runPrReworkFlow,
-  stage: async (task) => { await runGit(task.worktreePath, ["add", "--all"]); },
-  commit: async (task) => { await runGit(task.worktreePath, ["commit", "-m", "multiagents: address PR review"]); },
-  push: async (task) => { await runGit(task.worktreePath, ["push", "origin", task.branch]); },
+  stage: async (task) => { await runServerGitMutation(task.worktreePath, ["add", "--all"]); },
+  commit: async (task) => { await runServerGitMutation(task.worktreePath, ["commit", "-m", "multiagents: address PR review"]); },
+  push: async (task) => { await runServerGitMutation(task.worktreePath, ["push", "origin", task.branch]); },
   checkGhAuth: async (task) => { await checkedGh(["auth", "status", "--hostname", "github.com"], task.worktreePath); },
   checkDependencies: async (task) => { const { checkTaskDependencies } = await import("./pull-request"); await checkTaskDependencies(task); },
   runValidation: async (task, script, timeoutMs) => { const { runValidationCommand } = await import("./pull-request"); await runValidationCommand(task, script, timeoutMs); },
@@ -227,9 +230,13 @@ export async function approveRework(taskId: string, input: ApprovalInput, depend
       recordTaskEvent(task, "validation_passed", "system", { status: "passed", metadata: { diffHash: input.diffHash } });
 
       transitionTask(task, "committing_rework");
+      let approvedSnapshot: Awaited<ReturnType<typeof createDiffSnapshot>>;
+      let stagedTree: string;
       try {
         await deps.stage(task);
-        if ((await createDiffSnapshot(task)).hash !== input.diffHash) throw approvalInvalidated(task);
+        approvedSnapshot = await createDiffSnapshot(task);
+        if (approvedSnapshot.hash !== input.diffHash) throw approvalInvalidated(task);
+        stagedTree = await verifyStagedApproval(task, approvedSnapshot);
         await deps.commit(task);
       } catch (error) {
         if (error instanceof ApprovalError) throw error;
@@ -241,6 +248,7 @@ export async function approveRework(taskId: string, input: ApprovalInput, depend
       const commitSha = await runGit(task.worktreePath, ["rev-parse", "HEAD"]);
       if (commitSha === task.reworkBaseSha) throw new Error("Rework commit was not appended");
       task.commitSha = commitSha;
+      await verifyCommittedApproval(task, approvedSnapshot, stagedTree, commitSha);
       task.approvalState = "used";
       persistTask(task);
       recordTaskEvent(task, "commit_created", "system", { status: "created", metadata: { commitSha } });
@@ -543,8 +551,11 @@ async function validateReworkSafety(task: RepoTask, review: PullRequestReview) {
 }
 
 async function validateOrigin(task: RepoTask) {
-  const current = await runGit(task.worktreePath, ["remote", "get-url", "origin"]);
-  if (!task.originUrl || current !== task.originUrl) throw new Error("GitHub origin changed after task creation");
+  const [current, push] = await Promise.all([
+    runGit(task.worktreePath, ["remote", "get-url", "origin"]),
+    runGit(task.worktreePath, ["remote", "get-url", "--push", "origin"]),
+  ]);
+  if (!task.originUrl || current !== task.originUrl || push !== task.originUrl) throw new Error("GitHub origin changed after task creation");
   return validateGitHubRemote(current);
 }
 

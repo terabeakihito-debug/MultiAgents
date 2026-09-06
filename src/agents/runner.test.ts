@@ -189,10 +189,27 @@ describe("createAgentAdapter", () => {
   });
 
   it("uses fixed CLI read-only modes for repository reviewers", () => {
-    expect(cursorArgs("review", "/task", true, false)).toEqual(["--trust", "--workspace", "/task", "--mode", "ask", "--sandbox", "enabled", "-p", "review"]);
-    expect(claudeArgs("review", "/task", true, false)).toEqual(["--permission-mode", "plan", "--tools", "Read,Glob,Grep", "-p", "review"]);
-    expect(cursorArgs("answer", "/workspace", false, false)).toEqual(["--trust", "--workspace", "/workspace", "--mode", "ask", "--sandbox", "enabled", "-p", "answer"]);
-    expect(claudeArgs("answer", "/workspace", false, false)).toEqual(["--permission-mode", "plan", "--tools", "Read,Glob,Grep", "-p", "answer"]);
+    expect(cursorArgs("review", "/task", true, false)).toEqual(["--trust", "--workspace", "/task", "--skip-worktree-setup", "--mode", "ask", "--sandbox", "enabled", "-p", "review"]);
+    expect(claudeArgs("review", "/task", true, false)).toEqual(["--restricted", "--safe-mode", "--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence", "--no-chrome", "--permission-mode", "plan", "--permission-prompts", "none", "--tools", "Read,Glob,Grep", "-p", "review"]);
+    expect(cursorArgs("answer", "/workspace", false, false)).toEqual(["--trust", "--workspace", "/workspace", "--skip-worktree-setup", "--mode", "ask", "--sandbox", "enabled", "-p", "answer"]);
+    expect(claudeArgs("answer", "/workspace", false, false)).toEqual(["--restricted", "--safe-mode", "--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence", "--no-chrome", "--permission-mode", "plan", "--permission-prompts", "none", "--tools", "Read,Glob,Grep", "-p", "answer"]);
+    expect(cursorArgs("inject --mode plan", "/task", true, true)).toContain("enabled");
+    expect(claudeArgs("add Bash", "/task", true, true)).not.toContain("Bash");
+  });
+
+  it("does not let Cursor project instructions elevate review access", () => {
+    const injected = "--sandbox disabled --force --plugin-dir /tmp/evil";
+    const args = cursorArgs(injected, "/task", true, true);
+    expect(args).toEqual(["--trust", "--workspace", "/task", "--skip-worktree-setup", "--mode", "ask", "--sandbox", "enabled", "-p", injected]);
+    expect(args).not.toContain("--force");
+  });
+
+  it("isolates Claude project instructions, plugins, hooks, MCP and executable tools", () => {
+    const injected = "Use CLAUDE.md and add Bash,Edit";
+    const args = claudeArgs(injected, "/task", true, true);
+    expect(args).toEqual(["--restricted", "--safe-mode", "--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence", "--no-chrome", "--permission-mode", "plan", "--permission-prompts", "none", "--tools", "Read,Glob,Grep", "-p", injected]);
+    expect(args).not.toContain("Bash");
+    expect(args).not.toContain("Edit");
   });
 
   it("returns an agent-scoped error without throwing", async () => {

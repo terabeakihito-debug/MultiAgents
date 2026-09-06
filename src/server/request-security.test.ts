@@ -1,74 +1,110 @@
-import { describe, expect, it } from "vitest";
-import { rejectNonHumanFindingMutation, rejectNonHumanProfileMutation, rejectNonHumanTemplateMutation, rejectNonLocalRequest } from "./request-security";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { beginAgentExecution } from "./agent-execution-guard";
+import { clearHumanMutationSessionsForTests, issueHumanMutationNonce, rejectNonLocalRequest, requireHumanMutation } from "./request-security";
+
+const ORIGIN = "http://localhost:3000";
+
+async function issuedNonce(now = 1_000) {
+  const response = issueHumanMutationNonce(new Request(`${ORIGIN}/api/human-session`, { headers: {
+    host: "localhost:3000", referer: `${ORIGIN}/`, "sec-fetch-site": "same-origin",
+  } }), now);
+  const body = await response.json() as { nonce: string };
+  return { nonce: body.nonce, cookie: response.headers.get("set-cookie")!.split(";")[0] };
+}
+
+function mutation(headers: Record<string, string> = {}, method = "POST", url = `${ORIGIN}/api/tasks`) {
+  return new Request(url, { method, headers: { host: "localhost:3000", ...headers } });
+}
+
+function authorizedHeaders(nonce: string, cookie: string, action = "task-create") {
+  return {
+    origin: ORIGIN,
+    "sec-fetch-site": "same-origin",
+    "x-multiagents-human-action": action,
+    "x-multiagents-human-nonce": nonce,
+    cookie,
+  };
+}
+
+beforeEach(() => {
+  clearHumanMutationSessionsForTests();
+  vi.spyOn(console, "warn").mockImplementation(() => undefined);
+});
 
 describe("rejectNonLocalRequest", () => {
-  it("allows a localhost same-origin request", () => {
-    const request = new Request("http://localhost:3000/api/agents/codex", {
-      headers: { host: "localhost:3000", origin: "http://localhost:3000" },
-    });
-    expect(rejectNonLocalRequest(request)).toBeUndefined();
-  });
-
-  it("rejects non-loopback hosts and origins", async () => {
-    const badHost = new Request("http://example.test/api/agents/codex", { headers: { host: "example.test" } });
-    expect(rejectNonLocalRequest(badHost)?.status).toBe(403);
-
-    const badOrigin = new Request("http://localhost:3000/api/agents/codex", {
-      headers: { host: "localhost:3000", origin: "https://example.test" },
-    });
-    expect(rejectNonLocalRequest(badOrigin)?.status).toBe(403);
+  it("allows a localhost read and rejects non-loopback hosts and origins", () => {
+    expect(rejectNonLocalRequest(new Request(`${ORIGIN}/api/repos`, { headers: { host: "localhost:3000" } }))).toBeUndefined();
+    expect(rejectNonLocalRequest(new Request("http://example.test/api/repos", { headers: { host: "example.test" } }))?.status).toBe(403);
+    expect(rejectNonLocalRequest(new Request(`${ORIGIN}/api/repos`, { headers: { host: "localhost:3000", origin: "https://example.test" } }))?.status).toBe(403);
   });
 });
 
-describe("rejectNonHumanProfileMutation", () => {
-  it("requires the explicit same-origin browser profile-save signal", () => {
-    const agentLike = new Request("http://localhost:3000/api/repos/repo/profile", { method: "POST", headers: { host: "localhost:3000" } });
-    expect(rejectNonHumanProfileMutation(agentLike)?.status).toBe(403);
-    const humanUi = new Request("http://localhost:3000/api/repos/repo/profile", { method: "POST", headers: {
-      host: "localhost:3000", origin: "http://localhost:3000", "sec-fetch-site": "same-origin", "x-multiagents-human-action": "profile-save",
+describe("requireHumanMutation", () => {
+  it("rejects a mutation without Origin", async () => {
+    const { nonce, cookie } = await issuedNonce();
+    expect(requireHumanMutation(mutation({ "x-multiagents-human-action": "task-create", "x-multiagents-human-nonce": nonce, cookie }), "task-create")?.status).toBe(403);
+    const audit = JSON.stringify(vi.mocked(console.warn).mock.calls);
+    expect(audit).toContain("human_gate_rejected");
+    expect(audit).not.toContain(nonce);
+    expect(audit).not.toContain(ORIGIN);
+  });
+
+  it("rejects another localhost port and a non-loopback Origin", async () => {
+    const { nonce, cookie } = await issuedNonce();
+    expect(requireHumanMutation(mutation({ ...authorizedHeaders(nonce, cookie), origin: "http://localhost:9999" }), "task-create")?.status).toBe(403);
+    const issued = await issuedNonce();
+    expect(requireHumanMutation(mutation({ ...authorizedHeaders(issued.nonce, issued.cookie), origin: "https://example.test" }), "task-create")?.status).toBe(403);
+  });
+
+  it("rejects a missing human action header", async () => {
+    const { nonce, cookie } = await issuedNonce();
+    const headers = authorizedHeaders(nonce, cookie);
+    delete (headers as Partial<typeof headers>)["x-multiagents-human-action"];
+    expect(requireHumanMutation(mutation(headers), "task-create")?.status).toBe(403);
+  });
+
+  it("rejects invalid and expired nonces", async () => {
+    const issued = await issuedNonce();
+    expect(requireHumanMutation(mutation(authorizedHeaders("invalid", issued.cookie)), "task-create")?.status).toBe(403);
+    const expired = await issuedNonce(10_000);
+    expect(requireHumanMutation(mutation(authorizedHeaders(expired.nonce, expired.cookie)), "task-create", { now: 130_001 })?.status).toBe(403);
+  });
+
+  it("accepts one valid human mutation and rejects nonce reuse", async () => {
+    const { nonce, cookie } = await issuedNonce();
+    const request = mutation(authorizedHeaders(nonce, cookie));
+    expect(requireHumanMutation(request, "task-create", { now: 2_000 })).toBeUndefined();
+    expect(requireHumanMutation(request, "task-create", { now: 2_000 })?.status).toBe(403);
+  });
+
+  it("uses the browser Host as the exact origin when the framework normalizes request.url", async () => {
+    const browserOrigin = "http://127.0.0.1:3000";
+    const nonceResponse = issueHumanMutationNonce(new Request(`${ORIGIN}/api/human-session`, { headers: {
+      host: "127.0.0.1:3000", referer: `${browserOrigin}/`, "sec-fetch-site": "same-origin",
+    } }), 1_000);
+    expect(nonceResponse.status).toBe(200);
+    const { nonce } = await nonceResponse.json() as { nonce: string };
+    const cookie = nonceResponse.headers.get("set-cookie")!.split(";")[0];
+    const request = new Request(`${ORIGIN}/api/tasks`, { method: "POST", headers: {
+      host: "127.0.0.1:3000", origin: browserOrigin, "sec-fetch-site": "same-origin",
+      "x-multiagents-human-action": "task-create", "x-multiagents-human-nonce": nonce, cookie,
     } });
-    expect(rejectNonHumanProfileMutation(humanUi)).toBeUndefined();
+    expect(requireHumanMutation(request, "task-create", { now: 2_000 })).toBeUndefined();
+  });
+
+  it("rejects mutation and nonce issuance while an agent is active", async () => {
+    const { nonce, cookie } = await issuedNonce();
     const end = beginAgentExecution();
-    expect(rejectNonHumanProfileMutation(humanUi)?.status).toBe(423);
-    end();
-  });
-});
-
-describe("rejectNonHumanTemplateMutation", () => {
-  it("allows only the explicit same-origin template UI action and blocks agents", () => {
-    const agentLike = new Request("http://localhost:3000/api/repos/repo/templates", { method: "POST", headers: { host: "localhost:3000" } });
-    expect(rejectNonHumanTemplateMutation(agentLike)?.status).toBe(403);
-    const wrongSignal = new Request("http://localhost:3000/api/repos/repo/templates", { method: "POST", headers: { host: "localhost:3000", origin: "http://localhost:3000", "sec-fetch-site": "same-origin", "x-multiagents-human-action": "profile-save" } });
-    expect(rejectNonHumanTemplateMutation(wrongSignal)?.status).toBe(403);
-    const humanUi = new Request("http://localhost:3000/api/repos/repo/templates", { method: "POST", headers: { host: "localhost:3000", origin: "http://localhost:3000", "sec-fetch-site": "same-origin", "x-multiagents-human-action": "template-save" } });
-    expect(rejectNonHumanTemplateMutation(humanUi)).toBeUndefined();
-    const end = beginAgentExecution(); expect(rejectNonHumanTemplateMutation(humanUi)?.status).toBe(423); end();
-  });
-});
-
-describe("rejectNonHumanFindingMutation", () => {
-  it("requires the exact human conversion action and blocks conversion during agent execution", () => {
-    const url = "http://localhost:3000/api/findings/11111111-1111-4111-8111-111111111111/convert";
-    const direct = new Request(url, { method: "POST", headers: { host: "localhost:3000" } });
-    expect(rejectNonHumanFindingMutation(direct, "finding-convert")?.status).toBe(403);
-    const wrongAction = new Request(url, { method: "POST", headers: { host: "localhost:3000", origin: "http://localhost:3000", "sec-fetch-site": "same-origin", "x-multiagents-human-action": "finding-accept" } });
-    expect(rejectNonHumanFindingMutation(wrongAction, "finding-convert")?.status).toBe(403);
-    const humanUi = new Request(url, { method: "POST", headers: { host: "localhost:3000", origin: "http://localhost:3000", "sec-fetch-site": "same-origin", "x-multiagents-human-action": "finding-convert" } });
-    expect(rejectNonHumanFindingMutation(humanUi, "finding-convert")).toBeUndefined();
-    const end = beginAgentExecution();
-    expect(rejectNonHumanFindingMutation(humanUi, "finding-convert")?.status).toBe(423);
-    end();
+    try {
+      expect(requireHumanMutation(mutation(authorizedHeaders(nonce, cookie)), "task-create", { now: 2_000 })?.status).toBe(423);
+      expect(issueHumanMutationNonce(new Request(`${ORIGIN}/api/human-session`, { headers: { host: "localhost:3000", referer: `${ORIGIN}/`, "sec-fetch-site": "same-origin" } }), 2_000).status).toBe(423);
+    } finally { end(); }
   });
 
-  it("requires distinct human signals for priority and resolution", () => {
-    const headers = { host: "localhost:3000", origin: "http://localhost:3000", "sec-fetch-site": "same-origin" };
-    const priorityUrl = "http://localhost:3000/api/findings/11111111-1111-4111-8111-111111111111/priority";
-    const wrong = new Request(priorityUrl, { method: "POST", headers: { ...headers, "x-multiagents-human-action": "finding-resolve" } });
-    expect(rejectNonHumanFindingMutation(wrong, "finding-priority")?.status).toBe(403);
-    const priority = new Request(priorityUrl, { method: "POST", headers: { ...headers, "x-multiagents-human-action": "finding-priority" } });
-    expect(rejectNonHumanFindingMutation(priority, "finding-priority")).toBeUndefined();
-    const resolve = new Request(priorityUrl.replace("priority", "resolve"), { method: "POST", headers: { ...headers, "x-multiagents-human-action": "finding-resolve" } });
-    expect(rejectNonHumanFindingMutation(resolve, "finding-resolve")).toBeUndefined();
+  it("enforces the method and exact action", async () => {
+    const issued = await issuedNonce();
+    expect(requireHumanMutation(mutation(authorizedHeaders(issued.nonce, issued.cookie), "DELETE"), "task-create")?.status).toBe(405);
+    const next = await issuedNonce();
+    expect(requireHumanMutation(mutation(authorizedHeaders(next.nonce, next.cookie, "task-delete")), "task-create")?.status).toBe(403);
   });
 });

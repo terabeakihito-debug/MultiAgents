@@ -1,6 +1,6 @@
 import { agents } from "@/agents";
 import { agentIds, type AgentId } from "@/agents/types";
-import { rejectNonLocalRequest } from "@/server/request-security";
+import { requireHumanMutation } from "@/server/request-security";
 import { buildGenericRuntimePolicy } from "@/server/runtime-policy";
 
 export const runtime = "nodejs";
@@ -11,7 +11,7 @@ export async function POST(
   request: Request,
   context: { params: Promise<{ agent: string }> },
 ) {
-  const rejection = rejectNonLocalRequest(request);
+  const rejection = requireHumanMutation(request, "agent-run", { label: "Agent execution" });
   if (rejection) return rejection;
 
   const { agent } = await context.params;

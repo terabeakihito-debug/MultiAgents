@@ -1,12 +1,12 @@
 import { recoverExistingPullRequestTask } from "@/server/pr-review";
 import { ApprovalError } from "@/server/pull-request";
-import { rejectNonLocalRequest } from "@/server/request-security";
+import { requireHumanMutation } from "@/server/request-security";
 import { initializeTaskRecovery, listTasks, publicTask } from "@/server/tasks";
 
 export const runtime = "nodejs";
 
 export async function POST(request: Request) {
-  const rejection = rejectNonLocalRequest(request);
+  const rejection = requireHumanMutation(request, "task-recover-pr", { label: "PR recovery" });
   if (rejection) return rejection;
   await initializeTaskRecovery();
   let body: unknown;

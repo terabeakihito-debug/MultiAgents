@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { AgentAdapter, AgentId, AgentResult, AgentRunOptions, FlowStep, ReviewRerunEvent } from "../agents/types";
-import { parseReviewRerunRequest, rerunReviewStep } from "./review-rerun";
+import { parseReviewRerunCommand, reconstructReviewRerunRequest, rerunReviewStep } from "./review-rerun";
 
 const completedSteps = (): FlowStep[] => [
   { id: "codex_draft", agent: "codex", role: "draft", status: "completed", output: "draft" },
@@ -79,20 +79,33 @@ describe("rerunReviewStep", () => {
   });
 });
 
-describe("parseReviewRerunRequest", () => {
-  it("rejects invalid step IDs", () => {
-    expect(parseReviewRerunRequest({ ...request("cursor_review"), stepId: "codex_draft" })).toEqual({ error: "Invalid rerun stepId" });
+describe("server-side rerun reconstruction", () => {
+  const taskId = "11111111-1111-4111-8111-111111111111";
+
+  it("accepts only taskId and a rerunnable stepId", () => {
+    expect(parseReviewRerunCommand({ taskId, stepId: "cursor_review" })).toEqual({ taskId, stepId: "cursor_review" });
+    expect(parseReviewRerunCommand({ taskId, stepId: "codex_draft" })).toEqual({ error: "Invalid rerun stepId" });
   });
 
-  it("rejects missing upstream data", () => {
-    const data = request("claude_review"); data.steps[1].output = "";
-    expect(parseReviewRerunRequest(data)).toEqual({ error: "Missing usable upstream data: cursor_review" });
+  it("rejects client prompt, agent, role, flow, and step output overrides", () => {
+    for (const field of ["prompt", "agent", "role", "flowId", "steps", "priorOutputs"]) {
+      expect(parseReviewRerunCommand({ taskId, stepId: "cursor_review", [field]: "injected" })).toEqual({ error: "Rerun accepts only taskId and stepId" });
+    }
   });
 
-  it("ignores client agent and role fields", () => {
-    const data = request("cursor_review"); data.steps[1].agent = "codex"; data.steps[1].role = "final";
-    const parsed = parseReviewRerunRequest(data);
+  it("reconstructs prompt, flow and outputs from persisted task state", () => {
+    const persisted = request("claude_review");
+    persisted.steps[1].agent = "codex"; persisted.steps[1].role = "final";
+    const parsed = reconstructReviewRerunRequest({ prompt: persisted.prompt, flowId: persisted.flowId, flowSteps: persisted.steps }, "claude_review");
     expect("error" in parsed).toBe(false);
-    if (!("error" in parsed)) expect(parsed.steps[1]).toMatchObject({ agent: "cursor", role: "review" });
+    if (!("error" in parsed)) {
+      expect(parsed).toMatchObject({ prompt: "user request", flowId: "flow-1", stepId: "claude_review" });
+      expect(parsed.steps[1]).toMatchObject({ agent: "cursor", role: "review", output: "cursor-old" });
+    }
+  });
+
+  it("rejects missing persisted upstream output", () => {
+    const persisted = request("claude_review"); persisted.steps[1].output = "";
+    expect(reconstructReviewRerunRequest({ prompt: persisted.prompt, flowId: persisted.flowId, flowSteps: persisted.steps }, "claude_review")).toEqual({ error: "Missing usable upstream data: cursor_review" });
   });
 });

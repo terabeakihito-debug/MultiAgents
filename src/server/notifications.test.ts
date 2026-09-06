@@ -7,7 +7,7 @@ import type { Finding } from "../findings/types";
 import { defaultNotificationPreferences, type NotificationQuery } from "../notifications/types";
 import { beginAgentExecution } from "./agent-execution-guard";
 import { browserNotificationPayload, evaluateFindingNotification, evaluateTaskNotifications, parseNotificationPreferences, parseNotificationQuery } from "./notifications";
-import { rejectNonHumanNotificationMutation } from "./request-security";
+import { issueHumanMutationNonce, rejectNonHumanNotificationMutation } from "./request-security";
 import { SCHEMA_VERSION, StateStore, replaceStateStoreForTests } from "./state-store";
 import type { PullRequestReview } from "./pr-review-types";
 import type { RepoTask, TaskStatus } from "./tasks";
@@ -152,11 +152,14 @@ describe("Phase 14 notification persistence and security", () => {
     })).toThrow("type or severity");
   });
 
-  it("requires an explicit same-origin human action and blocks agents", () => {
+  it("requires an explicit same-origin human action and blocks agents", async () => {
     const url = "http://localhost:3000/api/notifications/read-all";
     const direct = new Request(url, { method: "POST", headers: { host: "localhost:3000" } });
     expect(rejectNonHumanNotificationMutation(direct, "notification-read-all")?.status).toBe(403);
-    const human = new Request(url, { method: "POST", headers: { host: "localhost:3000", origin: "http://localhost:3000", "sec-fetch-site": "same-origin", "x-multiagents-human-action": "notification-read-all" } });
+    const nonceResponse = issueHumanMutationNonce(new Request("http://localhost:3000/api/human-session", { headers: { host: "localhost:3000", referer: "http://localhost:3000/", "sec-fetch-site": "same-origin" } }));
+    const nonce = (await nonceResponse.json() as { nonce: string }).nonce;
+    const cookie = nonceResponse.headers.get("set-cookie")!.split(";")[0];
+    const human = new Request(url, { method: "POST", headers: { host: "localhost:3000", origin: "http://localhost:3000", "sec-fetch-site": "same-origin", "x-multiagents-human-action": "notification-read-all", "x-multiagents-human-nonce": nonce, cookie } });
     expect(rejectNonHumanNotificationMutation(human, "notification-read-all")).toBeUndefined();
     const end = beginAgentExecution(); expect(rejectNonHumanNotificationMutation(human, "notification-read-all")?.status).toBe(423); end();
   });

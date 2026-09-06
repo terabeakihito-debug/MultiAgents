@@ -1,11 +1,11 @@
 import { getTask, getTaskDiff, publicTask, resumeTask } from "@/server/tasks";
 import { prepareApproval } from "@/server/pull-request";
-import { rejectNonLocalRequest } from "@/server/request-security";
+import { requireHumanMutation } from "@/server/request-security";
 
 export const runtime = "nodejs";
 
 export async function POST(request: Request, context: { params: Promise<{ id: string }> }) {
-  const rejection = rejectNonLocalRequest(request); if (rejection) return rejection;
+  const rejection = requireHumanMutation(request, "task-resume", { label: "Task resume" }); if (rejection) return rejection;
   const id = (await context.params).id;
   try {
     const task = await resumeTask(id);

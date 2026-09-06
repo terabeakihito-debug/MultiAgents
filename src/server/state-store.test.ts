@@ -262,10 +262,10 @@ describe("Phase 8 SQLite state and audit history", () => {
     beginTaskReview(task, "Safe change"); completeTaskReview(task, true);
     const prepared = await prepareApproval(task);
     const input = { approved: true as const, diffHash: prepared.approval!.diffHash!, approvalId: prepared.approval!.approvalId! };
-    const commit = vi.fn(async (value: RepoTask) => { await runGit(value.worktreePath, ["add", "--all"]); await runGit(value.worktreePath, ["commit", "-m", "saved"]); });
+    const commit = vi.fn(async (value: RepoTask) => { await runGit(value.worktreePath, ["commit", "-m", "saved"]); });
     const createPr = vi.fn(async () => ({ url: "https://github.com/example/project/pull/42", number: 42 }));
     await approveAndCreatePullRequest(task.id, input, {
-      stage: async () => undefined, commit, push: async () => undefined, checkGhAuth: async () => undefined,
+      stage: async (value) => { await runGit(value.worktreePath, ["add", "--all"]); }, commit, push: async () => undefined, checkGhAuth: async () => undefined,
       createPr, checkDependencies: async () => undefined, runValidation: async () => undefined,
     });
     expect(commit).toHaveBeenCalledOnce(); expect(createPr).toHaveBeenCalledOnce();
