@@ -11,6 +11,8 @@ type Props = {
   repos: Repo[];
   busy: boolean;
   refreshToken: number;
+  view: "tasks" | "findings" | "operations";
+  onViewChange: (view: "tasks" | "findings" | "operations") => void;
   onResume: (taskId: string) => void;
   onHistory: (taskId: string, label: string) => void;
   onError: (error: string) => void;
@@ -34,14 +36,14 @@ const taskStatuses = [
 ] as const;
 
 export function TaskDashboard(props: Props) {
-  const [view, setView] = useState<"tasks" | "findings" | "operations">("tasks");
+  const { view, onViewChange } = props;
   return <section className="dashboardShell">
     <div className="dashboardTabs" role="tablist" aria-label="Operations dashboard">
-      <button type="button" role="tab" aria-selected={view === "tasks"} className={view === "tasks" ? "selected" : ""} onClick={() => setView("tasks")}>Tasks</button>
-      <button type="button" role="tab" aria-selected={view === "findings"} className={view === "findings" ? "selected" : ""} onClick={() => setView("findings")}>Findings</button>
-      <button type="button" role="tab" aria-selected={view === "operations"} className={view === "operations" ? "selected" : ""} onClick={() => setView("operations")}>Operations</button>
+      <button id="tasks-tab" type="button" role="tab" aria-selected={view === "tasks"} aria-controls="tasks-view" className={view === "tasks" ? "selected" : ""} onClick={() => onViewChange("tasks")}>Tasks</button>
+      <button id="findings-tab" type="button" role="tab" aria-selected={view === "findings"} aria-controls="findings-view" className={view === "findings" ? "selected" : ""} onClick={() => onViewChange("findings")}>Findings</button>
+      <button id="operations-tab" type="button" role="tab" aria-selected={view === "operations"} aria-controls="operations-view" className={view === "operations" ? "selected" : ""} onClick={() => onViewChange("operations")}>Operations</button>
     </div>
-    {view === "tasks" ? <TaskDashboardContent {...props} /> : view === "findings" ? <RemediationQueue repos={props.repos} busy={props.busy} refreshToken={props.refreshToken} onOpenTask={props.onResume} onHistory={props.onHistory} onError={props.onError} /> : <OperationalHealthPanel onOpenTask={props.onResume} />}
+    {view === "tasks" ? <div id="tasks-view" role="tabpanel" aria-labelledby="tasks-tab"><TaskDashboardContent {...props} /></div> : view === "findings" ? <div id="findings-view" role="tabpanel" aria-labelledby="findings-tab"><RemediationQueue repos={props.repos} busy={props.busy} refreshToken={props.refreshToken} onOpenTask={props.onResume} onHistory={props.onHistory} onError={props.onError} /></div> : <div id="operations-view" role="tabpanel" aria-labelledby="operations-tab"><OperationalHealthPanel onOpenTask={props.onResume} /></div>}
   </section>;
 }
 
