@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { taskBuckets, type DashboardCounts, type DashboardResponse, type DashboardTask, type TaskBucket } from "@/dashboard/types";
 import { RemediationQueue } from "./remediation-queue";
 import { humanMutationFetch } from "./human-mutation";
+import { OperationalHealthPanel } from "./operational-health";
 
 type Repo = { id: string; name: string };
 type Props = {
@@ -33,13 +34,14 @@ const taskStatuses = [
 ] as const;
 
 export function TaskDashboard(props: Props) {
-  const [view, setView] = useState<"tasks" | "findings">("tasks");
+  const [view, setView] = useState<"tasks" | "findings" | "operations">("tasks");
   return <section className="dashboardShell">
     <div className="dashboardTabs" role="tablist" aria-label="Operations dashboard">
       <button type="button" role="tab" aria-selected={view === "tasks"} className={view === "tasks" ? "selected" : ""} onClick={() => setView("tasks")}>Tasks</button>
       <button type="button" role="tab" aria-selected={view === "findings"} className={view === "findings" ? "selected" : ""} onClick={() => setView("findings")}>Findings</button>
+      <button type="button" role="tab" aria-selected={view === "operations"} className={view === "operations" ? "selected" : ""} onClick={() => setView("operations")}>Operations</button>
     </div>
-    {view === "tasks" ? <TaskDashboardContent {...props} /> : <RemediationQueue repos={props.repos} busy={props.busy} refreshToken={props.refreshToken} onOpenTask={props.onResume} onHistory={props.onHistory} onError={props.onError} />}
+    {view === "tasks" ? <TaskDashboardContent {...props} /> : view === "findings" ? <RemediationQueue repos={props.repos} busy={props.busy} refreshToken={props.refreshToken} onOpenTask={props.onResume} onHistory={props.onHistory} onError={props.onError} /> : <OperationalHealthPanel onOpenTask={props.onResume} />}
   </section>;
 }
 

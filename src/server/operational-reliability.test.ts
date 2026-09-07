@@ -11,7 +11,7 @@ import { runGit } from "./git";
 import { reconcileUnfinishedOperations } from "./operation-reconciliation";
 import { createStateBackup, validateBackupFile, validateStateBackup } from "./state-backup";
 import { diagnoseProvider } from "./provider-diagnostics";
-import { assertWorktreeDiskCapacity, inspectTaskWorktrees, inspectWorktrees, MINIMUM_WORKTREE_FREE_BYTES } from "./operational-health";
+import { assertWorktreeDiskCapacity, backupStatus, inspectTaskWorktrees, inspectWorktrees, MINIMUM_WORKTREE_FREE_BYTES } from "./operational-health";
 import { beginRegisteredOperation, drainOperations, lifecycleState, resetOperationRegistryForTests } from "./operation-registry";
 
 let fixtureRoot: string;
@@ -167,6 +167,15 @@ describe("Phase 19 durable journal reconciliation", () => {
 });
 
 describe("Phase 19 backup, compatibility, diagnostics, disk and drain", () => {
+  it("classifies fresh, aging, stale, and missing backups deterministically", () => {
+    expect(backupStatus(0)).toBe("ok");
+    expect(backupStatus(23.99)).toBe("ok");
+    expect(backupStatus(24)).toBe("warning");
+    expect(backupStatus(72)).toBe("warning");
+    expect(backupStatus(72.01)).toBe("attention");
+    expect(backupStatus(null)).toBe("attention");
+  });
+
   it("creates and verifies a private native SQLite backup with metadata", async () => {
     await taskFixture();
     const directory = join(fixtureRoot, "backups");

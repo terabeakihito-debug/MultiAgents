@@ -3,97 +3,81 @@
 import { useCallback, useEffect, useState } from "react";
 import { humanMutationFetch } from "./human-mutation";
 
-type Health = {
-  status: "ready" | "degraded" | "unavailable";
-  lifecycle: "RUNNING" | "DRAINING" | "STOPPED";
-  database: { status: "ok"; schema: number; supportedMin: number; supportedMax: number };
-  sandbox: string;
-  providers: Record<string, { status: string; version?: string }>;
-  backup: { lastVerifiedAgeHours: number | null; schemaVersion?: number; sizeBytes?: number };
-  disk: { freeBytes: number; minimumFreeBytes: number; stateDbSize: number; backupSize: number; worktreeCreationAllowed: boolean };
-  worktrees: { count: number; totalSizeBytes: number; orphaned: number };
-  unfinishedOperations: number;
+type Level = "ok" | "warning" | "attention" | "critical";
+type Backup = { backupId: string; createdAt: string; schemaVersion: number; sizeBytes: number; integrity: string };
+type Overview = {
+  overall: "ready" | "attention" | "critical"; checkedAt: string; nextAction: string;
+  database: { status: "ok" | "failed"; schema?: number; supportedMin?: number; supportedMax?: number; sizeBytes?: number; checkedAt: string };
+  backup: { level: Level; latest: (Backup & { ageHours: number }) | null; count: number; items: Backup[] };
+  disk: { level: Level; freeBytes: number; stateDbSize: number; backupSize: number; worktreeCreationAllowed: boolean };
+  sandbox: { status: "enforced" | "unavailable"; backend: string; version: string; privateHome: boolean; privateProc: boolean; privateTmp: boolean; validationNetwork: string; wslInterop: string };
+  providers: Array<{ provider: string; status: string; version?: string; level: Level }>;
+  maintenance: { state: "RUNNING" | "DRAINING" | "STOPPED"; activeCount: number };
+  activeOperations: Array<{ operationId: string; kind: string; taskId?: string; startedAt: string }>;
+  unfinishedOperations: Array<{ operationId: string; type: string; taskId?: string; state: string; createdAt: string; errorCode?: string }>;
+  reconcileRequired: number;
+  worktrees: { count: number; totalSizeBytes: number; orphaned: number; cleanupCandidates: number; inventory: Array<{ taskId?: string; repoId: string; ageHours: number; sizeBytes: number; taskStatus?: string; dirty?: boolean; prState?: string; inventoryStatus: string; cleanupCandidate: boolean; classification: string }> };
+  outbound: { unread: number; failed: number; ambiguous: number; pending: number; deliveredRecent: number; lastNotificationAt?: string; attention: Array<{ notificationId: string; taskId?: string; title: string; status: "failed" | "ambiguous" }> };
+  upgrade: { ready: boolean; reason: string };
 };
-type Backup = { backupId: string; createdAt: string; schemaVersion: number; sizeBytes: number };
 
-export function OperationalHealthPanel() {
-  const [health, setHealth] = useState<Health | null>(null);
-  const [latest, setLatest] = useState<Backup | null>(null);
+export function OperationalHealthPanel({ onOpenTask }: { onOpenTask?: (taskId: string) => void }) {
+  const [overview, setOverview] = useState<Overview | null>(null);
   const [error, setError] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [busy, setBusy] = useState("");
+  const [filter, setFilter] = useState("all");
   const refresh = useCallback(async () => {
     try {
-      const [healthResponse, backupResponse] = await Promise.all([
-        fetch("/api/health", { cache: "no-store" }),
-        fetch("/api/state/backups", { cache: "no-store" }),
-      ]);
-      const data = await healthResponse.json() as Health & { errorCode?: string };
-      const backupData = await backupResponse.json() as { backups?: Backup[] };
-      if (!healthResponse.ok) throw new Error(data.errorCode || "Health check failed");
-      if (!backupResponse.ok) throw new Error("Backup inventory failed");
-      setHealth(data); setLatest(backupData.backups?.[0] ?? null); setError("");
-    } catch (failure) { setError(failure instanceof Error ? failure.message : "Health check failed"); }
+      const response = await fetch("/api/operations/overview", { cache: "no-store" });
+      const data = await response.json() as Overview & { error?: string };
+      if (!response.ok) throw new Error(data.error || "Operations overview failed");
+      setOverview(data); setError("");
+    } catch (failure) { setError(failure instanceof Error ? failure.message : "Operations overview failed"); }
   }, []);
-  useEffect(() => {
-    const timer = window.setTimeout(() => void refresh(), 0);
-    return () => window.clearTimeout(timer);
-  }, [refresh]);
+  useEffect(() => { const initial = window.setTimeout(() => void refresh(), 0); const timer = window.setInterval(() => void refresh(), 30_000); return () => { window.clearTimeout(initial); window.clearInterval(timer); }; }, [refresh]);
 
-  async function backup() {
-    setBusy(true); setError("");
+  async function action(label: string, path: string, humanAction: Parameters<typeof humanMutationFetch>[1], init: RequestInit = {}, success?: string) {
+    setBusy(label); setError(""); setNotice("");
     try {
-      const response = await humanMutationFetch("/api/state/backups", "state-backup", { method: "POST" });
-      const data = await response.json() as { backup?: Backup; error?: string };
-      if (!response.ok || !data.backup) throw new Error(data.error || "Backup failed");
-      setLatest(data.backup); await refresh();
-    } catch (failure) { setError(failure instanceof Error ? failure.message : "Backup failed"); }
-    finally { setBusy(false); }
-  }
-
-  async function validate() {
-    if (!latest) return;
-    setBusy(true); setError("");
-    try {
-      const response = await humanMutationFetch(`/api/state/backups/${latest.backupId}/validate`, "state-backup-validate", { method: "POST" });
+      const response = await humanMutationFetch(path, humanAction, init);
       const data = await response.json() as { error?: string };
-      if (!response.ok) throw new Error(data.error || "Backup validation failed");
-      await refresh();
-    } catch (failure) { setError(failure instanceof Error ? failure.message : "Backup validation failed"); }
-    finally { setBusy(false); }
+      if (!response.ok) throw new Error(data.error || `${label} failed`);
+      await refresh(); if (success) setNotice(success);
+    } catch (failure) { setError(failure instanceof Error ? failure.message : `${label} failed`); }
+    finally { setBusy(""); }
   }
+  async function createBackup() { if (window.confirm("Create a verified state backup? This does not restore or modify task worktrees.")) await action("backup", "/api/state/backups", "state-backup", { method: "POST" }, "Backup created — Verified."); }
+  async function setMaintenance(enabled: boolean) { if (!enabled || window.confirm("Enter maintenance mode? New task mutations will be blocked and running operations will be drained.")) await action("maintenance", "/api/maintenance", "maintenance-mode", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled }) }); }
+  async function cleanup(item: Overview["worktrees"]["inventory"][number]) { if (item.taskId && window.confirm("Delete this clean managed worktree? Task history remains, and no branch or pull request is deleted.")) await action(`cleanup-${item.taskId}`, `/api/tasks/${item.taskId}`, "task-delete", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmedPrCleanup: true }) }); }
+  const inventory = overview?.worktrees.inventory.filter((item) => filter === "all" || (filter === "cleanup" && item.cleanupCandidate) || (filter === "dirty" && item.dirty) || (filter === "orphaned" && item.inventoryStatus === "orphaned_filesystem") || (filter === "missing" && item.inventoryStatus === "missing_filesystem") || (filter === "registered" && item.inventoryStatus === "registered") || (filter === "archived" && item.taskStatus === "archived") || (filter === "active" && item.taskStatus !== "archived")) ?? [];
 
-  async function maintenance(enabled: boolean) {
-    setBusy(true); setError("");
-    try {
-      const response = await humanMutationFetch("/api/maintenance", "maintenance-mode", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled }) });
-      const data = await response.json() as { error?: string };
-      if (!response.ok) throw new Error(data.error || "Maintenance mode update failed");
-      await refresh();
-    } catch (failure) { setError(failure instanceof Error ? failure.message : "Maintenance mode update failed"); }
-    finally { setBusy(false); }
-  }
-
-  return <section className="credentialPanel" aria-labelledby="health-heading">
-    <div><span className="eyebrow">Operational readiness</span><h2 id="health-heading">Health</h2></div>
-    {health ? <>
-      <div className="credentialGrid">
-        <article><strong>Readiness</strong><span className="credentialState">{health.status}</span><small>Lifecycle: {health.lifecycle}</small></article>
-        <article><strong>State database</strong><span className="credentialState">{health.database.status}</span><small>Schema {health.database.schema} · supported {health.database.supportedMin}–{health.database.supportedMax}</small></article>
-        <article><strong>Backup</strong><span className="credentialState">{health.backup.lastVerifiedAgeHours === null ? "missing" : "verified"}</span><small>{health.backup.lastVerifiedAgeHours === null ? "No verified backup" : `${health.backup.lastVerifiedAgeHours}h old`}</small></article>
-        <article><strong>Disk</strong><span className="credentialState">{health.disk.worktreeCreationAllowed ? "ok" : "low"}</span><small>{formatBytes(health.disk.freeBytes)} free · minimum {formatBytes(health.disk.minimumFreeBytes)}</small></article>
-        <article><strong>Worktrees</strong><span className="credentialState">{health.worktrees.count}</span><small>{formatBytes(health.worktrees.totalSizeBytes)} · {health.worktrees.orphaned} need inspection</small></article>
-        <article><strong>Operations</strong><span className="credentialState">{health.unfinishedOperations}</span><small>unfinished journal records</small></article>
-        {Object.entries(health.providers).map(([name, provider]) => <article key={name}><strong>{name}</strong><span className="credentialState">{provider.status}</span><small>{provider.version || "Version unavailable"}</small></article>)}
+  return <section className="operationsPanel" aria-labelledby="operations-heading">
+    <div className="operationsTitle"><div><span className="eyebrow">Local operations console</span><h2 id="operations-heading">Operations</h2></div><button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => void refresh()}>Refresh overview</button></div>
+    {!overview ? <p className="muted">Checking operational status…</p> : <>
+      <section className={`overallStatus ${overview.overall}`} aria-live="polite"><span>System status</span><strong>{overview.overall === "ready" ? "READY" : overview.overall === "critical" ? "CRITICAL" : "ATTENTION REQUIRED"}</strong><p>Next action: {overview.nextAction}</p></section>
+      <div className="operationsGrid" aria-label="Health summary">
+        <HealthCard title="Database" level={overview.database.status === "ok" ? "ok" : "critical"} value={overview.database.status === "ok" ? "OK" : "FAILED"} detail={overview.database.status === "ok" ? `Schema ${overview.database.schema} · supported ${overview.database.supportedMin}–${overview.database.supportedMax}` : "Readiness or integrity check failed"} foot={`Size ${formatBytes(overview.database.sizeBytes ?? 0)} · checked ${relativeTime(overview.database.checkedAt)}`} />
+        <HealthCard title="Sandbox" level={overview.sandbox.status === "enforced" ? "ok" : "critical"} value={overview.sandbox.status === "enforced" ? "ENFORCED" : "UNAVAILABLE"} detail={`${overview.sandbox.backend} ${overview.sandbox.version} · private HOME / proc / tmp`} foot={`Validation network ${overview.sandbox.validationNetwork} · WSL ${overview.sandbox.wslInterop}`} />
+        <HealthCard title="Backup" level={overview.backup.level} value={overview.backup.latest ? `${formatAge(overview.backup.latest.ageHours)} old` : "MISSING"} detail={overview.backup.latest ? `Verified · Schema ${overview.backup.latest.schemaVersion}` : "No verified backup"} foot={`${overview.backup.count} retained · ${overview.backup.latest ? formatBytes(overview.backup.latest.sizeBytes) : "—"}`} />
+        <HealthCard title="Disk" level={overview.disk.level} value={`${formatBytes(overview.disk.freeBytes)} free`} detail={overview.disk.worktreeCreationAllowed ? "New worktrees allowed" : "New worktrees blocked"} foot={`Worktrees ${formatBytes(overview.worktrees.totalSizeBytes)} · backups ${formatBytes(overview.disk.backupSize)}`} />
+        <HealthCard title="Operations" level={overview.reconcileRequired ? "attention" : "ok"} value={overview.maintenance.state} detail={`${overview.activeOperations.length} active · ${overview.reconcileRequired} reconcile required`} foot={`${overview.unfinishedOperations.length} unfinished journal records`} />
+        <HealthCard title="Worktrees" level={overview.worktrees.orphaned ? "attention" : "ok"} value={`${overview.worktrees.count} registered`} detail={`${overview.worktrees.orphaned} need inspection · ${overview.worktrees.cleanupCandidates} cleanup candidates`} foot={`${formatBytes(overview.worktrees.totalSizeBytes)} total`} />
+        <HealthCard title="Notifications" level={overview.outbound.failed || overview.outbound.ambiguous ? "attention" : "ok"} value={`${overview.outbound.unread} unread`} detail={`${overview.outbound.failed} failed · ${overview.outbound.ambiguous} ambiguous`} foot={overview.outbound.lastNotificationAt ? `Last ${relativeTime(overview.outbound.lastNotificationAt)}` : "No recent notifications"} />
+        {overview.providers.map((provider) => <HealthCard key={provider.provider} title={provider.provider === "codex" ? "Codex" : provider.provider === "cursor" ? "Cursor" : "Claude"} level={provider.level} value={provider.status} detail={provider.version || "Version unavailable"} foot={provider.status === "supported" ? "Credential and sandbox checks passed" : "Task execution is blocked for this provider"} />)}
       </div>
-      <div className="dialogActions">
-        <button type="button" disabled={busy || health.lifecycle !== "RUNNING"} onClick={() => void backup()}>Create verified backup</button>
-        <button type="button" className="secondary" disabled={busy || !latest} onClick={() => void validate()}>Validate latest backup</button>
-        <button type="button" className="secondary" disabled={busy} onClick={() => void maintenance(health.lifecycle === "RUNNING")}>{health.lifecycle === "RUNNING" ? "Enter maintenance" : "Leave maintenance"}</button>
-        <button type="button" className="secondary" disabled={busy} onClick={() => void refresh()}>Refresh health</button>
-      </div>
-    </> : <p className="muted">Checking operational readiness…</p>}
-    {error ? <p className="error">{error}</p> : null}
-    <p className="muted">Restore remains offline-only: <code>npm run state:restore -- &lt;backup-id&gt;</code>. Credentials are never included.</p>
+      <div className="operationsActions"><button type="button" disabled={Boolean(busy) || overview.maintenance.state !== "RUNNING"} onClick={() => void createBackup()}>{busy === "backup" ? "Creating backup…" : "Create Backup"}</button><button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => void action("providers", "/api/operations/providers/refresh", "operations-provider-refresh", { method: "POST" })}>{busy === "providers" ? "Refreshing…" : "Refresh diagnostics"}</button><button type="button" className="secondary" disabled={Boolean(busy) || overview.maintenance.state !== "RUNNING"} onClick={() => void setMaintenance(true)}>Enter maintenance mode</button><button type="button" className="secondary" disabled={Boolean(busy) || overview.maintenance.state === "RUNNING"} onClick={() => void setMaintenance(false)}>Resume normal operation</button></div>
+      <section className="operationsSection"><h3>Backups</h3><p className="muted">Restore requires server-offline CLI procedure. Restore must be performed with the server stopped.</p>{overview.backup.items.length ? <div className="operationsRows">{overview.backup.items.map((backup) => <div key={backup.backupId}><span>Verified · Schema {backup.schemaVersion} · {formatBytes(backup.sizeBytes)} · {relativeTime(backup.createdAt)}</span><button type="button" className="secondary compactButton" disabled={Boolean(busy)} onClick={() => void action(`validate-${backup.backupId}`, `/api/state/backups/${backup.backupId}/validate`, "state-backup-validate", { method: "POST" }, "Backup validation passed — integrity, schema, required tables, and permissions verified.")}>{busy === `validate-${backup.backupId}` ? "Validating…" : "Validate"}</button></div>)}</div> : <p className="muted">No backups recorded.</p>}</section>
+      <section className="operationsSection"><h3>Maintenance & active operations</h3>{overview.reconcileRequired ? <p className="operationsAlert" role="alert">{overview.reconcileRequired} operations require reconciliation. This screen never retries, pushes, creates PRs, or sends Slack automatically.</p> : null}{overview.activeOperations.length || overview.unfinishedOperations.length ? <div className="operationsRows">{[...overview.activeOperations.map((item) => ({ ...item, state: "active", type: item.kind, createdAt: item.startedAt })), ...overview.unfinishedOperations].map((item) => <div key={item.operationId}><span><code>{item.type}</code> · {item.state} · {relativeTime(item.createdAt)}</span>{item.taskId && onOpenTask ? <button type="button" className="textButton" onClick={() => onOpenTask(item.taskId!)}>Open Task</button> : <span>No task link</span>}</div>)}</div> : <p className="muted">No active or unfinished operations.</p>}</section>
+      <section className="operationsSection"><div className="operationsSectionTitle"><h3>Worktree inventory</h3><label>Filter <select value={filter} onChange={(event) => setFilter(event.target.value)}><option value="all">All</option><option value="cleanup">Cleanup candidate</option><option value="dirty">Dirty</option><option value="orphaned">Orphaned</option><option value="missing">Missing</option><option value="registered">Registered</option><option value="archived">Archived</option><option value="active">Active</option></select></label></div>{inventory.length ? <div className="tableWrap"><table><thead><tr><th>Repo</th><th>Task</th><th>Status</th><th>Age</th><th>Size</th><th>Dirty</th><th>PR</th><th>Classification</th><th>Action</th></tr></thead><tbody>{inventory.map((item, index) => <tr key={`${item.repoId}-${item.taskId ?? index}`}><td>{item.repoId}</td><td>{item.taskId ? item.taskId.slice(0, 8) : "—"}</td><td>{item.inventoryStatus}</td><td>{formatAge(item.ageHours)}</td><td>{formatBytes(item.sizeBytes)}</td><td>{item.dirty === undefined ? "Unknown" : item.dirty ? "Yes" : "No"}</td><td>{item.prState ?? "—"}</td><td>{item.cleanupCandidate ? "Safe cleanup candidate" : item.classification}</td><td>{item.cleanupCandidate && item.taskId ? <button type="button" className="secondary compactButton" disabled={Boolean(busy)} onClick={() => void cleanup(item)}>Cleanup</button> : item.taskId && onOpenTask ? <button type="button" className="textButton" onClick={() => onOpenTask(item.taskId!)}>Open Task</button> : "—"}</td></tr>)}</tbody></table></div> : <p className="muted">No worktrees match this filter.</p>}</section>
+      <section className="operationsSection"><h3>Slack delivery health</h3><p>{overview.outbound.pending} pending · {overview.outbound.deliveredRecent} delivered in the last 24h · {overview.outbound.failed} failed · {overview.outbound.ambiguous} ambiguous</p>{overview.outbound.attention.length ? <div className="operationsRows">{overview.outbound.attention.map((item) => <div key={item.notificationId}><span>{item.status.toUpperCase()} · {item.title}</span><span>{item.taskId && onOpenTask ? <button type="button" className="textButton" onClick={() => onOpenTask(item.taskId!)}>Open Task</button> : null}<button type="button" className="secondary compactButton" disabled={Boolean(busy)} onClick={() => void action(`retry-${item.notificationId}`, `/api/notifications/${item.notificationId}/deliveries/slack/retry`, "outbound-retry", { method: "POST" })}>Retry</button>{item.status === "ambiguous" ? <><button type="button" className="secondary compactButton" disabled={Boolean(busy)} onClick={() => void action(`delivered-${item.notificationId}`, `/api/notifications/${item.notificationId}/deliveries/slack/mark-delivered`, "outbound-mark-delivered", { method: "POST" })}>Mark delivered</button><button type="button" className="secondary compactButton" disabled={Boolean(busy)} onClick={() => void action(`dismiss-${item.notificationId}`, `/api/notifications/${item.notificationId}/deliveries/slack/dismiss`, "outbound-dismiss", { method: "POST" })}>Dismiss</button></> : null}</span></div>)}</div> : <p className="muted">No failed or ambiguous Slack deliveries.</p>}</section>
+      <section className="operationsSection runbook"><h3>Runbook</h3><div>{["Daily Start", "Before Upgrade", "After Upgrade", "Backup", "Restore", "Provider Failure", "Sandbox Failure", "Database Problem", "Disk Full", "Stuck Operation"].map((item) => <a key={item} href={`#runbook-${item.toLowerCase().replaceAll(" ", "-")}`}>{item}</a>)}</div><p id="runbook-daily-start">Daily Start: confirm database ready, sandbox enforced, providers supported, a recent verified backup, healthy disk, and no reconciliation-required operations.</p><p id="runbook-before-upgrade">Upgrade readiness: {overview.upgrade.reason}. Manual upgrade only; this dashboard never runs Git pull or dependency installation.</p><p id="runbook-restore">Restore: stop the server, use the documented offline CLI procedure, then validate readiness before resuming.</p></section>
+    </>}
+    {notice ? <p className="success" role="status">{notice}</p> : null}{error ? <p className="error" role="alert">{error}</p> : null}
   </section>;
 }
-function formatBytes(value: number) { return value >= 1024 ** 3 ? `${(value / 1024 ** 3).toFixed(1)} GB` : `${(value / 1024 ** 2).toFixed(1)} MB`; }
+
+function HealthCard({ title, level, value, detail, foot }: { title: string; level: Level; value: string; detail: string; foot: string }) { return <article className={`healthCard ${level}`}><strong>{title}</strong><span>{value}</span><small>{detail}</small><small>{foot}</small></article>; }
+function formatBytes(value: number) { if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(1)} GiB`; if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(1)} MiB`; return `${Math.max(0, Math.ceil(value / 1024))} KiB`; }
+function formatAge(hours: number) { return hours < 1 ? `${Math.max(0, Math.floor(hours * 60))} min` : hours < 48 ? `${Math.floor(hours)}h` : `${Math.floor(hours / 24)}d`; }
+function relativeTime(value: string) { const hours = Math.max(0, (Date.now() - Date.parse(value)) / 3_600_000); return `${formatAge(hours)} ago`; }

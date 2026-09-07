@@ -7,7 +7,6 @@ import { acquireRunLock, releaseRunLock } from "./run-lock";
 import { TaskDashboard } from "./task-dashboard";
 import { NotificationCenter } from "./notification-center";
 import { CredentialStatusPanel } from "./credential-status";
-import { OperationalHealthPanel } from "./operational-health";
 import { agentRoles, validationSteps, type ProjectProfile, type ProjectProfileSnapshot, type RolePolicy, type ValidationPolicy, type ValidationStep } from "@/profiles/policy";
 import type { RepoTemplateSettings, TaskTemplate, TaskTemplateSnapshot } from "@/templates/policy";
 import { humanPriorities, type Finding, type FindingEvent, type HumanPriority, type RemediationQueueItem } from "@/findings/types";
@@ -396,7 +395,6 @@ export default function Home() {
 
   return <main>
     <header className="appHeader"><div><h1>MultiAgents</h1><p>Parallel answers or a fixed, reviewed response from local AI CLIs.</p></div><NotificationCenter repos={repos} refreshToken={dashboardRefresh} onOpenTask={(id) => void resumePersistedTask(id)} onError={setTaskError} /></header>
-    <OperationalHealthPanel />
     <CredentialStatusPanel />
     <TaskDashboard repos={repos} busy={sending || approvalProcessing || reviewProcessing} refreshToken={dashboardRefresh} onResume={(id) => void resumePersistedTask(id)} onHistory={(id, label) => void openDashboardHistory(id, label)} onError={setTaskError} />
     {historyTitle ? <section className="dashboardHistory"><div className="cardHeader"><div><span className="eyebrow">Dashboard history</span><h2>{historyTitle}</h2></div><button type="button" className="secondary" onClick={() => { setHistoryTitle(""); setTaskHistory(emptyHistory()); }}>Close</button></div><TaskHistoryPanel history={taskHistory} /></section> : null}
