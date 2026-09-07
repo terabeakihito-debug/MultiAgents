@@ -5,6 +5,7 @@ export const humanMutationActions = [
   "notification-read", "notification-dismiss", "notification-read-all", "notification-preferences",
   "outbound-preferences", "outbound-test", "outbound-retry", "outbound-mark-delivered", "outbound-dismiss",
   "maintenance-mode", "state-backup", "state-backup-validate", "operations-provider-refresh",
+  "retention-policy", "cleanup-preview", "cleanup-execute",
 ] as const;
 
 export type HumanMutationAction = (typeof humanMutationActions)[number];

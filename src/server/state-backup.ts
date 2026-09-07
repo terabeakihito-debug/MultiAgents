@@ -54,6 +54,21 @@ export function validateStateBackup(backupId: string, options: { store?: StateSt
   return { ...metadata, verified: true as const };
 }
 
+/** Deletes only a verified, MultiAgents-managed backup and retires its metadata for auditability. */
+export async function deleteStateBackup(backupId: string, options: { store?: StateStore; directory?: string } = {}) {
+  if (!/^[0-9a-f-]{36}$/i.test(backupId)) throw new BackupValidationError("Backup ID is invalid");
+  const store = options.store ?? getStateStore();
+  const metadata = store.loadBackups().find((item) => item.backupId === backupId);
+  if (!metadata) throw new BackupValidationError("Backup metadata not found");
+  const directory = options.directory ?? BACKUP_DIRECTORY;
+  securePrivateDirectory(directory);
+  const file = join(directory, `${backupId}.db`);
+  const verified = validateStateBackup(backupId, { store, directory });
+  if (verified.sizeBytes !== metadata.sizeBytes) throw new BackupValidationError("Backup file identity changed");
+  await rm(file, { force: false });
+  store.retireBackupMetadata(backupId);
+}
+
 export function validateBackupFile(path: string) {
   const info = validateSecureRegularFile(path, "Backup file");
   let database: DatabaseSync;

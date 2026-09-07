@@ -21,6 +21,7 @@ export async function reconcileUnfinishedOperations(dependencies: ReconcileDepen
       else if (operation.type === "git_push") await reconcilePush(operation);
       else if (operation.type === "pr_create") await reconcilePullRequest(operation, dependencies.findPullRequests);
       else if (operation.type === "finding_conversion") reconcileFindingConversion(operation);
+      else if (operation.type.startsWith("cleanup_")) store.updateOperation(operation.operationId, "reconcile_required", undefined, "cleanup_filesystem_recheck_required");
     } catch {
       store.updateOperation(operation.operationId, "reconcile_required", undefined, `${operation.type}_reconcile_failed`);
     }

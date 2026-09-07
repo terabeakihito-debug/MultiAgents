@@ -5,6 +5,10 @@ export const operationTypes = [
   "git_push",
   "pr_create",
   "slack_delivery",
+  "cleanup_worktree",
+  "cleanup_node_modules",
+  "cleanup_backup",
+  "cleanup_notifications",
 ] as const;
 
 export type OperationType = (typeof operationTypes)[number];
@@ -43,3 +47,9 @@ export type BackupMetadata = {
   sizeBytes: number;
   appCommit?: string;
 };
+
+export const retentionPresets = ["conservative", "balanced"] as const;
+export type RetentionPreset = (typeof retentionPresets)[number];
+export const cleanupCandidateTypes = ["worktree", "worktree_node_modules", "backup", "notification", "outbound_delivery"] as const;
+export type CleanupCandidateType = (typeof cleanupCandidateTypes)[number];
+export type CleanupCandidate = { candidateId: string; type: CleanupCandidateType; repoId?: string; taskId?: string; ageDays: number; estimatedBytes: number; safeToDelete: boolean; blockedReasons: string[]; recommendedAction: "delete" | "review" | "keep" };

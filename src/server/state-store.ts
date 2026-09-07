@@ -10,7 +10,7 @@ import type { DashboardCounts, DashboardSort, PrFilter, TaskBucket } from "../da
 import { parseProfileSnapshot, safeDefaultSnapshot, type ProjectProfile, type ProjectProfileSnapshot } from "../profiles/policy";
 import { builtInTemplates, mergeTemplateWithProfile, parseTemplateSnapshot, snapshotTemplate, type RepoTemplateSettings, type TaskTemplate, type TaskTemplateSnapshot } from "../templates/policy";
 import type { RepoTask } from "./tasks";
-import { operationStates, operationTypes, type BackupMetadata, type DurableOperation, type OperationState, type OperationType, type SafeOperationMetadata } from "../operations/types";
+import { operationStates, operationTypes, retentionPresets, type BackupMetadata, type DurableOperation, type OperationState, type OperationType, type RetentionPreset, type SafeOperationMetadata } from "../operations/types";
 import { secureStateDatabasePath } from "./state-path";
 import type { AgentRole } from "../profiles/policy";
 import type { RuntimePolicyClass, RuntimeViolation } from "../runtime/types";
@@ -45,7 +45,7 @@ import {
 
 export const STATE_DIRECTORY = join(homedir(), ".multiagents");
 export const STATE_DATABASE = join(STATE_DIRECTORY, "state.db");
-export const APP_STATE_COMPAT = Object.freeze({ minSchema: 9, maxSchema: 10 });
+export const APP_STATE_COMPAT = Object.freeze({ minSchema: 9, maxSchema: 11 });
 export const SCHEMA_VERSION = APP_STATE_COMPAT.maxSchema;
 const MAX_STORED_PROMPT_CHARS = 20_000;
 const MAX_STORED_OUTPUT_CHARS = 1_000_000;
@@ -487,7 +487,7 @@ export class StateStore {
   clearForTests() {
     this.transaction(() => {
       this.dropAppendOnlyTriggers();
-      this.database.exec("DELETE FROM backup_metadata; DELETE FROM operations; DELETE FROM credential_audit_events; DELETE FROM outbound_audit_events; DELETE FROM notification_deliveries; DELETE FROM outbound_channel_settings; DELETE FROM notification_audit_events; DELETE FROM notifications; DELETE FROM watch_rule_state; DELETE FROM notification_preferences; DELETE FROM finding_events; DELETE FROM findings; DELETE FROM approval_events; DELETE FROM diff_versions; DELETE FROM step_versions; DELETE FROM task_events; DELETE FROM flow_steps; DELETE FROM tasks; DELETE FROM template_audit_events; DELETE FROM task_template_versions; DELETE FROM repo_template_settings; DELETE FROM task_templates; DELETE FROM profile_audit_events; DELETE FROM project_profile_versions; DELETE FROM project_profiles;");
+      this.database.exec("DELETE FROM cleanup_audit_events; DELETE FROM retention_policy; DELETE FROM backup_metadata; DELETE FROM operations; DELETE FROM credential_audit_events; DELETE FROM outbound_audit_events; DELETE FROM notification_deliveries; DELETE FROM outbound_channel_settings; DELETE FROM notification_audit_events; DELETE FROM notifications; DELETE FROM watch_rule_state; DELETE FROM notification_preferences; DELETE FROM finding_events; DELETE FROM findings; DELETE FROM approval_events; DELETE FROM diff_versions; DELETE FROM step_versions; DELETE FROM task_events; DELETE FROM flow_steps; DELETE FROM tasks; DELETE FROM template_audit_events; DELETE FROM task_template_versions; DELETE FROM repo_template_settings; DELETE FROM task_templates; DELETE FROM profile_audit_events; DELETE FROM project_profile_versions; DELETE FROM project_profiles;");
       this.createAppendOnlyTriggers();
     });
   }
@@ -525,6 +525,25 @@ export class StateStore {
     const rows = this.database.prepare(`SELECT * FROM notifications WHERE ${filters.join(" AND ")} ORDER BY created_at DESC, notification_id DESC LIMIT ?`).all(...values, input.limit) as TaskRow[];
     const unread = this.database.prepare("SELECT COUNT(*) AS count FROM notifications WHERE status = 'unread'").get() as { count: number };
     return { notifications: rows.map((row) => ({ ...rowToNotification(row), deliveries: this.loadNotificationDeliveries(String(row.notification_id)) })), unreadCount: Number(unread.count) };
+  }
+
+  /** Retention evaluation includes dismissed rows, which the inbox intentionally hides. */
+  loadNotificationsForRetention(): AppNotification[] {
+    const rows = this.database.prepare("SELECT * FROM notifications ORDER BY created_at ASC, notification_id ASC").all() as TaskRow[];
+    return rows.map((row) => ({ ...rowToNotification(row), deliveries: this.loadNotificationDeliveries(String(row.notification_id)) }));
+  }
+
+  deleteNotificationForRetention(notificationId: string) {
+    requireUuid(notificationId, "Notification ID");
+    this.transaction(() => {
+      this.database.prepare("DELETE FROM notification_deliveries WHERE notification_id = ?").run(notificationId);
+      this.database.prepare("DELETE FROM notifications WHERE notification_id = ?").run(notificationId);
+    });
+  }
+
+  deleteDeliveredOutboundForRetention(notificationId: string) {
+    requireUuid(notificationId, "Notification ID");
+    this.database.prepare("DELETE FROM notification_deliveries WHERE notification_id = ? AND channel = 'slack' AND status = 'delivered'").run(notificationId);
   }
 
   markNotificationRead(notificationId: string): AppNotification | undefined {
@@ -733,7 +752,29 @@ export class StateStore {
   }
 
   loadBackups(): BackupMetadata[] {
-    return (this.database.prepare("SELECT * FROM backup_metadata ORDER BY created_at DESC").all() as TaskRow[]).map(rowToBackupMetadata);
+    return (this.database.prepare("SELECT * FROM backup_metadata WHERE retired_at IS NULL ORDER BY created_at DESC").all() as TaskRow[]).map(rowToBackupMetadata);
+  }
+
+  retireBackupMetadata(backupId: string) {
+    requireUuid(backupId, "Backup ID");
+    this.database.prepare("UPDATE backup_metadata SET retired_at = ? WHERE backup_id = ? AND retired_at IS NULL").run(new Date().toISOString(), backupId);
+  }
+
+  loadRetentionPolicy(): RetentionPreset {
+    const row = this.database.prepare("SELECT preset FROM retention_policy WHERE singleton = 1").get() as { preset?: string } | undefined;
+    return row && retentionPresets.includes(row.preset as RetentionPreset) ? row.preset as RetentionPreset : "conservative";
+  }
+
+  saveRetentionPolicy(preset: RetentionPreset) {
+    if (!retentionPresets.includes(preset)) throw new Error("Retention preset is invalid");
+    this.database.prepare("INSERT INTO retention_policy(singleton, preset, updated_at) VALUES (1, ?, ?) ON CONFLICT(singleton) DO UPDATE SET preset = excluded.preset, updated_at = excluded.updated_at").run(preset, new Date().toISOString());
+    this.appendCleanupAudit("retention_policy_changed", { preset });
+    return preset;
+  }
+
+  appendCleanupAudit(eventType: "retention_policy_changed" | "cleanup_preview_created" | "cleanup_requested" | "cleanup_completed" | "cleanup_blocked" | "cleanup_reconcile_required", metadata: SafeOperationMetadata = {}) {
+    this.database.prepare("INSERT INTO cleanup_audit_events(event_id, event_type, created_at, metadata_json) VALUES (?, ?, ?, ?)")
+      .run(randomUUID(), eventType, new Date().toISOString(), JSON.stringify(safeOperationMetadata(metadata)));
   }
 
   loadWatchRuleState(subjectType: "task" | "finding", subjectId: string, ruleType: NotificationType) {
@@ -1481,11 +1522,48 @@ export class StateStore {
       `);
       this.database.prepare("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)").run(10, new Date().toISOString());
     });
+    if (version < 10) version = 10;
+    if (version < 11) this.transaction(() => {
+      const backupColumns = this.database.prepare("PRAGMA table_info(backup_metadata)").all() as Array<{ name: string }>;
+      const hasRetiredAt = backupColumns.some((column) => column.name === "retired_at");
+      this.database.exec(`
+        DROP TRIGGER IF EXISTS backup_metadata_no_update;
+        DROP TRIGGER IF EXISTS backup_metadata_no_delete;
+        ${hasRetiredAt ? "" : "ALTER TABLE backup_metadata ADD COLUMN retired_at TEXT;"}
+        CREATE TABLE IF NOT EXISTS retention_policy (
+          singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+          preset TEXT NOT NULL CHECK(preset IN ('conservative','balanced')),
+          updated_at TEXT NOT NULL
+        );
+        INSERT OR IGNORE INTO retention_policy(singleton, preset, updated_at) VALUES (1, 'conservative', datetime('now'));
+        CREATE TABLE IF NOT EXISTS cleanup_audit_events (
+          sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE,
+          event_type TEXT NOT NULL CHECK(event_type IN ('retention_policy_changed','cleanup_preview_created','cleanup_requested','cleanup_completed','cleanup_blocked','cleanup_reconcile_required')),
+          created_at TEXT NOT NULL, metadata_json TEXT NOT NULL CHECK(json_valid(metadata_json))
+        );
+        ALTER TABLE operations RENAME TO operations_v10;
+        CREATE TABLE operations (
+          operation_id TEXT PRIMARY KEY,
+          operation_type TEXT NOT NULL CHECK(operation_type IN ('worktree_create','finding_conversion','git_commit','git_push','pr_create','slack_delivery','cleanup_worktree','cleanup_node_modules','cleanup_backup','cleanup_notifications')),
+          task_id TEXT, finding_id TEXT, notification_id TEXT,
+          idempotency_key TEXT NOT NULL UNIQUE,
+          state TEXT NOT NULL CHECK(state IN ('prepared','executing','external_succeeded','persisted','reconcile_required','failed')),
+          safe_metadata_json TEXT NOT NULL CHECK(json_valid(safe_metadata_json)),
+          error_code TEXT CHECK(error_code IS NULL OR length(error_code) BETWEEN 1 AND 80),
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        INSERT INTO operations SELECT * FROM operations_v10;
+        DROP TABLE operations_v10;
+        CREATE INDEX operations_state_idx ON operations(state, created_at);
+        CREATE INDEX operations_task_idx ON operations(task_id, created_at);
+      `);
+      this.database.prepare("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)").run(11, new Date().toISOString());
+    });
     this.createAppendOnlyTriggers();
   }
 
   private createAppendOnlyTriggers() {
-    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events", "task_template_versions", "template_audit_events", "finding_events", "notification_audit_events", "outbound_audit_events", "credential_audit_events", "backup_metadata"]) {
+    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events", "task_template_versions", "template_audit_events", "finding_events", "notification_audit_events", "outbound_audit_events", "credential_audit_events", "cleanup_audit_events"]) {
       this.database.exec(`
         CREATE TRIGGER IF NOT EXISTS ${table}_no_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT, '${table} is append-only'); END;
         CREATE TRIGGER IF NOT EXISTS ${table}_no_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT, '${table} is append-only'); END;
@@ -1494,7 +1572,7 @@ export class StateStore {
   }
 
   private dropAppendOnlyTriggers() {
-    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events", "task_template_versions", "template_audit_events", "finding_events", "notification_audit_events", "outbound_audit_events", "credential_audit_events", "backup_metadata"]) {
+    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events", "task_template_versions", "template_audit_events", "finding_events", "notification_audit_events", "outbound_audit_events", "credential_audit_events", "cleanup_audit_events"]) {
       this.database.exec(`DROP TRIGGER IF EXISTS ${table}_no_update; DROP TRIGGER IF EXISTS ${table}_no_delete;`);
     }
   }

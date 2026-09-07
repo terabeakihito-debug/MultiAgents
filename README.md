@@ -205,8 +205,8 @@ ORM. State is stored at `~/.multiagents/state.db`, outside every repository.
 The directory is forced to mode `0700` and the database file to `0600` when it
 is opened. Schema migrations are tracked in `schema_version`; the supported
 range and current version are reported by `GET /api/health` from the code-owned
-compatibility manifest (Phase 19 writes schema version 10). The v1→v2 through
-v9→v10 migrations run transactionally and
+compatibility manifest (Phase 20C writes schema version 11). The v1→v2 through
+v10→v11 migrations run transactionally and
 preserve existing task and flow-step snapshots. Existing tasks receive a
 `safe_default` v1 profile snapshot during the v3 migration and a compatible
 `Bug Fix` v1 template snapshot during the v4 migration.

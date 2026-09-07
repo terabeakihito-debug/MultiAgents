@@ -39,7 +39,7 @@ async function validate(path) {
     const integrity = db.prepare("PRAGMA integrity_check").get();
     if (integrity.integrity_check !== "ok") fail("Backup integrity check failed");
     const schema = Number(db.prepare("SELECT MAX(version) AS version FROM schema_version").get().version ?? 0);
-    if (schema < 9 || schema > 10) fail("Backup schema is incompatible with this application");
+    if (schema < 9 || schema > 11) fail("Backup schema is incompatible with this application");
     const tables = new Set(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((row) => row.name));
     for (const name of ["tasks", "task_events", "findings", "notifications", "operations", "backup_metadata"]) if (!tables.has(name)) fail(`Backup is missing required table ${name}`);
   } finally { db.close(); }
