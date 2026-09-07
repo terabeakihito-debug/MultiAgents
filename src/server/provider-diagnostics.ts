@@ -6,6 +6,7 @@ import { spawn } from "node:child_process";
 import type { AgentId } from "../agents/types";
 import type { ProviderDiagnostic } from "../health/types";
 import { buildSandboxCommand } from "./os-sandbox";
+import { registerChildProcess } from "./child-process-registry";
 
 const manifests: Record<AgentId, {
   binary: string; credential: string; versionPattern: RegExp; helpArgs: string[]; requiredFlags: string[];
@@ -65,14 +66,15 @@ export function resetProviderDiagnosticsForTests() { cache = undefined; }
 async function executeInSandbox(provider: AgentId, binary: string, args: string[], cwd: string) {
   const command = buildSandboxCommand({ profile: "agent_read_only", provider, cwd, command: { binary, args } });
   return new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
-    const child = spawn(command.binary, command.args, { cwd: command.cwd, env: command.env, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(command.binary, command.args, { cwd: command.cwd, env: command.env, shell: false, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
+    const registration = registerChildProcess({ child, purpose: "other" });
     let stdout = ""; let stderr = ""; let done = false;
     const timer = setTimeout(() => { if (!done) child.kill("SIGKILL"); }, 10_000);
     child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => { if (stdout.length < 200_000) stdout += chunk; });
     child.stderr.on("data", (chunk: string) => { if (stderr.length < 200_000) stderr += chunk; });
-    child.once("error", (error) => { done = true; clearTimeout(timer); reject(error); });
-    child.once("close", (code) => { done = true; clearTimeout(timer); resolve({ code, stdout, stderr }); });
+    child.once("error", (error) => { done = true; clearTimeout(timer); registration.unregister(); reject(error); });
+    child.once("close", (code) => { done = true; clearTimeout(timer); registration.unregister(); resolve({ code, stdout, stderr }); });
   });
 }
 

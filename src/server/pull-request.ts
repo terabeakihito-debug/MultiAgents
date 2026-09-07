@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { GIT_BINARY, runGit, runGitBytes, serverGitMutationInvocation } from "./git";
 import { buildChildProcessEnv, type ChildProcessPurpose } from "./child-process-env";
+import { registerChildProcess, withChildProcessOperation } from "./child-process-registry";
 import { containsKnownSecret, redactKnownSecrets } from "./credential-resolver";
 import { validateRepository } from "./repositories";
 import { validationScript, validationTimeoutMs, type ValidationStep } from "../profiles/policy";
@@ -271,7 +272,7 @@ export async function approveAndCreatePullRequest(taskId: string, input: Approva
           safeMetadata: { expectedParent, expectedTree: stagedTree, approvalId: input.approvalId },
         });
         getStateStore().updateOperation(commitOperation.operationId, "executing");
-        await deps.commit(task, commitMessage(task.prompt));
+        await withChildProcessOperation(commitOperation.operationId, () => deps.commit(task, commitMessage(task.prompt)));
         task.commitSha = await runGit(task.worktreePath, ["rev-parse", "HEAD"]);
         await verifyCommittedApproval(task, beforeCommit, stagedTree, task.commitSha);
         getStateStore().updateOperation(commitOperation.operationId, "external_succeeded", { commitSha: task.commitSha });
@@ -298,7 +299,7 @@ export async function approveAndCreatePullRequest(taskId: string, input: Approva
       });
       try {
         getStateStore().updateOperation(pushOperation.operationId, "executing");
-        await deps.push(task);
+        await withChildProcessOperation(pushOperation.operationId, () => deps.push(task));
         getStateStore().updateOperation(pushOperation.operationId, "external_succeeded");
         getStateStore().transaction(() => {
           task.latestPushedSha = task.commitSha;
@@ -321,7 +322,7 @@ export async function approveAndCreatePullRequest(taskId: string, input: Approva
       try {
         getStateStore().updateOperation(prOperation.operationId, "executing");
         const title = prTitle(task.prompt);
-        const created = await deps.createPr(task, remote, title, prBody(task));
+        const created = await withChildProcessOperation(prOperation.operationId, () => deps.createPr(task, remote, title, prBody(task)));
         validatePrUrl(created.url, remote, created.number);
         getStateStore().updateOperation(prOperation.operationId, "external_succeeded", { prNumber: created.number });
         task.prUrl = created.url;
@@ -392,7 +393,7 @@ export async function retryPullRequest(taskId: string, dependencies: Partial<App
       if (!["prepared", "failed"].includes(prOperation.state)) throw new ApprovalError("PR creation outcome requires reconciliation before retry");
       getStateStore().updateOperation(prOperation.operationId, "executing");
       const title = prTitle(task.prompt);
-      const created = await deps.createPr(task, remote, title, prBody(task));
+      const created = await withChildProcessOperation(prOperation.operationId, () => deps.createPr(task, remote, title, prBody(task)));
       validatePrUrl(created.url, remote, created.number);
       getStateStore().updateOperation(prOperation.operationId, "external_succeeded", { prNumber: created.number });
       task.prUrl = created.url;
@@ -890,6 +891,7 @@ async function runFixedProcessWithEnv(binary: string, args: readonly string[], c
       detached: process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],
     });
+    const registration = registerChildProcess({ child, purpose });
     let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0);
     let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
     let stdoutTruncated = false;
@@ -939,6 +941,7 @@ async function runFixedProcessWithEnv(binary: string, args: readonly string[], c
       if (settled) return;
       settled = true;
       clearTimers();
+      registration.unregister();
       resolve(result());
     };
     const finishAfterCloseAndOutput = () => {
@@ -953,6 +956,7 @@ async function runFixedProcessWithEnv(binary: string, args: readonly string[], c
       if (settled) return;
       settled = true;
       clearTimers();
+      registration.unregister();
       reject(error);
     });
     child.once("exit", (code, signal) => {

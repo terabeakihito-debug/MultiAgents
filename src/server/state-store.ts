@@ -270,6 +270,7 @@ export class StateStore {
   readonly path: string;
   private readonly database: DatabaseSync;
   private transactionDepth = 0;
+  private closed = false;
 
   constructor(path = STATE_DATABASE) {
     this.path = path;
@@ -280,7 +281,7 @@ export class StateStore {
     this.migrate();
   }
 
-  close() { this.database.close(); }
+  close() { if (!this.closed) { this.closed = true; this.database.close(); } }
 
   schemaVersion() {
     const row = this.database.prepare("SELECT MAX(version) AS version FROM schema_version").get() as { version: number | null };

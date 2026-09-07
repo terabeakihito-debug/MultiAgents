@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { AgentId } from "../agents/types";
 import type { RuntimePolicy } from "../runtime/types";
+import { registerChildProcess } from "./child-process-registry";
 
 export const BWRAP_BINARY = "/usr/bin/bwrap" as const;
 export const SANDBOX_PROJECT_ROOT = "/project" as const;
@@ -188,12 +189,13 @@ function runProbe(binary: string) {
       "--setenv", "HOME", SANDBOX_HOME, "--setenv", "PATH", "/usr/bin:/bin",
       "--", "/bin/sh", "-c",
       "test ! -e /home/justa && test ! -e /mnt/c && test ! -e /init && test -z \"$WSL_INTEROP\" && printf SANDBOX_OK",
-    ], { cwd: "/", env: { PATH: "/usr/bin:/bin", NODE_ENV: safeNodeEnv(process.env.NODE_ENV) }, shell: false, stdio: ["ignore", "pipe", "ignore"] });
+    ], { cwd: "/", env: { PATH: "/usr/bin:/bin", NODE_ENV: safeNodeEnv(process.env.NODE_ENV) }, shell: false, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "ignore"] });
+    const registration = registerChildProcess({ child, purpose: "other" });
     let stdout = "";
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (value: string) => { if (stdout.length < 100) stdout += value; });
-    child.once("error", rejectProbe);
-    child.once("close", (code) => resolveProbe({ code, stdout }));
+    child.once("error", (error) => { registration.unregister(); rejectProbe(error); });
+    child.once("close", (code) => { registration.unregister(); resolveProbe({ code, stdout }); });
   }).catch((error: unknown) => {
     if (error instanceof OsSandboxUnavailableError) throw error;
     throw new OsSandboxUnavailableError("namespace_unsupported");

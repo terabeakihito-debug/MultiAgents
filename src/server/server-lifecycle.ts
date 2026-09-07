@@ -1,7 +1,8 @@
 import { rmSync } from "node:fs";
 import { lstat, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { drainOperations, lifecycleState } from "./operation-registry";
+import { enterMaintenanceMode, lifecycleState, waitForOperations } from "./operation-registry";
+import { CHILD_PROCESS_GRACE_MS, terminateRegisteredChildren } from "./child-process-registry";
 import { getStateStore, STATE_DIRECTORY } from "./state-store";
 
 const shared = globalThis as typeof globalThis & { __multiAgentsShutdownInstalled?: boolean };
@@ -20,16 +21,45 @@ export async function installServerLifecycle() {
 }
 
 export async function gracefulDrainForTests(timeoutMs = SHUTDOWN_TIMEOUT_MS) {
-  return drainOperations(timeoutMs);
+  return drainServerProcesses(timeoutMs, "STOPPED");
+}
+
+export async function drainForMaintenance(timeoutMs = SHUTDOWN_TIMEOUT_MS) {
+  return drainServerProcesses(timeoutMs, "DRAINING");
 }
 
 async function shutdown(signal: NodeJS.Signals) {
   if (lifecycleState() === "STOPPED") return;
-  const result = await drainOperations(SHUTDOWN_TIMEOUT_MS);
-  try { getStateStore().close(); } catch { /* state may already be closed */ }
-  await rm(SERVER_LOCK_PATH, { force: true }).catch(() => undefined);
+  const result = await finalizeShutdown(SHUTDOWN_TIMEOUT_MS);
   if (result.timedOut) console.warn("operational_shutdown", JSON.stringify({ signal, timedOut: true, remaining: result.remaining.length }));
   process.exit(result.timedOut ? 1 : 0);
+}
+
+export async function finalizeShutdownForTests(timeoutMs = SHUTDOWN_TIMEOUT_MS, lockPath = SERVER_LOCK_PATH) {
+  return finalizeShutdown(timeoutMs, lockPath);
+}
+
+async function finalizeShutdown(timeoutMs: number, lockPath = SERVER_LOCK_PATH) {
+  const result = await drainServerProcesses(timeoutMs, "STOPPED");
+  try { getStateStore().close(); } catch { /* state may already be closed */ }
+  await rm(lockPath, { force: true }).catch(() => undefined);
+  return result;
+}
+
+async function drainServerProcesses(timeoutMs: number, finalState: "STOPPED" | "DRAINING") {
+  enterMaintenanceMode();
+  const startedAt = Date.now();
+  const children = await terminateRegisteredChildren({ graceMs: Math.min(CHILD_PROCESS_GRACE_MS, timeoutMs) });
+  for (const operationId of children.operationIds) {
+    try {
+      const operation = getStateStore().loadOperation(operationId);
+      if (operation && !["persisted", "failed"].includes(operation.state)) {
+        getStateStore().updateOperation(operationId, "reconcile_required", undefined, "shutdown_child_terminated");
+        if (process.env.NODE_ENV !== "test") console.info("operational_shutdown", JSON.stringify({ type: "shutdown_operation_reconcile_required", operationId }));
+      }
+    } catch { /* shutdown must continue even if state is already unavailable */ }
+  }
+  return waitForOperations(Math.max(0, timeoutMs - (Date.now() - startedAt)), finalState);
 }
 
 async function createServerLock() {

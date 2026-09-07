@@ -5,6 +5,7 @@ import { runGit } from "./git";
 import { getTask, listTasks, persistTask } from "./tasks";
 import type { DurableOperation } from "../operations/types";
 import { reconcileStaleSlackDeliveries } from "./outbound-notifications";
+import { registerChildProcess } from "./child-process-registry";
 
 type PullMatch = { number: number; url: string; headRefOid: string; headRefName: string; baseRefName: string };
 type ReconcileDependencies = { findPullRequests?: (taskId: string) => Promise<PullMatch[]>; now?: Date };
@@ -138,13 +139,18 @@ async function findPullRequests(task: NonNullable<ReturnType<typeof getTask>>): 
 
 function spawnBounded(binary: string, args: string[], cwd: string) {
   return new Promise<string>((resolve, reject) => {
-    const child = spawn(binary, args, { cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(binary, args, { cwd, shell: false, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
+    const registration = registerChildProcess({ child, purpose: "github" });
     let stdout = ""; let stderr = "";
     child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => { if (stdout.length < 200_000) stdout += chunk; });
     child.stderr.on("data", (chunk: string) => { if (stderr.length < 2_000) stderr += chunk; });
-    child.once("error", reject);
-    child.once("close", (code) => code === 0 ? resolve(stdout) : reject(new Error(`GitHub read-only reconciliation failed (${code}): ${stderr.slice(0, 400)}`)));
+    child.once("error", (error) => { registration.unregister(); reject(error); });
+    child.once("close", (code) => {
+      registration.unregister();
+      if (code === 0) resolve(stdout);
+      else reject(new Error(`GitHub read-only reconciliation failed (${code}): ${stderr.slice(0, 400)}`));
+    });
   });
 }
 function stringMeta(operation: DurableOperation, key: string) {

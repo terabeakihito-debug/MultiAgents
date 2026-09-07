@@ -28,7 +28,7 @@ export function activeOperations() { return [...active.values()].map((operation)
 export function hasActiveTaskOperation(taskId: string) { return [...active.values()].some((operation) => operation.taskId === taskId); }
 
 export function enterMaintenanceMode() {
-  if (active.size) throw new OperationUnavailableError("Cannot enter maintenance mode while operations are running");
+  if (lifecycleState() === "STOPPED") throw new OperationUnavailableError("Server has stopped");
   shared.__multiAgentsLifecycle = "DRAINING";
 }
 
@@ -38,11 +38,15 @@ export function leaveMaintenanceMode() {
 }
 
 export async function drainOperations(timeoutMs = 30_000) {
-  shared.__multiAgentsLifecycle = "DRAINING";
+  enterMaintenanceMode();
+  return waitForOperations(timeoutMs, "STOPPED");
+}
+
+export async function waitForOperations(timeoutMs: number, finalState: LifecycleState = "STOPPED") {
   const deadline = Date.now() + timeoutMs;
   while (active.size && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
   const timedOut = active.size > 0;
-  shared.__multiAgentsLifecycle = "STOPPED";
+  shared.__multiAgentsLifecycle = finalState;
   return { timedOut, remaining: activeOperations() };
 }
 

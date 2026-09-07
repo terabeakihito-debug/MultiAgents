@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { buildChildProcessEnv, buildServerGitMutationEnv } from "./child-process-env";
+import { registerChildProcess } from "./child-process-registry";
 import { redactKnownSecrets } from "./credential-resolver";
 
 export const GIT_BINARY = "/usr/bin/git";
@@ -12,7 +13,8 @@ export async function runGit(cwd: string, args: readonly string[]): Promise<stri
 
 export async function runGitBytes(cwd: string, args: readonly string[], env = buildChildProcessEnv({ purpose: "git" })): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    const child = spawn(GIT_BINARY, [...args], { cwd, env, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(GIT_BINARY, [...args], { cwd, env, shell: false, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
+    const registration = registerChildProcess({ child, purpose: "git" });
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let size = 0;
@@ -23,8 +25,9 @@ export async function runGitBytes(cwd: string, args: readonly string[], env = bu
       else oversized = true;
     });
     child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
-    child.on("error", reject);
+    child.on("error", (error) => { registration.unregister(); reject(error); });
     child.on("close", (code) => {
+      registration.unregister();
       if (code !== 0) reject(new Error(redactKnownSecrets(Buffer.concat(stderr).toString("utf8").trim()) || `git exited with code ${code}`));
       else if (oversized) reject(new Error("git output exceeded the security limit"));
       else resolve(Buffer.concat(stdout));

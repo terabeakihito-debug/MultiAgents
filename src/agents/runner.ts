@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { AgentAdapter, AgentDefinition, AgentResult } from "./types";
 import { beginAgentExecution } from "../server/agent-execution-guard";
 import { buildChildProcessEnv } from "../server/child-process-env";
+import { registerChildProcess } from "../server/child-process-registry";
 import { redactKnownSecrets } from "../server/credential-resolver";
 import { buildGenericRuntimePolicy } from "../server/runtime-policy";
 import {
@@ -98,12 +99,15 @@ function runProcess(
         stdio: ["ignore", "pipe", "pipe"],
       };
       let child;
+      let registration: ReturnType<typeof registerChildProcess> | undefined;
       let endAgentExecution: (() => void) | undefined;
       try {
         child = spawnProcess(command.binary, command.args, spawnOptions);
+        registration = registerChildProcess({ child, purpose: "agent" });
         endAgentExecution = beginAgentExecution();
         audit?.({ type: "os_sandbox_created", profile, provider: definition.id, capabilityClass: policy.policyClass });
       } catch (error) {
+        registration?.unregister();
         audit?.({ type: "os_sandbox_failed", profile, provider: definition.id, capabilityClass: policy.policyClass, failureCode: "sandbox_launch_failed" });
         resolve(errorResult(definition.id, error));
         return;
@@ -136,6 +140,7 @@ function runProcess(
         finish(errorResult(definition.id, error));
       });
       child.on("close", (code, closeSignal) => {
+        registration?.unregister();
         if (forceKillTimer) clearTimeout(forceKillTimer);
         cleanupAudit();
         if (code === 0) {

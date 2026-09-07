@@ -26,6 +26,7 @@ import { WORKTREE_ROOT, classifyTaskBase, getTask, getTaskDiff, persistTask, pub
 import { prepareTaskRuntime } from "./task-runtime";
 import { readOnlyRuntimePolicy } from "./runtime-policy";
 import { getStateStore } from "./state-store";
+import { withChildProcessOperation } from "./child-process-registry";
 import type { DurableOperation } from "../operations/types";
 
 const MAX_REVIEW_BODY_CHARS = 10_000;
@@ -243,7 +244,7 @@ export async function approveRework(taskId: string, input: ApprovalInput, depend
         const expectedParent = await runGit(task.worktreePath, ["rev-parse", "HEAD"]);
         commitOperation = getStateStore().createOperation({ type: "git_commit", taskId: task.id, idempotencyKey: `git_commit:${task.id}:${input.approvalId}`, safeMetadata: { expectedParent, expectedTree: stagedTree, approvalId: input.approvalId } });
         getStateStore().updateOperation(commitOperation.operationId, "executing");
-        await deps.commit(task);
+        await withChildProcessOperation(commitOperation.operationId, () => deps.commit(task));
       } catch (error) {
         if (error instanceof ApprovalError) throw error;
         const outcomeUnknown = commitOperation ? await commitOutcomeUnknown(task.worktreePath, commitOperation) : false;
@@ -267,7 +268,7 @@ export async function approveRework(taskId: string, input: ApprovalInput, depend
 
       transitionTask(task, "pushing_rework");
       const pushOperation = getStateStore().createOperation({ type: "git_push", taskId: task.id, idempotencyKey: `git_push:${task.id}:${commitSha}`, safeMetadata: { branch: task.branch, expectedSha: commitSha } });
-      try { getStateStore().updateOperation(pushOperation.operationId, "executing"); await deps.push(task); getStateStore().updateOperation(pushOperation.operationId, "external_succeeded"); }
+      try { getStateStore().updateOperation(pushOperation.operationId, "executing"); await withChildProcessOperation(pushOperation.operationId, () => deps.push(task)); getStateStore().updateOperation(pushOperation.operationId, "external_succeeded"); }
       catch {
         getStateStore().updateOperation(pushOperation.operationId, "reconcile_required", undefined, "push_outcome_unknown");
         transitionTask(task, "push_failed");
