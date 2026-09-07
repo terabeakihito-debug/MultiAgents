@@ -9,7 +9,9 @@ import { beginAgentExecution } from "./agent-execution-guard";
 import { createCredentialResolver } from "./credential-resolver";
 import {
   dispatchOutboundNotification,
+  markAmbiguousDelivery,
   parseOutboundChannelConfig,
+  reconcileStaleSlackDeliveries,
   retryOutboundNotification,
   sanitizeOutboundNotification,
   sendFixedSlackTest,
@@ -165,6 +167,39 @@ describe("Phase 15A delivery lifecycle, human gates, and migration", () => {
     expect(store.loadOutboundChannelConfig()).toEqual(config);
     expect(store.loadNotificationDelivery(notification.notificationId)?.status).toBe("pending");
     expect(store.loadOutboundAuditEvents().filter((event) => (event as { event_type: string }).event_type === "outbound_delivery_attempted")).toHaveLength(0);
+  });
+
+  it("moves an expired crash-window delivery to ambiguous and never retries automatically", async () => {
+    const notification = create("ci_failed");
+    const attemptId = crypto.randomUUID();
+    store.reserveNotificationDelivery(notification.notificationId, "pending", undefined, {
+      attemptId,
+      startedAt: "2026-01-01T00:00:00.000Z",
+      leaseExpiresAt: "2026-01-01T00:05:00.000Z",
+    });
+    const operation = store.createOperation({ type: "slack_delivery", notificationId: notification.notificationId, idempotencyKey: `slack_delivery:${notification.notificationId}:${attemptId}`, safeMetadata: { attemptId } });
+    store.updateOperation(operation.operationId, "executing");
+    const send = vi.fn(async () => ({ delivered: true as const }));
+
+    expect(reconcileStaleSlackDeliveries(new Date("2026-01-01T00:06:00.000Z"))).toBe(1);
+    expect(store.loadNotificationDelivery(notification.notificationId)).toMatchObject({ status: "ambiguous", errorCode: "delivery_outcome_unknown" });
+    expect(store.loadOperation(operation.operationId)).toMatchObject({ state: "reconcile_required", errorCode: "delivery_outcome_unknown" });
+    expect(send).not.toHaveBeenCalled();
+
+    await retryOutboundNotification(notification.notificationId, { configured: true, send });
+    expect(send).toHaveBeenCalledOnce();
+  });
+
+  it("allows a human decision to mark or dismiss an ambiguous Slack delivery", () => {
+    const delivered = create("ci_failed");
+    store.reserveNotificationDelivery(delivered.notificationId, "pending");
+    reconcileStaleSlackDeliveries();
+    expect(markAmbiguousDelivery(delivered.notificationId, "delivered").status).toBe("delivered");
+
+    const dismissed = create("ci_failed");
+    store.reserveNotificationDelivery(dismissed.notificationId, "pending");
+    reconcileStaleSlackDeliveries();
+    expect(markAmbiguousDelivery(dismissed.notificationId, "dismissed")).toMatchObject({ status: "suppressed", errorCode: "human_dismissed" });
   });
 
   it("migrates v7 to v8 without enqueueing historical notifications", async () => {

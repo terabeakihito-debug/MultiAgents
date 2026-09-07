@@ -38,6 +38,7 @@ const safeContent: Record<NotificationType, Pick<OutboundNotification, "title" |
 };
 
 type DeliveryDependencies = { send?: (payload: SanitizedOutboundNotification) => Promise<SlackDeliveryResult>; configured?: boolean };
+const DELIVERY_LEASE_MS = 5 * 60_000;
 
 export function sanitizeOutboundNotification(notification: AppNotification): SanitizedOutboundNotification {
   const fixed = safeContent[notification.type];
@@ -80,8 +81,15 @@ export async function dispatchOutboundNotification(notificationId: string, depen
     store.reserveNotificationDelivery(notificationId, "suppressed", allowed ? "not_configured" : "policy_suppressed");
     return store.loadNotificationDelivery(notificationId)!;
   }
-  if (!store.reserveNotificationDelivery(notificationId, "pending")) return store.loadNotificationDelivery(notificationId)!;
-  return attemptDelivery(notification, dependencies.send ?? sendSlackNotification, false);
+  const lease = deliveryLease();
+  let operation: ReturnType<typeof store.createOperation> | undefined;
+  const reserved = store.transaction(() => {
+    if (!store.reserveNotificationDelivery(notificationId, "pending", undefined, lease)) return false;
+    operation = store.createOperation({ type: "slack_delivery", notificationId, idempotencyKey: `slack_delivery:${notificationId}:${lease.attemptId}`, safeMetadata: { attemptId: lease.attemptId } });
+    return true;
+  });
+  if (!reserved) return store.loadNotificationDelivery(notificationId)!;
+  return attemptDelivery(notification, dependencies.send ?? sendSlackNotification, false, operation!.operationId);
 }
 
 export async function retryOutboundNotification(notificationId: string, dependencies: DeliveryDependencies = {}): Promise<NotificationDelivery> {
@@ -94,8 +102,13 @@ export async function retryOutboundNotification(notificationId: string, dependen
     if (dependencies.configured === undefined) auditCredentialResolutionFailure("slack_outbound");
     throw new OutboundInputError("Slack credential is not configured.");
   }
-  if (!store.beginNotificationDeliveryRetry(notificationId)) throw new OutboundInputError("Only a failed Slack delivery can be retried");
-  return attemptDelivery(notification, dependencies.send ?? sendSlackNotification, true);
+  const lease = deliveryLease();
+  let operation: ReturnType<typeof store.createOperation> | undefined;
+  store.transaction(() => {
+    if (!store.beginNotificationDeliveryRetry(notificationId, lease)) throw new OutboundInputError("Only a failed or ambiguous Slack delivery can be retried");
+    operation = store.createOperation({ type: "slack_delivery", notificationId, idempotencyKey: `slack_delivery:${notificationId}:${lease.attemptId}`, safeMetadata: { attemptId: lease.attemptId, retry: true } });
+  });
+  return attemptDelivery(notification, dependencies.send ?? sendSlackNotification, true, operation!.operationId);
 }
 
 export async function sendFixedSlackTest(dependencies: { send?: () => Promise<SlackDeliveryResult>; configured?: boolean } = {}) {
@@ -111,8 +124,9 @@ export async function sendFixedSlackTest(dependencies: { send?: () => Promise<Sl
   return result;
 }
 
-async function attemptDelivery(notification: AppNotification, send: (payload: SanitizedOutboundNotification) => Promise<SlackDeliveryResult>, retry: boolean) {
+async function attemptDelivery(notification: AppNotification, send: (payload: SanitizedOutboundNotification) => Promise<SlackDeliveryResult>, retry: boolean, operationId: string) {
   const store = getStateStore();
+  store.updateOperation(operationId, "executing");
   if (retry) store.appendOutboundAudit("outbound_delivery_retried", notification.notificationId, "pending");
   store.markNotificationDeliveryAttempted(notification.notificationId);
   store.appendOutboundAudit("outbound_delivery_attempted", notification.notificationId, "pending");
@@ -120,9 +134,38 @@ async function attemptDelivery(notification: AppNotification, send: (payload: Sa
   try { result = await send(sanitizeOutboundNotification(notification)); }
   catch { result = { delivered: false, errorCode: "adapter_error" }; }
   const status = result.delivered ? "delivered" : "failed";
-  store.completeNotificationDelivery(notification.notificationId, status, result.delivered ? undefined : result.errorCode);
-  store.appendOutboundAudit(result.delivered ? "outbound_delivery_succeeded" : "outbound_delivery_failed", notification.notificationId, status);
+  store.updateOperation(operationId, "external_succeeded", { delivered: result.delivered });
+  store.transaction(() => {
+    store.completeNotificationDelivery(notification.notificationId, status, result.delivered ? undefined : result.errorCode);
+    store.appendOutboundAudit(result.delivered ? "outbound_delivery_succeeded" : "outbound_delivery_failed", notification.notificationId, status);
+    store.updateOperation(operationId, "persisted");
+  });
   return store.loadNotificationDelivery(notification.notificationId)!;
+}
+
+export function reconcileStaleSlackDeliveries(now = new Date()) {
+  const store = getStateStore();
+  const changed = store.expireSlackDeliveryLeases(now);
+  for (const operation of store.loadUnfinishedOperations().filter((item) => item.type === "slack_delivery" && item.notificationId)) {
+    const delivery = store.loadNotificationDelivery(operation.notificationId!);
+    if (delivery?.status === "ambiguous") {
+      store.updateOperation(operation.operationId, "reconcile_required", undefined, "delivery_outcome_unknown");
+      store.appendOutboundAudit("outbound_delivery_ambiguous", operation.notificationId, "ambiguous");
+    }
+  }
+  return changed;
+}
+
+export function markAmbiguousDelivery(notificationId: string, action: "delivered" | "dismissed") {
+  const store = getStateStore();
+  const changed = action === "delivered" ? store.markAmbiguousSlackDelivered(notificationId) : store.dismissAmbiguousSlackDelivery(notificationId);
+  if (!changed) throw new OutboundInputError("Slack delivery is not ambiguous");
+  store.appendOutboundAudit(action === "delivered" ? "outbound_delivery_marked_delivered" : "outbound_delivery_dismissed", notificationId, action === "delivered" ? "delivered" : "suppressed");
+  return store.loadNotificationDelivery(notificationId)!;
+}
+
+function deliveryLease(now = new Date()) {
+  return { attemptId: randomUUID(), startedAt: now.toISOString(), leaseExpiresAt: new Date(now.getTime() + DELIVERY_LEASE_MS).toISOString() };
 }
 
 function sanitizeRepositoryName(value: string | undefined) {

@@ -131,7 +131,7 @@ function TaskCard({ task, busy, onResume, onHistory, onRefreshPr, onCleanup }: {
   return <article className={`dashboardCard bucket-${task.bucket}`}>
     <div className="taskCardTop"><div><span className="repoName">{task.repoName}</span><h3>{task.summary}</h3></div><span className={`bucketBadge ${task.bucket}`}>{bucketLabels[task.bucket]}</span></div>
     <div className="taskState"><code>{task.status}</code>{task.inactive ? <span className="inactiveBadge">INACTIVE · {relativeTime(task.updatedAt)}</span> : null}</div>
-    <dl className="taskFacts"><div><dt>Profile</dt><dd>{task.profileName} v{task.profileVersion}</dd></div><div><dt>Template</dt><dd>{task.templateName} v{task.templateVersion}</dd></div><div><dt>Branch</dt><dd><code>{task.branch}</code></dd></div><div><dt>PR</dt><dd>{task.prNumber ? `#${task.prNumber}${task.prState ? ` · ${task.prState}` : ""}` : "None"}</dd></div><div><dt>Recovery</dt><dd>{task.recoveryStatus}</dd></div><div><dt>Worktree</dt><dd>{task.worktreeStatus}</dd></div><div><dt>Updated</dt><dd>{relativeTime(task.updatedAt)}</dd></div></dl>
+    <dl className="taskFacts"><div><dt>Profile</dt><dd>{task.profileName} v{task.profileVersion}</dd></div><div><dt>Template</dt><dd>{task.templateName} v{task.templateVersion}</dd></div><div><dt>Branch</dt><dd><code>{task.branch}</code></dd></div><div><dt>Base</dt><dd>{baseLabel(task)}</dd></div><div><dt>PR</dt><dd>{task.prNumber ? `#${task.prNumber}${task.prState ? ` · ${task.prState}` : ""}` : "None"}</dd></div><div><dt>Recovery</dt><dd>{task.recoveryStatus}</dd></div><div><dt>Worktree</dt><dd>{task.worktreeInventoryStatus || task.worktreeStatus}{task.worktreeDirty === true ? " · dirty" : ""}</dd></div><div><dt>Size / age</dt><dd>{task.worktreeSizeBytes === undefined ? "—" : `${formatBytes(task.worktreeSizeBytes)} · ${Math.floor(task.worktreeAgeHours || 0)}h`}</dd></div><div><dt>Cleanup</dt><dd>{task.cleanupCandidate ? "Candidate" : "Retain"}</dd></div><div><dt>Updated</dt><dd>{relativeTime(task.updatedAt)}</dd></div></dl>
     {task.source ? <div className="taskSource"><strong>Source</strong><p>Finding {task.source.severity.toUpperCase()} — {task.source.title}</p></div> : null}
     {task.attentionReason ? <div className="attentionReason"><strong>Reason</strong><p>{task.attentionReason}</p></div> : null}
     <div className="nextAction"><span>Next</span><strong>{task.nextActionLabel}</strong></div>
@@ -153,4 +153,14 @@ function relativeTime(value: string) {
   if (elapsed < 3_600_000) return `${Math.floor(elapsed / 60_000)} min ago`;
   if (elapsed < 86_400_000) return `${Math.floor(elapsed / 3_600_000)} hr ago`;
   return `${Math.floor(elapsed / 86_400_000)} days ago`;
+}
+
+function baseLabel(task: DashboardTask) {
+  if (task.baseState === "base_advanced") return `Advanced by ${task.baseAheadCount ?? "?"} commits`;
+  return task.baseState?.replace("base_", "") || "unchecked";
+}
+function formatBytes(value: number) {
+  if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(1)} GB`;
+  if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(1)} MB`;
+  return `${Math.ceil(value / 1024)} KB`;
 }

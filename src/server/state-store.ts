@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync } from "node:fs";
+import { chmodSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { FlowStep } from "../agents/types";
 import type { CredentialCapability, CredentialStatus } from "../credentials/types";
@@ -10,6 +10,8 @@ import type { DashboardCounts, DashboardSort, PrFilter, TaskBucket } from "../da
 import { parseProfileSnapshot, safeDefaultSnapshot, type ProjectProfile, type ProjectProfileSnapshot } from "../profiles/policy";
 import { builtInTemplates, mergeTemplateWithProfile, parseTemplateSnapshot, snapshotTemplate, type RepoTemplateSettings, type TaskTemplate, type TaskTemplateSnapshot } from "../templates/policy";
 import type { RepoTask } from "./tasks";
+import { operationStates, operationTypes, type BackupMetadata, type DurableOperation, type OperationState, type OperationType, type SafeOperationMetadata } from "../operations/types";
+import { secureStateDatabasePath } from "./state-path";
 import type { AgentRole } from "../profiles/policy";
 import type { RuntimePolicyClass, RuntimeViolation } from "../runtime/types";
 import {
@@ -43,7 +45,8 @@ import {
 
 export const STATE_DIRECTORY = join(homedir(), ".multiagents");
 export const STATE_DATABASE = join(STATE_DIRECTORY, "state.db");
-export const SCHEMA_VERSION = 9;
+export const APP_STATE_COMPAT = Object.freeze({ minSchema: 9, maxSchema: 10 });
+export const SCHEMA_VERSION = APP_STATE_COMPAT.maxSchema;
 const MAX_STORED_PROMPT_CHARS = 20_000;
 const MAX_STORED_OUTPUT_CHARS = 1_000_000;
 
@@ -270,10 +273,7 @@ export class StateStore {
 
   constructor(path = STATE_DATABASE) {
     this.path = path;
-    if (path !== ":memory:") {
-      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-      chmodSync(dirname(path), 0o700);
-    }
+    secureStateDatabasePath(path);
     this.database = new DatabaseSync(path);
     if (path !== ":memory:") chmodSync(path, 0o600);
     this.database.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
@@ -285,6 +285,11 @@ export class StateStore {
   schemaVersion() {
     const row = this.database.prepare("SELECT MAX(version) AS version FROM schema_version").get() as { version: number | null };
     return row.version ?? 0;
+  }
+
+  integrityCheck() {
+    const row = this.database.prepare("PRAGMA integrity_check").get() as Record<string, unknown>;
+    return String(row.integrity_check);
   }
 
   saveTask(task: RepoTask) {
@@ -317,6 +322,8 @@ export class StateStore {
       ciMessage: task.ciMessage,
       error: task.error,
       runtimeViolation: task.runtimeViolation,
+      baseState: task.baseState,
+      baseAheadCount: task.baseAheadCount,
       profileSnapshot: profile,
       templateSnapshot: template,
     });
@@ -479,7 +486,7 @@ export class StateStore {
   clearForTests() {
     this.transaction(() => {
       this.dropAppendOnlyTriggers();
-      this.database.exec("DELETE FROM credential_audit_events; DELETE FROM outbound_audit_events; DELETE FROM notification_deliveries; DELETE FROM outbound_channel_settings; DELETE FROM notification_audit_events; DELETE FROM notifications; DELETE FROM watch_rule_state; DELETE FROM notification_preferences; DELETE FROM finding_events; DELETE FROM findings; DELETE FROM approval_events; DELETE FROM diff_versions; DELETE FROM step_versions; DELETE FROM task_events; DELETE FROM flow_steps; DELETE FROM tasks; DELETE FROM template_audit_events; DELETE FROM task_template_versions; DELETE FROM repo_template_settings; DELETE FROM task_templates; DELETE FROM profile_audit_events; DELETE FROM project_profile_versions; DELETE FROM project_profiles;");
+      this.database.exec("DELETE FROM backup_metadata; DELETE FROM operations; DELETE FROM credential_audit_events; DELETE FROM outbound_audit_events; DELETE FROM notification_deliveries; DELETE FROM outbound_channel_settings; DELETE FROM notification_audit_events; DELETE FROM notifications; DELETE FROM watch_rule_state; DELETE FROM notification_preferences; DELETE FROM finding_events; DELETE FROM findings; DELETE FROM approval_events; DELETE FROM diff_versions; DELETE FROM step_versions; DELETE FROM task_events; DELETE FROM flow_steps; DELETE FROM tasks; DELETE FROM template_audit_events; DELETE FROM task_template_versions; DELETE FROM repo_template_settings; DELETE FROM task_templates; DELETE FROM profile_audit_events; DELETE FROM project_profile_versions; DELETE FROM project_profiles;");
       this.createAppendOnlyTriggers();
     });
   }
@@ -581,34 +588,56 @@ export class StateStore {
     return config;
   }
 
-  reserveNotificationDelivery(notificationId: string, status: Extract<DeliveryStatus, "pending" | "suppressed">, errorCode?: string) {
+  reserveNotificationDelivery(notificationId: string, status: Extract<DeliveryStatus, "pending" | "suppressed">, errorCode?: string, lease?: { attemptId: string; startedAt: string; leaseExpiresAt: string }) {
     requireUuid(notificationId, "Notification ID");
     const result = this.database.prepare(`INSERT OR IGNORE INTO notification_deliveries
-      (notification_id, channel, status, attempted_at, delivered_at, error_code) VALUES (?, 'slack', ?, NULL, NULL, ?)`)
-      .run(notificationId, status, boundedErrorCode(errorCode) ?? null);
+      (notification_id, channel, status, attempted_at, delivered_at, error_code, attempt_id, started_at, lease_expires_at)
+      VALUES (?, 'slack', ?, NULL, NULL, ?, ?, ?, ?)`)
+      .run(notificationId, status, boundedErrorCode(errorCode) ?? null, lease?.attemptId ?? null, lease?.startedAt ?? null, lease?.leaseExpiresAt ?? null);
     return Number(result.changes) === 1;
   }
 
   markNotificationDeliveryAttempted(notificationId: string) {
     requireUuid(notificationId, "Notification ID");
-    const result = this.database.prepare("UPDATE notification_deliveries SET attempted_at = ? WHERE notification_id = ? AND channel = 'slack' AND status = 'pending'")
-      .run(new Date().toISOString(), notificationId);
+    const result = this.database.prepare("UPDATE notification_deliveries SET attempted_at = COALESCE(attempted_at, ?), started_at = COALESCE(started_at, ?) WHERE notification_id = ? AND channel = 'slack' AND status = 'pending'")
+      .run(new Date().toISOString(), new Date().toISOString(), notificationId);
     if (Number(result.changes) !== 1) throw new Error("Slack delivery is not pending");
   }
 
   completeNotificationDelivery(notificationId: string, status: Extract<DeliveryStatus, "delivered" | "failed">, errorCode?: string) {
     requireUuid(notificationId, "Notification ID");
     const now = new Date().toISOString();
-    const result = this.database.prepare(`UPDATE notification_deliveries SET status = ?, delivered_at = ?, error_code = ?
+    const result = this.database.prepare(`UPDATE notification_deliveries SET status = ?, delivered_at = ?, error_code = ?, lease_expires_at = NULL
       WHERE notification_id = ? AND channel = 'slack' AND status = 'pending'`)
       .run(status, status === "delivered" ? now : null, status === "failed" ? boundedErrorCode(errorCode) ?? "unknown" : null, notificationId);
     if (Number(result.changes) !== 1) throw new Error("Slack delivery completion state is invalid");
   }
 
-  beginNotificationDeliveryRetry(notificationId: string) {
+  beginNotificationDeliveryRetry(notificationId: string, lease?: { attemptId: string; startedAt: string; leaseExpiresAt: string }) {
     requireUuid(notificationId, "Notification ID");
-    const result = this.database.prepare(`UPDATE notification_deliveries SET status = 'pending', attempted_at = NULL, delivered_at = NULL, error_code = NULL
-      WHERE notification_id = ? AND channel = 'slack' AND status = 'failed'`).run(notificationId);
+    const result = this.database.prepare(`UPDATE notification_deliveries SET status = 'pending', attempted_at = NULL, delivered_at = NULL, error_code = NULL,
+      attempt_id = ?, started_at = ?, lease_expires_at = ?
+      WHERE notification_id = ? AND channel = 'slack' AND status IN ('failed','ambiguous')`).run(lease?.attemptId ?? null, lease?.startedAt ?? null, lease?.leaseExpiresAt ?? null, notificationId);
+    return Number(result.changes) === 1;
+  }
+
+  expireSlackDeliveryLeases(now = new Date()) {
+    const result = this.database.prepare(`UPDATE notification_deliveries SET status = 'ambiguous', error_code = 'delivery_outcome_unknown', lease_expires_at = NULL
+      WHERE channel = 'slack' AND status = 'pending' AND (lease_expires_at IS NULL OR lease_expires_at <= ?)`).run(now.toISOString());
+    return Number(result.changes);
+  }
+
+  markAmbiguousSlackDelivered(notificationId: string) {
+    requireUuid(notificationId, "Notification ID");
+    const result = this.database.prepare(`UPDATE notification_deliveries SET status = 'delivered', delivered_at = ?, error_code = NULL, lease_expires_at = NULL
+      WHERE notification_id = ? AND channel = 'slack' AND status = 'ambiguous'`).run(new Date().toISOString(), notificationId);
+    return Number(result.changes) === 1;
+  }
+
+  dismissAmbiguousSlackDelivery(notificationId: string) {
+    requireUuid(notificationId, "Notification ID");
+    const result = this.database.prepare(`UPDATE notification_deliveries SET status = 'suppressed', error_code = 'human_dismissed', lease_expires_at = NULL
+      WHERE notification_id = ? AND channel = 'slack' AND status = 'ambiguous'`).run(notificationId);
     return Number(result.changes) === 1;
   }
 
@@ -623,7 +652,7 @@ export class StateStore {
     return (this.database.prepare("SELECT * FROM notification_deliveries WHERE notification_id = ? ORDER BY channel").all(notificationId) as TaskRow[]).map(rowToNotificationDelivery);
   }
 
-  appendOutboundAudit(eventType: "outbound_delivery_attempted" | "outbound_delivery_succeeded" | "outbound_delivery_failed" | "outbound_delivery_retried" | "outbound_preferences_updated", notificationId: string | undefined, status: DeliveryStatus) {
+  appendOutboundAudit(eventType: "outbound_delivery_attempted" | "outbound_delivery_succeeded" | "outbound_delivery_failed" | "outbound_delivery_retried" | "outbound_preferences_updated" | "outbound_delivery_ambiguous" | "outbound_delivery_marked_delivered" | "outbound_delivery_dismissed", notificationId: string | undefined, status: DeliveryStatus) {
     if (notificationId) requireUuid(notificationId, "Notification ID");
     this.database.prepare("INSERT INTO outbound_audit_events(event_id, event_type, notification_id, channel, status, created_at) VALUES (?, ?, ?, 'slack', ?, ?)")
       .run(randomUUID(), eventType, notificationId ?? null, status, new Date().toISOString());
@@ -640,6 +669,70 @@ export class StateStore {
 
   loadCredentialAuditEvents() {
     return this.database.prepare("SELECT event_type, capability, status, created_at FROM credential_audit_events ORDER BY sequence").all();
+  }
+
+  createOperation(input: {
+    type: OperationType;
+    taskId?: string;
+    findingId?: string;
+    notificationId?: string;
+    idempotencyKey: string;
+    safeMetadata?: SafeOperationMetadata;
+  }): DurableOperation {
+    if (!operationTypes.includes(input.type)) throw new Error("Operation type is invalid");
+    if (!/^[A-Za-z0-9:._/-]{1,500}$/.test(input.idempotencyKey)) throw new Error("Operation idempotency key is invalid");
+    for (const id of [input.taskId, input.findingId, input.notificationId]) if (id) requireUuid(id, "Operation relation");
+    const metadata = safeOperationMetadata(input.safeMetadata ?? {});
+    const operationId = randomUUID();
+    const now = new Date().toISOString();
+    this.database.prepare(`INSERT OR IGNORE INTO operations
+      (operation_id, operation_type, task_id, finding_id, notification_id, idempotency_key, state, safe_metadata_json, error_code, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, NULL, ?, ?)`)
+      .run(operationId, input.type, input.taskId ?? null, input.findingId ?? null, input.notificationId ?? null, input.idempotencyKey, JSON.stringify(metadata), now, now);
+    const operation = this.loadOperationByKey(input.idempotencyKey);
+    if (!operation || operation.type !== input.type || operation.taskId !== input.taskId || operation.findingId !== input.findingId || operation.notificationId !== input.notificationId) {
+      throw new Error("Operation idempotency key conflicts with another logical operation");
+    }
+    return operation;
+  }
+
+  updateOperation(operationId: string, state: OperationState, safeMetadata?: SafeOperationMetadata, errorCode?: string) {
+    requireUuid(operationId, "Operation ID");
+    if (!operationStates.includes(state)) throw new Error("Operation state is invalid");
+    const current = this.loadOperation(operationId);
+    if (!current) throw new Error("Operation not found");
+    const metadata = safeOperationMetadata({ ...current.safeMetadata, ...(safeMetadata ?? {}) });
+    this.database.prepare("UPDATE operations SET state = ?, safe_metadata_json = ?, error_code = ?, updated_at = ? WHERE operation_id = ?")
+      .run(state, JSON.stringify(metadata), boundedErrorCode(errorCode) ?? null, new Date().toISOString(), operationId);
+    return this.loadOperation(operationId)!;
+  }
+
+  loadOperation(operationId: string): DurableOperation | undefined {
+    requireUuid(operationId, "Operation ID");
+    const row = this.database.prepare("SELECT * FROM operations WHERE operation_id = ?").get(operationId) as TaskRow | undefined;
+    return row ? rowToOperation(row) : undefined;
+  }
+
+  loadOperationByKey(idempotencyKey: string): DurableOperation | undefined {
+    const row = this.database.prepare("SELECT * FROM operations WHERE idempotency_key = ?").get(idempotencyKey) as TaskRow | undefined;
+    return row ? rowToOperation(row) : undefined;
+  }
+
+  loadUnfinishedOperations(): DurableOperation[] {
+    return (this.database.prepare("SELECT * FROM operations WHERE state NOT IN ('persisted','failed') ORDER BY created_at, operation_id").all() as TaskRow[]).map(rowToOperation);
+  }
+
+  saveBackupMetadata(metadata: BackupMetadata) {
+    requireUuid(metadata.backupId, "Backup ID");
+    if (metadata.integrityStatus !== "ok" || !Number.isSafeInteger(metadata.schemaVersion) || !Number.isSafeInteger(metadata.sizeBytes) || metadata.sizeBytes < 1) throw new Error("Backup metadata is invalid");
+    this.database.prepare(`INSERT INTO backup_metadata(backup_id, created_at, schema_version, integrity_status, size_bytes, app_commit)
+      VALUES (?, ?, ?, 'ok', ?, ?)`)
+      .run(metadata.backupId, metadata.createdAt, metadata.schemaVersion, metadata.sizeBytes, metadata.appCommit ?? null);
+    return metadata;
+  }
+
+  loadBackups(): BackupMetadata[] {
+    return (this.database.prepare("SELECT * FROM backup_metadata ORDER BY created_at DESC").all() as TaskRow[]).map(rowToBackupMetadata);
   }
 
   loadWatchRuleState(subjectType: "task" | "finding", subjectId: string, ruleType: NotificationType) {
@@ -990,6 +1083,8 @@ export class StateStore {
       sourceFindingId: optionalString(row.source_finding_id),
       sourceTaskId: optionalString(row.source_task_id),
       runtimeViolation: objectOrUndefined(payload.runtimeViolation) as RepoTask["runtimeViolation"],
+      baseState: optionalString(payload.baseState) as RepoTask["baseState"],
+      baseAheadCount: optionalNumber(payload.baseAheadCount),
     } as RepoTask;
   }
 
@@ -1328,11 +1423,68 @@ export class StateStore {
       `);
       this.database.prepare("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)").run(9, new Date().toISOString());
     });
+    if (version < 9) version = 9;
+    if (version < 10) this.transaction(() => {
+      this.database.exec(`
+        DROP TRIGGER IF EXISTS outbound_audit_events_no_update;
+        DROP TRIGGER IF EXISTS outbound_audit_events_no_delete;
+        ALTER TABLE notification_deliveries RENAME TO notification_deliveries_v9;
+        CREATE TABLE notification_deliveries (
+          notification_id TEXT NOT NULL REFERENCES notifications(notification_id),
+          channel TEXT NOT NULL CHECK(channel = 'slack'),
+          status TEXT NOT NULL CHECK(status IN ('pending','delivered','failed','suppressed','ambiguous')),
+          attempted_at TEXT, delivered_at TEXT,
+          error_code TEXT CHECK(error_code IS NULL OR length(error_code) BETWEEN 1 AND 80),
+          attempt_id TEXT, started_at TEXT, lease_expires_at TEXT,
+          PRIMARY KEY(notification_id, channel)
+        );
+        INSERT INTO notification_deliveries(notification_id, channel, status, attempted_at, delivered_at, error_code)
+          SELECT notification_id, channel, CASE WHEN status = 'pending' THEN 'ambiguous' ELSE status END, attempted_at, delivered_at,
+            CASE WHEN status = 'pending' THEN 'delivery_outcome_unknown' ELSE error_code END FROM notification_deliveries_v9;
+        DROP TABLE notification_deliveries_v9;
+        CREATE INDEX notification_deliveries_status_idx ON notification_deliveries(status);
+
+        ALTER TABLE outbound_audit_events RENAME TO outbound_audit_events_v9;
+        CREATE TABLE outbound_audit_events (
+          sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+          event_id TEXT NOT NULL UNIQUE,
+          event_type TEXT NOT NULL CHECK(event_type IN ('outbound_delivery_attempted','outbound_delivery_succeeded','outbound_delivery_failed','outbound_delivery_retried','outbound_preferences_updated','outbound_delivery_ambiguous','outbound_delivery_marked_delivered','outbound_delivery_dismissed')),
+          notification_id TEXT,
+          channel TEXT NOT NULL CHECK(channel = 'slack'),
+          status TEXT NOT NULL CHECK(status IN ('pending','delivered','failed','suppressed','ambiguous')),
+          created_at TEXT NOT NULL
+        );
+        INSERT INTO outbound_audit_events(sequence, event_id, event_type, notification_id, channel, status, created_at)
+          SELECT sequence, event_id, event_type, notification_id, channel, status, created_at FROM outbound_audit_events_v9;
+        DROP TABLE outbound_audit_events_v9;
+
+        CREATE TABLE IF NOT EXISTS operations (
+          operation_id TEXT PRIMARY KEY,
+          operation_type TEXT NOT NULL CHECK(operation_type IN ('worktree_create','finding_conversion','git_commit','git_push','pr_create','slack_delivery')),
+          task_id TEXT, finding_id TEXT, notification_id TEXT,
+          idempotency_key TEXT NOT NULL UNIQUE,
+          state TEXT NOT NULL CHECK(state IN ('prepared','executing','external_succeeded','persisted','reconcile_required','failed')),
+          safe_metadata_json TEXT NOT NULL CHECK(json_valid(safe_metadata_json)),
+          error_code TEXT CHECK(error_code IS NULL OR length(error_code) BETWEEN 1 AND 80),
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS operations_state_idx ON operations(state, created_at);
+        CREATE INDEX IF NOT EXISTS operations_task_idx ON operations(task_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS backup_metadata (
+          backup_id TEXT PRIMARY KEY, created_at TEXT NOT NULL,
+          schema_version INTEGER NOT NULL CHECK(schema_version > 0),
+          integrity_status TEXT NOT NULL CHECK(integrity_status = 'ok'),
+          size_bytes INTEGER NOT NULL CHECK(size_bytes > 0), app_commit TEXT
+        );
+      `);
+      this.database.prepare("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)").run(10, new Date().toISOString());
+    });
     this.createAppendOnlyTriggers();
   }
 
   private createAppendOnlyTriggers() {
-    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events", "task_template_versions", "template_audit_events", "finding_events", "notification_audit_events", "outbound_audit_events", "credential_audit_events"]) {
+    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events", "task_template_versions", "template_audit_events", "finding_events", "notification_audit_events", "outbound_audit_events", "credential_audit_events", "backup_metadata"]) {
       this.database.exec(`
         CREATE TRIGGER IF NOT EXISTS ${table}_no_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT, '${table} is append-only'); END;
         CREATE TRIGGER IF NOT EXISTS ${table}_no_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT, '${table} is append-only'); END;
@@ -1341,7 +1493,7 @@ export class StateStore {
   }
 
   private dropAppendOnlyTriggers() {
-    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events", "task_template_versions", "template_audit_events", "finding_events", "notification_audit_events", "outbound_audit_events", "credential_audit_events"]) {
+    for (const table of ["task_events", "step_versions", "diff_versions", "approval_events", "project_profile_versions", "profile_audit_events", "task_template_versions", "template_audit_events", "finding_events", "notification_audit_events", "outbound_audit_events", "credential_audit_events", "backup_metadata"]) {
       this.database.exec(`DROP TRIGGER IF EXISTS ${table}_no_update; DROP TRIGGER IF EXISTS ${table}_no_delete;`);
     }
   }
@@ -1484,6 +1636,22 @@ function rowToNotificationDelivery(row: TaskRow): NotificationDelivery {
   return {
     notificationId: String(row.notification_id), channel: "slack", status: String(row.status) as DeliveryStatus,
     attemptedAt: optionalString(row.attempted_at), deliveredAt: optionalString(row.delivered_at), errorCode: optionalString(row.error_code),
+    attemptId: optionalString(row.attempt_id), startedAt: optionalString(row.started_at), leaseExpiresAt: optionalString(row.lease_expires_at),
+  };
+}
+function rowToOperation(row: TaskRow): DurableOperation {
+  return {
+    operationId: String(row.operation_id), type: String(row.operation_type) as OperationType,
+    taskId: optionalString(row.task_id), findingId: optionalString(row.finding_id), notificationId: optionalString(row.notification_id),
+    idempotencyKey: String(row.idempotency_key), state: String(row.state) as OperationState,
+    safeMetadata: safeOperationMetadata(parseObject(row.safe_metadata_json) as SafeOperationMetadata),
+    errorCode: optionalString(row.error_code), createdAt: String(row.created_at), updatedAt: String(row.updated_at),
+  };
+}
+function rowToBackupMetadata(row: TaskRow): BackupMetadata {
+  return {
+    backupId: String(row.backup_id), createdAt: String(row.created_at), schemaVersion: Number(row.schema_version),
+    integrityStatus: "ok", sizeBytes: Number(row.size_bytes), appCommit: optionalString(row.app_commit),
   };
 }
 function requireUuid(value: string, label: string) {
@@ -1492,6 +1660,24 @@ function requireUuid(value: string, label: string) {
 function boundedErrorCode(value: string | undefined) {
   if (value === undefined) return undefined;
   return /^[a-z0-9_-]{1,80}$/.test(value) ? value : "unknown";
+}
+function safeOperationMetadata(value: SafeOperationMetadata): SafeOperationMetadata {
+  const safe: SafeOperationMetadata = {};
+  const forbidden = /(?:prompt|output|secret|token|credential|password|cookie|authorization|webhook)/i;
+  for (const [key, item] of Object.entries(value)) {
+    if (!/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(key) || forbidden.test(key)) throw new Error("Operation metadata key is forbidden");
+    if (item === undefined) continue;
+    if (typeof item === "string") {
+      if (item.length > 500 || containsSensitiveOperationValue(item)) throw new Error("Operation metadata value is unsafe");
+      safe[key] = redactKnownSecrets(item);
+    } else if (typeof item === "number" && Number.isSafeInteger(item)) safe[key] = item;
+    else if (typeof item === "boolean") safe[key] = item;
+    else throw new Error("Operation metadata value is invalid");
+  }
+  return safe;
+}
+function containsSensitiveOperationValue(value: string) {
+  return /(?:gh[opusr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|hooks\.slack\.com\/services\/)/i.test(value);
 }
 function parseJson(value: unknown): unknown { try { return JSON.parse(String(value)); } catch { return undefined; } }
 function rowToFlowStep(row: FlowStepRow): FlowStep {

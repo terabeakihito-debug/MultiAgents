@@ -5,6 +5,8 @@ import { getStateStore, type DashboardQuery, type DashboardRow } from "./state-s
 import { getTask, type RepoTask, type TaskStatus } from "./tasks";
 import { evaluateInactiveTasks } from "./notifications";
 import { redactKnownSecrets } from "./credential-resolver";
+import { inspectTaskWorktrees } from "./operational-health";
+import type { WorktreeUsage } from "../health/types";
 
 const MAX_DASHBOARD_LIMIT = 100;
 const DEFAULT_DASHBOARD_LIMIT = 50;
@@ -65,7 +67,9 @@ export function parseDashboardQuery(url: URL): DashboardQuery {
 export async function getDashboard(query: DashboardQuery, now = new Date()): Promise<DashboardResponse> {
   evaluateInactiveTasks(now);
   const result = getStateStore().queryDashboard(query);
-  const tasks = await Promise.all(result.rows.map((row) => dashboardTask(row, now)));
+  const dashboardTasks = result.rows.map((row) => getTask(row.taskId)).filter((task): task is RepoTask => Boolean(task));
+  const usage = new Map((await inspectTaskWorktrees(dashboardTasks)).filter((item) => item.taskId).map((item) => [item.taskId!, item]));
+  const tasks = await Promise.all(result.rows.map((row) => dashboardTask(row, now, usage.get(row.taskId))));
   return { tasks, counts: result.counts, limit: query.limit };
 }
 
@@ -123,7 +127,7 @@ export function validatedDashboardPrUrl(task: RepoTask | undefined, row: Pick<Da
   return row.prUrl === expected ? expected : undefined;
 }
 
-async function dashboardTask(row: DashboardRow, now: Date): Promise<DashboardTask> {
+async function dashboardTask(row: DashboardRow, now: Date, usage?: WorktreeUsage): Promise<DashboardTask> {
   const task = getTask(row.taskId);
   const sourceFinding = row.sourceFindingId ? getStateStore().loadFinding(row.sourceFindingId) : undefined;
   const profile = object(row.payload.profileSnapshot);
@@ -148,16 +152,20 @@ async function dashboardTask(row: DashboardRow, now: Date): Promise<DashboardTas
   return {
     id: row.taskId, repoId: row.repoId, repoName: row.repoName, summary: summarizeTaskPrompt(row.originalPrompt),
     status: row.status, bucket: row.bucket, branch: row.branch, baseBranch: row.baseBranch,
+    baseState: typeof row.payload.baseState === "string" ? row.payload.baseState as DashboardTask["baseState"] : undefined,
+    baseAheadCount: typeof row.payload.baseAheadCount === "number" ? row.payload.baseAheadCount : undefined,
     prNumber: row.prNumber, prUrl, prState: typeof review.state === "string" ? review.state : undefined,
     createdAt: row.createdAt, updatedAt: row.updatedAt,
     inactive: now.getTime() - Date.parse(row.updatedAt) >= INACTIVE_AFTER_MS,
     recoveryStatus: row.recoveryStatus, recoveryMessage: row.recoveryMessage, worktreeStatus: row.worktreeStatus,
+    worktreeAgeHours: usage?.ageHours, worktreeSizeBytes: usage?.sizeBytes, worktreeDirty: usage?.dirty,
+    worktreeInventoryStatus: usage?.inventoryStatus, cleanupCandidate: usage?.cleanupCandidate,
     profileName: typeof profile.name === "string" ? profile.name : "invalid profile",
     profileVersion: typeof profile.version === "number" ? profile.version : row.profileVersion ?? 0,
     templateName: typeof template.name === "string" ? template.name : "invalid template",
     templateVersion: typeof template.version === "number" ? template.version : row.templateVersion ?? 0,
     nextAction, nextActionLabel: NEXT_ACTION_LABELS[nextAction], attentionReason: row.bucket === "needs_attention" ? attentionReasonFor(row) : undefined,
-    canResume: row.bucket !== "archived" && row.recoveryStatus !== "invalid", canViewDiff: row.worktreeAvailable && row.worktreeStatus === "available",
+    canResume: row.bucket !== "archived" && row.recoveryStatus !== "invalid" && !["base_diverged", "base_missing"].includes(String(row.payload.baseState)), canViewDiff: row.worktreeAvailable && row.worktreeStatus === "available",
     canRefreshPr: Boolean(row.prNumber && prUrl),
     cleanup: { allowed: !cleanupBlocked, requiresConfirmation: hasPr, warning, blockedReason: cleanupBlocked },
     source: sourceFinding && row.sourceTaskId ? { findingId: sourceFinding.findingId, sourceTaskId: row.sourceTaskId, severity: sourceFinding.severity, title: sourceFinding.title } : undefined,

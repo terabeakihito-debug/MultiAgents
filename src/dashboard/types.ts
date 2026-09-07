@@ -36,6 +36,8 @@ export type DashboardTask = {
   bucket: TaskBucket;
   branch: string;
   baseBranch: string;
+  baseState?: "base_current" | "base_advanced" | "base_diverged" | "base_missing";
+  baseAheadCount?: number;
   prNumber?: number;
   prUrl?: string;
   prState?: string;
@@ -45,6 +47,11 @@ export type DashboardTask = {
   recoveryStatus: string;
   recoveryMessage?: string;
   worktreeStatus: string;
+  worktreeAgeHours?: number;
+  worktreeSizeBytes?: number;
+  worktreeDirty?: boolean;
+  worktreeInventoryStatus?: string;
+  cleanupCandidate?: boolean;
   profileName: string;
   profileVersion: number;
   templateName: string;

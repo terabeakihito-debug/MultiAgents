@@ -1,5 +1,4 @@
 import { spawn, type SpawnOptions } from "node:child_process";
-import { StringDecoder } from "node:string_decoder";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { AgentAdapter, AgentDefinition, AgentResult } from "./types";
@@ -192,8 +191,7 @@ function assertFixedLauncher(definition: AgentDefinition) {
 }
 
 class BoundedUtf8Output {
-  private readonly decoder = new StringDecoder("utf8");
-  private text = "";
+  private readonly chunks: Buffer[] = [];
   private bytes = 0;
   private truncated = false;
 
@@ -204,18 +202,34 @@ class BoundedUtf8Output {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     const remaining = this.maxBytes - this.bytes;
     if (buffer.length > remaining) {
-      this.text += this.decoder.write(buffer.subarray(0, remaining));
+      this.chunks.push(buffer.subarray(0, remaining));
       this.bytes = this.maxBytes;
       this.truncated = true;
       return;
     }
-    this.text += this.decoder.write(buffer);
+    this.chunks.push(buffer);
     this.bytes += buffer.length;
   }
 
   value() {
-    return `${this.text}${this.truncated ? `\n[output truncated at ${this.maxBytes} bytes]` : this.decoder.end()}`;
+    const buffer = Buffer.concat(this.chunks, this.bytes);
+    const incomplete = incompleteUtf8SuffixBytes(buffer);
+    if (incomplete) this.truncated = true;
+    const text = buffer.subarray(0, buffer.length - incomplete).toString("utf8");
+    return `${text}${this.truncated ? `\n[output truncated at ${this.maxBytes} bytes]` : ""}`;
   }
+}
+
+function incompleteUtf8SuffixBytes(buffer: Buffer) {
+  if (!buffer.length) return 0;
+  let continuation = 0;
+  for (let index = buffer.length - 1; index >= 0 && continuation < 3 && (buffer[index] & 0xc0) === 0x80; index -= 1) continuation += 1;
+  const leadIndex = buffer.length - continuation - 1;
+  if (leadIndex < 0) return Math.min(buffer.length, continuation);
+  const lead = buffer[leadIndex];
+  const expected = (lead & 0xe0) === 0xc0 ? 2 : (lead & 0xf0) === 0xe0 ? 3 : (lead & 0xf8) === 0xf0 ? 4 : 1;
+  const present = continuation + 1;
+  return expected > present ? present : 0;
 }
 
 function errorResult(agent: AgentDefinition["id"], error: unknown): AgentResult {

@@ -10,6 +10,8 @@ import { validateRepository } from "./repositories";
 import { validationScript, validationTimeoutMs, type ValidationStep } from "../profiles/policy";
 import { acquireTaskLock, clearTaskLocksForTests, isTaskLocked, releaseTaskLock } from "./task-lock";
 import { assertOsSandboxAvailable, buildSandboxCommand, OsSandboxUnavailableError } from "./os-sandbox";
+import { getStateStore } from "./state-store";
+import type { DurableOperation } from "../operations/types";
 import {
   MAX_UNTRACKED_FILE_BYTES,
   MAX_UNTRACKED_TOTAL_BYTES,
@@ -257,47 +259,82 @@ export async function approveAndCreatePullRequest(taskId: string, input: Approva
       if (beforeStage.hash !== input.diffHash) throw invalidate(task, "Approval invalidated because the worktree changed. Review the latest diff again.");
 
       transitionTask(task, "committing");
+      let commitOperation: DurableOperation | undefined;
       try {
         await deps.stage(task);
         const beforeCommit = await createDiffSnapshot(task);
         if (beforeCommit.hash !== input.diffHash) throw invalidate(task, "Approval invalidated because the worktree changed. Review the latest diff again.");
         const stagedTree = await verifyStagedApproval(task, beforeCommit);
+        const expectedParent = await runGit(task.worktreePath, ["rev-parse", "HEAD"]);
+        commitOperation = getStateStore().createOperation({
+          type: "git_commit", taskId: task.id, idempotencyKey: `git_commit:${task.id}:${input.approvalId}`,
+          safeMetadata: { expectedParent, expectedTree: stagedTree, approvalId: input.approvalId },
+        });
+        getStateStore().updateOperation(commitOperation.operationId, "executing");
         await deps.commit(task, commitMessage(task.prompt));
         task.commitSha = await runGit(task.worktreePath, ["rev-parse", "HEAD"]);
         await verifyCommittedApproval(task, beforeCommit, stagedTree, task.commitSha);
+        getStateStore().updateOperation(commitOperation.operationId, "external_succeeded", { commitSha: task.commitSha });
         task.approvalState = "used";
-        persistTask(task);
-        recordTaskEvent(task, "commit_created", "system", { status: "created", metadata: { commitSha: task.commitSha } });
+        getStateStore().transaction(() => {
+          persistTask(task);
+          recordTaskEvent(task, "commit_created", "system", { status: "created", metadata: { commitSha: task.commitSha } });
+          getStateStore().updateOperation(commitOperation!.operationId, "persisted");
+        });
       } catch (error) {
         if (error instanceof ApprovalError) throw error;
+        const outcomeUnknown = commitOperation ? await commitOutcomeUnknown(task.worktreePath, commitOperation) : false;
+        if (commitOperation) getStateStore().updateOperation(commitOperation.operationId, outcomeUnknown ? "reconcile_required" : "failed", undefined, outcomeUnknown ? "commit_outcome_unknown" : "commit_failed");
         task.approvalState = "invalidated";
         transitionTask(task, "commit_failed");
-        task.error = "Git commit failed. Nothing was pushed.";
+        task.error = outcomeUnknown ? "Git commit outcome requires reconciliation. Nothing was pushed." : "Git commit failed. Nothing was pushed.";
         throw new ApprovalError(task.error);
       }
 
       transitionTask(task, "pushing");
+      const pushOperation = getStateStore().createOperation({
+        type: "git_push", taskId: task.id, idempotencyKey: `git_push:${task.id}:${task.commitSha}`,
+        safeMetadata: { branch: task.branch, expectedSha: task.commitSha! },
+      });
       try {
+        getStateStore().updateOperation(pushOperation.operationId, "executing");
         await deps.push(task);
-        recordTaskEvent(task, "branch_pushed", "system", { status: "pushed", metadata: task.commitSha ? { commitSha: task.commitSha } : undefined });
+        getStateStore().updateOperation(pushOperation.operationId, "external_succeeded");
+        getStateStore().transaction(() => {
+          task.latestPushedSha = task.commitSha;
+          persistTask(task);
+          recordTaskEvent(task, "branch_pushed", "system", { status: "pushed", metadata: task.commitSha ? { commitSha: task.commitSha } : undefined });
+          getStateStore().updateOperation(pushOperation.operationId, "persisted");
+        });
       } catch {
+        getStateStore().updateOperation(pushOperation.operationId, "reconcile_required", undefined, "push_outcome_unknown");
         transitionTask(task, "push_failed");
         task.error = "Git push failed. The commit exists only in the retained task worktree.";
         throw new ApprovalError(task.error);
       }
 
       transitionTask(task, "creating_pr");
+      const prOperation = getStateStore().createOperation({
+        type: "pr_create", taskId: task.id, idempotencyKey: `pr_create:${task.id}:${task.commitSha}`,
+        safeMetadata: { branch: task.branch, baseBranch: task.baseBranch, expectedSha: task.commitSha! },
+      });
       try {
+        getStateStore().updateOperation(prOperation.operationId, "executing");
         const title = prTitle(task.prompt);
         const created = await deps.createPr(task, remote, title, prBody(task));
         validatePrUrl(created.url, remote, created.number);
+        getStateStore().updateOperation(prOperation.operationId, "external_succeeded", { prNumber: created.number });
         task.prUrl = created.url;
         task.prNumber = created.number;
-        transitionTask(task, "pr_created");
-        recordTaskEvent(task, "pr_created", "system", { status: "created", metadata: { prNumber: created.number, ...(task.commitSha ? { commitSha: task.commitSha } : {}) } });
+        getStateStore().transaction(() => {
+          transitionTask(task, "pr_created");
+          recordTaskEvent(task, "pr_created", "system", { status: "created", metadata: { prNumber: created.number, ...(task.commitSha ? { commitSha: task.commitSha } : {}) } });
+          getStateStore().updateOperation(prOperation.operationId, "persisted");
+        });
         task.error = undefined;
         return publicTask(task);
       } catch {
+        getStateStore().updateOperation(prOperation.operationId, "reconcile_required", undefined, "pr_outcome_unknown");
         transitionTask(task, "pr_failed");
         task.error = "Pull request creation failed. The task branch and commit were pushed; no merge was attempted.";
         throw new ApprovalError(task.error);
@@ -322,6 +359,13 @@ export async function approveAndCreatePullRequest(taskId: string, input: Approva
   }
 }
 
+async function commitOutcomeUnknown(worktreePath: string, operation: DurableOperation) {
+  const expectedParent = operation.safeMetadata.expectedParent;
+  if (typeof expectedParent !== "string") return true;
+  try { return await runGit(worktreePath, ["rev-parse", "HEAD"]) !== expectedParent; }
+  catch { return true; }
+}
+
 export async function retryPullRequest(taskId: string, dependencies: Partial<ApprovalDependencies> = {}) {
   if (!acquireTaskLock(taskId)) throw new ApprovalError("This task is already being processed", 409);
   const deps = { ...defaultDependencies, ...dependencies };
@@ -339,17 +383,29 @@ export async function retryPullRequest(taskId: string, dependencies: Partial<App
     const remote = validateGitHubRemote(await runGit(task.worktreePath, ["remote", "get-url", "origin"]));
     await deps.checkGhAuth(task);
     transitionTask(task, "creating_pr");
+    const prOperation = getStateStore().createOperation({
+      type: "pr_create", taskId: task.id, idempotencyKey: `pr_create:${task.id}:${task.commitSha}`,
+      safeMetadata: { branch: task.branch, baseBranch: task.baseBranch, expectedSha: task.commitSha },
+    });
     try {
+      if (prOperation.state === "persisted" && task.prNumber) return publicTask(task);
+      if (!["prepared", "failed"].includes(prOperation.state)) throw new ApprovalError("PR creation outcome requires reconciliation before retry");
+      getStateStore().updateOperation(prOperation.operationId, "executing");
       const title = prTitle(task.prompt);
       const created = await deps.createPr(task, remote, title, prBody(task));
       validatePrUrl(created.url, remote, created.number);
+      getStateStore().updateOperation(prOperation.operationId, "external_succeeded", { prNumber: created.number });
       task.prUrl = created.url;
       task.prNumber = created.number;
-      transitionTask(task, "pr_created");
-      recordTaskEvent(task, "pr_created", "system", { status: "created", metadata: { prNumber: created.number, commitSha: task.commitSha } });
+      getStateStore().transaction(() => {
+        transitionTask(task, "pr_created");
+        recordTaskEvent(task, "pr_created", "system", { status: "created", metadata: { prNumber: created.number, commitSha: task.commitSha } });
+        getStateStore().updateOperation(prOperation.operationId, "persisted");
+      });
       task.error = undefined;
       return publicTask(task);
     } catch {
+      getStateStore().updateOperation(prOperation.operationId, "reconcile_required", undefined, "pr_outcome_unknown");
       transitionTask(task, "pr_failed");
       task.error = "Pull request creation failed again. No automatic retry or merge was attempted.";
       throw new ApprovalError(task.error);

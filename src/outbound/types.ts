@@ -1,7 +1,7 @@
 import type { NotificationSeverity, NotificationType } from "../notifications/types";
 
 export type OutboundChannel = "slack";
-export type DeliveryStatus = "pending" | "delivered" | "failed" | "suppressed";
+export type DeliveryStatus = "pending" | "delivered" | "failed" | "suppressed" | "ambiguous";
 
 export type OutboundNotification = {
   notificationId: string;
@@ -25,6 +25,9 @@ export type NotificationDelivery = {
   attemptedAt?: string;
   deliveredAt?: string;
   errorCode?: string;
+  attemptId?: string;
+  startedAt?: string;
+  leaseExpiresAt?: string;
 };
 
 export type OutboundChannelConfig = {

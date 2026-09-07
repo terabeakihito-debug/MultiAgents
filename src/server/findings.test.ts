@@ -9,6 +9,7 @@ import { updateRepoProfile } from "./project-profiles";
 import { getDashboard } from "./dashboard";
 import { runGit } from "./git";
 import { StateStore, replaceStateStoreForTests } from "./state-store";
+import { reconcileUnfinishedOperations } from "./operation-reconciliation";
 import { clearTasksForTests, createTask, getTaskHistory, persistTask, reloadTasksFromStoreForTests } from "./tasks";
 import {
   MAX_FINDINGS,
@@ -180,6 +181,21 @@ describe("Phase 12 lifecycle and conversion", () => {
     expect(store.loadTasks().find((task) => task.id === result.task.id)).toMatchObject({ sourceFindingId: finding.findingId, sourceTaskId: source.id });
     const dashboard = await getDashboard({ pr: "any", sort: "updated_desc", includeArchived: true, limit: 100 });
     expect(dashboard.tasks.find((task) => task.id === result.task.id)?.source).toEqual({ findingId: finding.findingId, sourceTaskId: source.id, severity: "low", title: finding.title });
+  });
+
+  it("adopts a linked task after a finding-conversion crash window", async () => {
+    const { finding } = await extractedFinding();
+    acceptFinding(finding.findingId);
+    const result = await convertFinding(finding.findingId, { templateId: "bug_fix", objective: "Recover conversion", allowedRoot, worktreeRoot });
+    const operation = store.loadOperationByKey(`finding_conversion:${finding.findingId}`)!;
+    const raw = new DatabaseSync(store.path);
+    raw.prepare("UPDATE findings SET status = 'accepted', converted_task_id = NULL WHERE finding_id = ?").run(finding.findingId);
+    raw.close();
+    store.updateOperation(operation.operationId, "executing");
+
+    await reconcileUnfinishedOperations();
+    expect(store.loadFinding(finding.findingId)).toMatchObject({ status: "converted", convertedTaskId: result.task.id });
+    expect(store.loadOperation(operation.operationId)?.state).toBe("persisted");
   });
 
   it("wraps finding content as untrusted context", () => {

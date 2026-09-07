@@ -16,6 +16,8 @@ import { redactKnownSecrets, redactKnownSecretsInValue } from "./credential-reso
 import type { RuntimePolicy, RuntimeViolation, RuntimeViolationRecord } from "../runtime/types";
 import { runtimeViolationMessage } from "./runtime-policy";
 import type { OsSandboxAudit } from "./os-sandbox";
+import { acquireTaskLock, releaseTaskLock } from "./task-lock";
+import { beginRegisteredOperation } from "./operation-registry";
 
 export const WORKTREE_ROOT = join(homedir(), "code", ".multiagents-worktrees");
 export const TASK_BRANCH_PATTERN = /^multiagents\/[0-9a-f-]{36}$/;
@@ -55,6 +57,7 @@ export type ApprovalState = "unavailable" | "pending" | "processing" | "invalida
 export type ApprovalPurpose = "create_pr" | "rework";
 export type RecoveryStatus = "recoverable" | "needs_attention" | "orphaned" | "invalid";
 export type WorktreeStatus = "available" | "not_required" | "missing" | "removed" | "invalid";
+export type BaseState = "base_current" | "base_advanced" | "base_diverged" | "base_missing";
 export type ValidationCheck = { name: string; status: "pass" | "fail" | "skip"; detail?: string };
 export type SecretFinding = { path: string; kind: "filename" | "content" | "limit"; rule: string };
 
@@ -67,6 +70,8 @@ export type RepoTask = {
   branch: string;
   baseBranch: string;
   baseSha: string;
+  baseState?: BaseState;
+  baseAheadCount?: number;
   originUrl?: string;
   worktreePath: string;
   worktreeRoot: string;
@@ -171,6 +176,10 @@ export async function createTask(repoId: string, options: { allowedRoot?: string
   if ((options.sourceFindingId !== undefined && !/^[0-9a-f-]{36}$/i.test(options.sourceFindingId)) || (options.sourceTaskId !== undefined && !/^[0-9a-f-]{36}$/i.test(options.sourceTaskId))) throw new Error("Task source linkage is invalid");
   if (Boolean(options.sourceFindingId) !== Boolean(options.sourceTaskId)) throw new Error("Task source linkage must include both finding and task IDs");
   if (repo.dirty && template.requireWorktree) throw new Error("Repository has uncommitted changes. Commit or stash them before creating a worktree.");
+  if (template.requireWorktree) {
+    const { assertWorktreeDiskCapacity } = await import("./operational-health");
+    await assertWorktreeDiskCapacity({ root: options.worktreeRoot ?? WORKTREE_ROOT });
+  }
   const id = randomUUID();
   const branch = `multiagents/${id}`;
   const worktreeRoot = options.worktreeRoot ?? WORKTREE_ROOT;
@@ -179,10 +188,6 @@ export async function createTask(repoId: string, options: { allowedRoot?: string
   const baseSha = await runGit(repo.path, ["rev-parse", "HEAD"]);
   let originUrl: string | undefined;
   try { originUrl = await runGit(repo.path, ["remote", "get-url", "origin"]); } catch { /* approval reports a missing origin */ }
-  if (template.requireWorktree) {
-    await mkdir(parent, { recursive: true });
-    await runGit(repo.path, ["worktree", "add", "-b", branch, worktreePath, "HEAD"]);
-  }
   const task: RepoTask = {
     id,
     repoId: repo.id,
@@ -192,10 +197,12 @@ export async function createTask(repoId: string, options: { allowedRoot?: string
     branch: template.requireWorktree ? branch : repo.branch,
     baseBranch: repo.branch,
     baseSha,
+    baseState: "base_current",
+    baseAheadCount: 0,
     originUrl,
     worktreePath: template.requireWorktree ? worktreePath : repo.path,
     worktreeRoot,
-    worktreeAvailable: template.requireWorktree,
+    worktreeAvailable: false,
     status: "draft",
     prompt: options.prompt?.trim() ?? "",
     reviewReady: false,
@@ -206,7 +213,7 @@ export async function createTask(repoId: string, options: { allowedRoot?: string
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     recoveryStatus: "recoverable",
-    worktreeStatus: template.requireWorktree ? "available" : "not_required",
+    worktreeStatus: template.requireWorktree ? "missing" : "not_required",
     profile,
     profileSnapshotValid: true,
     template,
@@ -216,7 +223,12 @@ export async function createTask(repoId: string, options: { allowedRoot?: string
   };
   tasks.set(id, task);
   const store = getStateStore();
+  let worktreeOperation: ReturnType<typeof store.createOperation> | undefined;
   store.transaction(() => {
+    if (template.requireWorktree) worktreeOperation = store.createOperation({
+      type: "worktree_create", taskId: id, idempotencyKey: `worktree_create:${id}`,
+      safeMetadata: { repoId: repo.id, branch, baseSha },
+    });
     persistTask(task);
     store.appendTaskEvent(task.id, { type: "task_created", actor: "user", createdAt: task.createdAt, status: task.status });
     store.appendTaskEvent(task.id, { type: "profile_snapshot_created", actor: "user", createdAt: task.createdAt, status: "created", metadata: { profileId: profile.profileId, profileVersion: profile.version } });
@@ -224,6 +236,28 @@ export async function createTask(repoId: string, options: { allowedRoot?: string
     store.appendProfileAudit("profile_snapshot_created", task.repoId, profile.profileId, profile.version, task.id);
     store.appendTemplateAudit("template_snapshot_created", task.repoId, template.templateId, template.version, task.id);
   });
+  if (worktreeOperation) {
+    const operation = worktreeOperation;
+    const endOperation = beginRegisteredOperation(operation.operationId, "worktree_create", task.id);
+    try {
+      store.updateOperation(operation.operationId, "executing");
+      await mkdir(parent, { recursive: true });
+      await runGit(repo.path, ["worktree", "add", "-b", branch, worktreePath, "HEAD"]);
+      store.updateOperation(operation.operationId, "external_succeeded");
+      store.transaction(() => {
+        task.worktreeAvailable = true;
+        task.worktreeStatus = "available";
+        persistTask(task);
+        store.updateOperation(operation.operationId, "persisted");
+      });
+    } catch (error) {
+      store.updateOperation(operation.operationId, "reconcile_required", undefined, "worktree_outcome_unknown");
+      task.recoveryStatus = "needs_attention";
+      task.recoveryMessage = "Managed worktree creation failed. The operation journal was retained for recovery.";
+      persistTask(task);
+      throw error;
+    } finally { endOperation(); }
+  }
   return task;
 }
 
@@ -565,6 +599,8 @@ export async function getTaskDiff(task: RepoTask): Promise<TaskDiff> {
 }
 
 export async function deleteTask(id: string, input: { confirmedPrCleanup?: boolean } = {}) {
+  if (!acquireTaskLock(id)) throw new Error("Task cleanup is blocked while another operation is running");
+  try {
   const task = getTask(id);
   if (!task) throw new Error("Task not found");
   const profile = requireTaskProfile(task);
@@ -590,11 +626,16 @@ export async function deleteTask(id: string, input: { confirmedPrCleanup?: boole
     store.appendTaskEvent(task.id, { type: "worktree_removed", actor: "system", status: "removed", metadata: task.prNumber ? { prNumber: task.prNumber } : undefined });
     store.appendTaskEvent(task.id, { type: "task_archived", actor: "user", status: "archived" });
   });
+  } finally { releaseTaskLock(id); }
 }
 
 export async function initializeTaskRecovery(options: { allowedRoot?: string; worktreeRoot?: string } = {}) {
   loadPersistedTasks();
-  if (!recoveryPromise) recoveryPromise = recoverAllTasks(options.allowedRoot ?? ALLOWED_ROOT, options.worktreeRoot ?? WORKTREE_ROOT);
+  if (!recoveryPromise) recoveryPromise = (async () => {
+    const { reconcileUnfinishedOperations } = await import("./operation-reconciliation");
+    await reconcileUnfinishedOperations();
+    await recoverAllTasks(options.allowedRoot ?? ALLOWED_ROOT, options.worktreeRoot ?? WORKTREE_ROOT);
+  })();
   await recoveryPromise;
 }
 
@@ -634,11 +675,16 @@ async function recoverTask(task: RepoTask, allowedRoot: string, worktreeRoot: st
       if (savedRoot !== expectedRoot) throw new Error("Saved allowed root does not match the server allowed root");
       const repo = await validateRepository(task.repoId, allowedRoot);
       if (await realpath(task.repoPath) !== repo.path || await realpath(task.worktreePath) !== repo.path) throw new Error("Saved read-only task repository path does not match the allowed repository");
-      if (repo.branch !== task.baseBranch || await runGit(repo.path, ["rev-parse", "HEAD"]) !== task.baseSha) throw new Error("Base repository branch or HEAD changed after task creation");
+      if (repo.branch !== task.baseBranch) throw new Error("Base repository branch changed after task creation");
+      const base = await classifyTaskBase(task, repo.path);
+      if (base.state === "base_missing") throw new Error("Original task base commit is missing");
+      if (base.state === "base_diverged") throw new Error("Base branch diverged from the original task base");
       task.worktreeAvailable = false;
       task.worktreeStatus = "not_required";
       task.recoveryStatus = task.runtimeViolation ? "needs_attention" : "recoverable";
-      task.recoveryMessage = task.runtimeViolation?.message ?? "Read-only template snapshot restored; no managed worktree, commit, push, or PR is permitted.";
+      task.recoveryMessage = task.runtimeViolation?.message ?? (base.state === "base_advanced"
+        ? `Base advanced by ${base.aheadCount} commit${base.aheadCount === 1 ? "" : "s"}; read-only task remains recoverable.`
+        : "Read-only template snapshot restored; no managed worktree, commit, push, or PR is permitted.");
       persistTask(task);
     } catch (error) {
       task.worktreeAvailable = false;
@@ -665,7 +711,15 @@ async function recoverTask(task: RepoTask, allowedRoot: string, worktreeRoot: st
     if (savedWorktreeRoot !== expectedWorktreeRoot) throw new Error("Saved worktree root does not match the server-managed root");
     const repo = await validateRepository(task.repoId, allowedRoot);
     if (await realpath(task.repoPath) !== repo.path) throw new Error("Saved repository path does not match the allowed repository");
-    if (repo.branch !== task.baseBranch || await runGit(repo.path, ["rev-parse", "HEAD"]) !== task.baseSha) throw new Error("Base repository branch or HEAD changed after task creation");
+    if (repo.branch !== task.baseBranch) throw new Error("Base repository branch changed after task creation");
+    const base = await classifyTaskBase(task, repo.path);
+    if (base.state === "base_missing") throw new Error("Original task base commit is missing");
+    if (base.state === "base_diverged") {
+      task.worktreeAvailable = true;
+      task.worktreeStatus = "available";
+      task.recoveryStatus = "needs_attention";
+      task.recoveryMessage = "Base branch diverged from the original task base. No automatic merge or rebase was attempted.";
+    }
     const currentOrigin = await runGit(repo.path, ["remote", "get-url", "origin"]);
     if (!task.originUrl || currentOrigin !== task.originUrl) throw new Error("Repository origin changed after task creation");
 
@@ -710,11 +764,14 @@ async function recoverTask(task: RepoTask, allowedRoot: string, worktreeRoot: st
     task.worktreeStatus = "available";
     const approvalWasInvalidated = invalidateApprovalForRestart(task)
       || (task.approvalState === "invalidated" && ["approval_invalidated", "commit_failed"].includes(task.status));
-    task.recoveryStatus = task.runtimeViolation || approvalWasInvalidated || Boolean(task.prNumber) || ["ci_pending", "checking_ci", "fetching_review"].includes(task.status)
+    task.recoveryStatus = base.state === "base_diverged" || task.runtimeViolation || approvalWasInvalidated || Boolean(task.prNumber) || ["ci_pending", "checking_ci", "fetching_review"].includes(task.status)
       ? "needs_attention" : "recoverable";
-    task.recoveryMessage = task.runtimeViolation?.message ?? (approvalWasInvalidated
+    task.recoveryMessage = base.state === "base_diverged"
+      ? "Base branch diverged from the original task base. No automatic merge or rebase was attempted."
+      : task.runtimeViolation?.message ?? (approvalWasInvalidated
       ? "Approval was invalidated after restart. Review the current diff and run validation again."
-      : task.prNumber ? "PR and CI state must be refreshed from GitHub." : undefined);
+      : task.prNumber ? "PR and CI state must be refreshed from GitHub."
+        : base.state === "base_advanced" ? `Base advanced by ${base.aheadCount} commit${base.aheadCount === 1 ? "" : "s"}.` : undefined);
     persistTask(task);
   } catch (error) {
     task.worktreeAvailable = false;
@@ -723,6 +780,32 @@ async function recoverTask(task: RepoTask, allowedRoot: string, worktreeRoot: st
     task.recoveryMessage = error instanceof Error ? error.message : "Task recovery validation failed";
     invalidateApprovalForRestart(task);
     persistTask(task);
+  }
+}
+
+export async function classifyTaskBase(task: Pick<RepoTask, "baseSha" | "baseState" | "baseAheadCount">, repoPath: string) {
+  try { await runGit(repoPath, ["cat-file", "-e", `${task.baseSha}^{commit}`]); }
+  catch {
+    task.baseState = "base_missing";
+    task.baseAheadCount = undefined;
+    return { state: task.baseState, aheadCount: 0 } as const;
+  }
+  const current = await runGit(repoPath, ["rev-parse", "HEAD"]);
+  if (current === task.baseSha) {
+    task.baseState = "base_current";
+    task.baseAheadCount = 0;
+    return { state: task.baseState, aheadCount: 0 } as const;
+  }
+  try {
+    await runGit(repoPath, ["merge-base", "--is-ancestor", task.baseSha, current]);
+    const aheadCount = Number(await runGit(repoPath, ["rev-list", "--count", `${task.baseSha}..${current}`]));
+    task.baseState = "base_advanced";
+    task.baseAheadCount = Number.isSafeInteger(aheadCount) && aheadCount >= 1 ? aheadCount : 1;
+    return { state: task.baseState, aheadCount: task.baseAheadCount } as const;
+  } catch {
+    task.baseState = "base_diverged";
+    task.baseAheadCount = undefined;
+    return { state: task.baseState, aheadCount: 0 } as const;
   }
 }
 

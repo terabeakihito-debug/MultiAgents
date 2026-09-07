@@ -22,9 +22,11 @@ import {
 import type { PullRequestCheck, PullRequestReview, PullRequestReviewItem, ReviewDisposition } from "./pr-review-types";
 import { ALLOWED_ROOT, validateRepository } from "./repositories";
 import { acquireTaskLock, isTaskLocked, releaseTaskLock } from "./task-lock";
-import { WORKTREE_ROOT, getTask, getTaskDiff, persistTask, publicTask, recordApprovalEvent, recordDiffVersion, recordTaskEvent, registerRecoveredTask, requireNoRuntimeViolation, requireTaskProfile, requireTaskTemplate, transitionTask, type RepoTask } from "./tasks";
+import { WORKTREE_ROOT, classifyTaskBase, getTask, getTaskDiff, persistTask, publicTask, recordApprovalEvent, recordDiffVersion, recordTaskEvent, registerRecoveredTask, requireNoRuntimeViolation, requireTaskProfile, requireTaskTemplate, transitionTask, type RepoTask } from "./tasks";
 import { prepareTaskRuntime } from "./task-runtime";
 import { readOnlyRuntimePolicy } from "./runtime-policy";
+import { getStateStore } from "./state-store";
+import type { DurableOperation } from "../operations/types";
 
 const MAX_REVIEW_BODY_CHARS = 10_000;
 const MAX_REVIEW_ITEMS = 200;
@@ -232,14 +234,20 @@ export async function approveRework(taskId: string, input: ApprovalInput, depend
       transitionTask(task, "committing_rework");
       let approvedSnapshot: Awaited<ReturnType<typeof createDiffSnapshot>>;
       let stagedTree: string;
+      let commitOperation: DurableOperation | undefined;
       try {
         await deps.stage(task);
         approvedSnapshot = await createDiffSnapshot(task);
         if (approvedSnapshot.hash !== input.diffHash) throw approvalInvalidated(task);
         stagedTree = await verifyStagedApproval(task, approvedSnapshot);
+        const expectedParent = await runGit(task.worktreePath, ["rev-parse", "HEAD"]);
+        commitOperation = getStateStore().createOperation({ type: "git_commit", taskId: task.id, idempotencyKey: `git_commit:${task.id}:${input.approvalId}`, safeMetadata: { expectedParent, expectedTree: stagedTree, approvalId: input.approvalId } });
+        getStateStore().updateOperation(commitOperation.operationId, "executing");
         await deps.commit(task);
       } catch (error) {
         if (error instanceof ApprovalError) throw error;
+        const outcomeUnknown = commitOperation ? await commitOutcomeUnknown(task.worktreePath, commitOperation) : false;
+        if (commitOperation) getStateStore().updateOperation(commitOperation.operationId, outcomeUnknown ? "reconcile_required" : "failed", undefined, outcomeUnknown ? "commit_outcome_unknown" : "commit_failed");
         task.approvalState = "invalidated";
         transitionTask(task, "commit_failed");
         task.error = "Rework commit failed. Nothing was pushed.";
@@ -249,19 +257,29 @@ export async function approveRework(taskId: string, input: ApprovalInput, depend
       if (commitSha === task.reworkBaseSha) throw new Error("Rework commit was not appended");
       task.commitSha = commitSha;
       await verifyCommittedApproval(task, approvedSnapshot, stagedTree, commitSha);
+      getStateStore().updateOperation(commitOperation!.operationId, "external_succeeded", { commitSha });
       task.approvalState = "used";
-      persistTask(task);
-      recordTaskEvent(task, "commit_created", "system", { status: "created", metadata: { commitSha } });
+      getStateStore().transaction(() => {
+        persistTask(task);
+        recordTaskEvent(task, "commit_created", "system", { status: "created", metadata: { commitSha } });
+        getStateStore().updateOperation(commitOperation!.operationId, "persisted");
+      });
 
       transitionTask(task, "pushing_rework");
-      try { await deps.push(task); }
+      const pushOperation = getStateStore().createOperation({ type: "git_push", taskId: task.id, idempotencyKey: `git_push:${task.id}:${commitSha}`, safeMetadata: { branch: task.branch, expectedSha: commitSha } });
+      try { getStateStore().updateOperation(pushOperation.operationId, "executing"); await deps.push(task); getStateStore().updateOperation(pushOperation.operationId, "external_succeeded"); }
       catch {
+        getStateStore().updateOperation(pushOperation.operationId, "reconcile_required", undefined, "push_outcome_unknown");
         transitionTask(task, "push_failed");
         task.error = "Rework push failed. No force-push or automatic retry was attempted.";
         throw new ApprovalError(task.error);
       }
       task.latestPushedSha = commitSha;
-      recordTaskEvent(task, "branch_pushed", "system", { status: "pushed", metadata: { commitSha } });
+      getStateStore().transaction(() => {
+        persistTask(task);
+        recordTaskEvent(task, "branch_pushed", "system", { status: "pushed", metadata: { commitSha } });
+        getStateStore().updateOperation(pushOperation.operationId, "persisted");
+      });
       transitionTask(task, "checking_ci");
       const verified = await deps.verifyPush(task, commitSha);
       await validateExistingPullRequest(task, verified);
@@ -295,6 +313,13 @@ export async function approveRework(taskId: string, input: ApprovalInput, depend
     const task = getTask(taskId); if (task) persistTask(task);
     releaseTaskLock(taskId);
   }
+}
+
+async function commitOutcomeUnknown(worktreePath: string, operation: DurableOperation) {
+  const expectedParent = operation.safeMetadata.expectedParent;
+  if (typeof expectedParent !== "string") return true;
+  try { return await runGit(worktreePath, ["rev-parse", "HEAD"]) !== expectedParent; }
+  catch { return true; }
 }
 
 export async function fetchPullRequestReview(task: RepoTask): Promise<PullRequestReview> {
@@ -516,14 +541,18 @@ async function validatePullRequestIdentity(task: RepoTask, review: PullRequestRe
   if (review.head !== task.branch || !/^multiagents\/[0-9a-f-]{36}$/.test(review.head)) throw new Error("Pull request head branch does not match the task");
   if (!task.worktreeAvailable) {
     if (task.originalTaskAvailable) throw new Error("Review-only recovery state is invalid");
-    if (await runGit(task.repoPath, ["branch", "--show-current"]) !== task.baseBranch || await runGit(task.repoPath, ["rev-parse", "HEAD"]) !== task.baseSha) throw new Error("Source/base branch changed after review-only recovery");
+    if (await runGit(task.repoPath, ["branch", "--show-current"]) !== task.baseBranch) throw new Error("Source/base branch changed after review-only recovery");
+    const base = await classifyTaskBase(task, task.repoPath);
+    if (base.state === "base_missing" || base.state === "base_diverged") throw new Error("Source/base history is incompatible with the recovered task");
     return;
   }
   if (await runGit(task.worktreePath, ["branch", "--show-current"]) !== task.branch) throw new Error("Task worktree branch changed");
   const head = await runGit(task.worktreePath, ["rev-parse", "HEAD"]);
   if (!task.commitSha || head !== task.commitSha || review.headSha !== head) throw new Error("Task worktree, commit, and PR head SHA do not match");
   if (!options.allowDirty && await runGit(task.worktreePath, ["status", "--porcelain"])) throw new Error("Task worktree must be clean before review intake");
-  if (await runGit(task.repoPath, ["branch", "--show-current"]) !== task.baseBranch || await runGit(task.repoPath, ["rev-parse", "HEAD"]) !== task.baseSha) throw new Error("Source/base branch changed after task creation");
+  if (await runGit(task.repoPath, ["branch", "--show-current"]) !== task.baseBranch) throw new Error("Source/base branch changed after task creation");
+  const base = await classifyTaskBase(task, task.repoPath);
+  if (base.state === "base_missing" || base.state === "base_diverged") throw new Error("Source/base history is incompatible with the task");
 }
 
 export function classifyDisposition(input: { reviewState?: string; unresolved?: boolean; resolved?: boolean; requiredCheckBucket?: PullRequestCheck["bucket"] }): ReviewDisposition {

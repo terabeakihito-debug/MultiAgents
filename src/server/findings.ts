@@ -171,20 +171,35 @@ export async function convertFinding(findingId: string, input: { templateId: str
       throw new Error("Current profile and selected template do not permit a safely isolated implementation task");
     }
     store.appendFindingEvent(finding, { type: "finding_conversion_requested", actor: "user" });
-    const task = await createTask(source.repoId, {
-      allowedRoot: input.allowedRoot ?? source.allowedRoot,
-      worktreeRoot: input.worktreeRoot,
-      templateId: input.templateId,
-      prompt: implementationTaskPrompt(finding, input.objective),
-      sourceFindingId: finding.findingId,
-      sourceTaskId: source.id,
+    const operation = store.createOperation({
+      type: "finding_conversion", findingId: finding.findingId,
+      idempotencyKey: `finding_conversion:${finding.findingId}`,
+      safeMetadata: { sourceTaskId: source.id, repoId: source.repoId, templateId: input.templateId },
     });
+    if (!["prepared", "failed"].includes(operation.state)) throw new Error("Finding conversion outcome requires startup reconciliation");
+    store.updateOperation(operation.operationId, "executing");
+    let task: RepoTask;
+    try {
+      task = await createTask(source.repoId, {
+        allowedRoot: input.allowedRoot ?? source.allowedRoot,
+        worktreeRoot: input.worktreeRoot,
+        templateId: input.templateId,
+        prompt: implementationTaskPrompt(finding, input.objective),
+        sourceFindingId: finding.findingId,
+        sourceTaskId: source.id,
+      });
+      store.updateOperation(operation.operationId, "external_succeeded", { implementationTaskId: task.id });
+    } catch (error) {
+      store.updateOperation(operation.operationId, "reconcile_required", undefined, "conversion_outcome_unknown");
+      throw error;
+    }
     if (task.repoId !== source.repoId || !task.worktreeAvailable || task.worktreePath === source.worktreePath) throw new Error("Implementation task isolation failed");
     const converted = store.transaction(() => {
       const updated = store.updateFindingStatus(finding.findingId, ["open", "accepted"], "converted", task.id);
       store.appendFindingEvent(updated, { type: "implementation_task_created", actor: "system", convertedTaskId: task.id });
       store.appendTaskEvent(source.id, { type: "finding_converted", actor: "user", status: "converted", metadata: { findingId: finding.findingId, sourceTaskId: source.id } });
       store.appendTaskEvent(task.id, { type: "implementation_task_created", actor: "system", status: "created", metadata: { findingId: finding.findingId, sourceTaskId: source.id } });
+      store.updateOperation(operation.operationId, "persisted");
       return updated;
     });
     return { finding: converted, task };
