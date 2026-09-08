@@ -22,11 +22,15 @@ export type AgentRunOptions = {
   signal?: AbortSignal;
   policy?: import("../runtime/types").RuntimePolicy;
   onSandboxAudit?: (event: import("../server/os-sandbox").OsSandboxAudit) => void;
+  /** Runs after child close/unregister while the active-agent gate is held. */
+  afterClose?: (result: AgentResult) => Promise<AgentResult> | AgentResult;
 };
 
 export type AgentAdapter = {
   id: AgentId;
   name: string;
+  /** True only when this adapter executes AgentRunOptions.afterClose itself. */
+  supportsPostCloseFinalization?: true;
   run: (prompt: string, options?: AgentRunOptions) => Promise<AgentResult>;
 };
 

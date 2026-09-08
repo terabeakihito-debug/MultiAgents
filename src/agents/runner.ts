@@ -39,6 +39,7 @@ export function createAgentAdapter(
   return {
     id: definition.id,
     name: definition.name,
+    supportsPostCloseFinalization: true,
     run: (prompt, runOptions) => runProcess(definition, prompt, options, runOptions),
   };
 }
@@ -107,84 +108,143 @@ function runProcess(
       };
       let child;
       let registration: ReturnType<typeof registerChildProcess> | undefined;
-      let endAgentExecution: (() => void) | undefined;
       try {
         child = spawnProcess(command.binary, command.args, spawnOptions);
-        registration = registerChildProcess({ child, purpose: "agent" });
-        endAgentExecution = beginAgentExecution();
-        audit?.({ type: "os_sandbox_created", profile, provider: definition.id, capabilityClass: policy.policyClass });
       } catch (error) {
-        registration?.unregister();
         audit?.({ type: "os_sandbox_failed", profile, provider: definition.id, capabilityClass: policy.policyClass, failureCode: "sandbox_launch_failed" });
         resolve(errorResult(definition.id, error));
         return;
       }
 
+      // From here a ChildProcess object exists. Every later failure is a
+      // post-spawn failure and must converge through close finalization.
+      const endAgentExecution = beginAgentExecution();
       const stdout = new BoundedUtf8Output(MAX_OUTPUT_BYTES);
       const stderr = new BoundedUtf8Output(MAX_OUTPUT_BYTES);
       let finished = false;
+      let terminationRequested = false;
+      let pendingResult: AgentResult | undefined;
       let cleanupAudited = false;
       let forceKillTimer: NodeJS.Timeout | undefined;
+      let auditError: unknown;
+      let lifecycleError: unknown;
+      const auditFailure = (error: unknown) => errorResult(definition.id, error);
+      // Auditing is diagnostic side-effect work, never lifecycle control flow.
+      // Precedence at settlement is runtime violation/verification failure,
+      // then lifecycle cleanup failure, then audit failure, then process result.
+      const captureAuditFailure = (event: Parameters<NonNullable<typeof audit>>[0]) => {
+        try { audit?.(event); }
+        catch (error) { auditError ??= error; }
+        return auditError;
+      };
       const cleanupAudit = () => {
         if (cleanupAudited) return;
         cleanupAudited = true;
-        audit?.({ type: "os_sandbox_process_cleanup", profile, provider: definition.id, capabilityClass: policy.policyClass });
+        captureAuditFailure({ type: "os_sandbox_process_cleanup", profile, provider: definition.id, capabilityClass: policy.policyClass });
       };
-      const finish = (result: AgentResult) => {
+      // This is deliberately the only completion path after spawn.  A result
+      // can be selected by abort, timeout, an error, or normal exit, but is
+      // never exposed while the child could still be mutating its worktree.
+      const finishAfterClose = async (result: AgentResult) => {
         if (finished) return;
         finished = true;
         clearTimeout(timer);
         signal?.removeEventListener("abort", abort);
-        endAgentExecution?.();
-        resolve(result);
+        let verifiedResult = result;
+        let verificationError: unknown;
+        try { verifiedResult = await runOptions?.afterClose?.(result) ?? result; }
+        catch (error) { verificationError = error; }
+        let finalResult: AgentResult;
+        if (verifiedResult.runtimeViolation) finalResult = verifiedResult;
+        else if (verificationError) finalResult = errorResult(definition.id, verificationError);
+        else if (lifecycleError) finalResult = errorResult(definition.id, lifecycleError);
+        else if (auditError) finalResult = errorResult(definition.id, auditError);
+        else finalResult = verifiedResult;
+        // The guard spans close, unregister, and runtime verification, and
+        // must release even if any finalization side effect has failed.
+        try { endAgentExecution(); }
+        finally { resolve(finalResult); }
+      };
+
+      const output = () => redactKnownSecrets(stdout.value()).trim();
+      const requestTermination = () => {
+        if (terminationRequested) return;
+        terminationRequested = true;
+        cleanupAudit();
+        if (registration?.id) {
+          // The shared registry owns process-group TERM/KILL escalation.  Do
+          // not await it here: `close` remains the definitive lifecycle gate.
+          void registration.terminate({ graceMs: FORCE_KILL_GRACE_MS }).catch((error) => { lifecycleError ??= error; });
+        } else {
+          const signalDirectGroup = (signal: NodeJS.Signals) => {
+            try {
+              if (child.pid && process.platform !== "win32") process.kill(-child.pid, signal);
+              else child.kill(signal);
+            } catch { try { child.kill(signal); } catch { /* close remains authoritative */ } }
+          };
+          signalDirectGroup("SIGTERM");
+          forceKillTimer = setTimeout(() => signalDirectGroup("SIGKILL"), FORCE_KILL_GRACE_MS);
+          forceKillTimer.unref();
+        }
+      };
+      const chooseTerminalResult = (result: AgentResult, terminate = false) => {
+        if (finished || pendingResult) return;
+        pendingResult = result;
+        if (terminate) requestTermination();
       };
 
       child.stdout?.on("data", (chunk) => stdout.append(chunk));
       child.stderr?.on("data", (chunk) => stderr.append(chunk));
       child.on("error", (error) => {
-        audit?.({ type: "os_sandbox_failed", profile, provider: definition.id, capabilityClass: policy.policyClass, failureCode: "sandbox_launch_failed" });
-        cleanupAudit();
-        finish(errorResult(definition.id, error));
+        captureAuditFailure({ type: "os_sandbox_failed", profile, provider: definition.id, capabilityClass: policy.policyClass, failureCode: "sandbox_launch_failed" });
+        // A spawn failure with no PID has no OS child to wait for.
+        if (!child.pid) {
+          cleanupAudit();
+          finishAfterClose(errorResult(definition.id, error));
+          return;
+        }
+        chooseTerminalResult(errorResult(definition.id, error), true);
       });
       child.on("close", (code, closeSignal) => {
-        registration?.unregister();
+        try { registration?.unregister(); }
+        catch (error) { lifecycleError ??= error; }
         if (forceKillTimer) clearTimeout(forceKillTimer);
         cleanupAudit();
+        if (pendingResult) {
+          void finishAfterClose(pendingResult);
+          return;
+        }
         if (code === 0) {
-          finish({ agent: definition.id, status: "completed", output: redactKnownSecrets(stdout.value()).trim() });
+          void finishAfterClose({ agent: definition.id, status: "completed", output: output() });
           return;
         }
         const diagnostic = stderr.value().trim();
         if (diagnostic.startsWith("bwrap:")) {
-          audit?.({ type: "os_sandbox_violation", profile, provider: definition.id, capabilityClass: policy.policyClass, failureCode: "sandbox_launch_failed" });
-          finish(errorResult(definition.id, new OsSandboxUnavailableError("sandbox_launch_failed")));
+          captureAuditFailure({ type: "os_sandbox_violation", profile, provider: definition.id, capabilityClass: policy.policyClass, failureCode: "sandbox_launch_failed" });
+          void finishAfterClose(errorResult(definition.id, new OsSandboxUnavailableError("sandbox_launch_failed")));
           return;
         }
         const exit = `Process exited with code ${code ?? "unknown"}${closeSignal ? ` (${closeSignal})` : ""}`;
-        finish({ agent: definition.id, status: "error", output: redactKnownSecrets(stdout.value()).trim(), error: diagnostic ? `${exit}: ${redactKnownSecrets(diagnostic)}` : exit });
+        void finishAfterClose({ agent: definition.id, status: "error", output: output(), error: diagnostic ? `${exit}: ${redactKnownSecrets(diagnostic)}` : exit });
       });
-
-      const terminate = () => {
-        cleanupAudit();
-        if (child.pid && process.platform !== "win32") {
-          try { process.kill(-child.pid, "SIGTERM"); } catch { child.kill("SIGTERM"); }
-          forceKillTimer = setTimeout(() => {
-            try { process.kill(-child.pid!, "SIGKILL"); } catch { child.kill("SIGKILL"); }
-          }, FORCE_KILL_GRACE_MS);
-          forceKillTimer.unref();
-        } else child.kill("SIGTERM");
-      };
       const abort = () => {
-        terminate();
-        finish({ agent: definition.id, status: "error", output: redactKnownSecrets(stdout.value()).trim(), error: "Request was aborted" });
+        chooseTerminalResult({ agent: definition.id, status: "error", output: output(), error: "Request was aborted" }, true);
       };
       signal?.addEventListener("abort", abort, { once: true });
       const timer = setTimeout(() => {
-        terminate();
-        finish({ agent: definition.id, status: "error", output: redactKnownSecrets(stdout.value()).trim(), error: `Process timed out after ${options.timeoutMs ?? DEFAULT_TIMEOUT_MS} ms` });
+        chooseTerminalResult({ agent: definition.id, status: "error", output: output(), error: `Process timed out after ${options.timeoutMs ?? DEFAULT_TIMEOUT_MS} ms` }, true);
       }, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
       timer.unref();
-      if (signal?.aborted) abort();
+      try {
+        registration = registerChildProcess({ child, purpose: "agent" });
+        const createdAuditFailure = captureAuditFailure({ type: "os_sandbox_created", profile, provider: definition.id, capabilityClass: policy.policyClass });
+        if (createdAuditFailure) chooseTerminalResult(auditFailure(createdAuditFailure), true);
+        if (signal?.aborted) abort();
+      } catch (error) {
+        // Listener setup is complete, so this post-spawn failure follows the
+        // exact same TERM/KILL -> close -> verification finalization path.
+        chooseTerminalResult(auditFailure(error), true);
+      }
     }
   });
 }

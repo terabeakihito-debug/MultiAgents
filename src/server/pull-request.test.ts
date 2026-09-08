@@ -33,6 +33,8 @@ import {
   transitionTask,
   type RepoTask,
 } from "./tasks";
+import { getStateStore } from "./state-store";
+import { acquireTaskLock, releaseTaskLock } from "./task-lock";
 
 const roots: string[] = [];
 
@@ -343,6 +345,22 @@ describe("Phase 5 approval and PR state machine", () => {
     await expect(approveAndCreatePullRequest(task.id, input, successfulDependencies())).rejects.toThrow("already being processed");
     release();
     await expect(first).resolves.toMatchObject({ status: "pr_created" });
+  });
+
+  it("releases its owned task lock when final task persistence fails", async () => {
+    const { task, input } = await readyTask({ path: "package.json", content: JSON.stringify({ scripts: { test: "true" } }) });
+    const commit = vi.fn(async () => undefined);
+    const saveTask = vi.spyOn(getStateStore(), "saveTask").mockImplementation(() => { throw new Error("injected SQLITE_FULL"); });
+    try {
+      await expect(approveAndCreatePullRequest(task.id, input, successfulDependencies({ commit }))).rejects.toThrow("injected SQLITE_FULL");
+      expect(isTaskLockedForTests(task.id)).toBe(false);
+      expect(commit).not.toHaveBeenCalled();
+      const nextLease = acquireTaskLock(task.id);
+      expect(nextLease).toBeTruthy();
+      if (nextLease) releaseTaskLock(task.id, nextLease);
+    } finally {
+      saveTask.mockRestore();
+    }
   });
 
   it("stops before commit when project validation fails", async () => {

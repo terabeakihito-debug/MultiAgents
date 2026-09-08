@@ -536,7 +536,7 @@ export async function getTaskDiff(task: RepoTask): Promise<TaskDiff> {
 }
 
 export async function deleteTask(id: string, input: { confirmedPrCleanup?: boolean } = {}) {
-  if (!acquireTaskLock(id)) throw new Error("Task cleanup is blocked while another operation is running");
+  const taskLock = acquireTaskLock(id); if (!taskLock) throw new Error("Task cleanup is blocked while another operation is running");
   try {
   const task = getTask(id);
   if (!task) throw new Error("Task not found");
@@ -563,7 +563,11 @@ export async function deleteTask(id: string, input: { confirmedPrCleanup?: boole
     store.appendTaskEvent(task.id, { type: "worktree_removed", actor: "system", status: "removed", metadata: task.prNumber ? { prNumber: task.prNumber } : undefined });
     store.appendTaskEvent(task.id, { type: "task_archived", actor: "user", status: "archived" });
   });
-  } finally { releaseTaskLock(id); }
+  } finally {
+    // The transaction above may throw while persisting; ownership cleanup is
+    // intentionally independent of that outcome.
+    releaseTaskLock(id, taskLock);
+  }
 }
 
 export async function initializeTaskRecovery(options: { allowedRoot?: string; worktreeRoot?: string } = {}) {

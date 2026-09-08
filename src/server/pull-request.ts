@@ -203,7 +203,7 @@ export function validateSnapshotForHumanApproval(task: RepoTask, snapshot: DiffS
 }
 
 export async function approveAndCreatePullRequest(taskId: string, input: ApprovalInput, dependencies: Partial<ApprovalDependencies> = {}): Promise<PullRequestResult> {
-  if (!acquireTaskLock(taskId)) throw new ApprovalError("This task is already being processed", 409);
+  const taskLock = acquireTaskLock(taskId); if (!taskLock) throw new ApprovalError("This task is already being processed", 409);
   const deps = { ...defaultDependencies, ...dependencies };
   try {
     const task = getTask(taskId);
@@ -379,8 +379,11 @@ export async function approveAndCreatePullRequest(taskId: string, input: Approva
       throw error instanceof ApprovalError ? failure : new ApprovalError(task.error ?? failure.message);
     }
   } finally {
-    const task = getTask(taskId); if (task) persistTask(task);
-    releaseTaskLock(taskId);
+    try {
+      const task = getTask(taskId); if (task) persistTask(task);
+    } finally {
+      releaseTaskLock(taskId, taskLock);
+    }
   }
 }
 
@@ -392,7 +395,7 @@ async function commitOutcomeUnknown(worktreePath: string, operation: DurableOper
 }
 
 export async function retryPullRequest(taskId: string, dependencies: Partial<ApprovalDependencies> = {}) {
-  if (!acquireTaskLock(taskId)) throw new ApprovalError("This task is already being processed", 409);
+  const taskLock = acquireTaskLock(taskId); if (!taskLock) throw new ApprovalError("This task is already being processed", 409);
   const deps = { ...defaultDependencies, ...dependencies };
   try {
     const task = getTask(taskId);
@@ -436,8 +439,11 @@ export async function retryPullRequest(taskId: string, dependencies: Partial<App
       throw new ApprovalError(task.error);
     }
   } finally {
-    const task = getTask(taskId); if (task) persistTask(task);
-    releaseTaskLock(taskId);
+    try {
+      const task = getTask(taskId); if (task) persistTask(task);
+    } finally {
+      releaseTaskLock(taskId, taskLock);
+    }
   }
 }
 

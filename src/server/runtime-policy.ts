@@ -139,22 +139,40 @@ export async function runTaskAgentWithPolicy(input: {
     return violationResult(policy.agent, "worktree_escape");
   }
   input.onAudit("runtime_execution_started", policy);
-  let result: AgentResult;
-  try { result = await adapter.run(input.prompt, { signal: input.signal, policy, onSandboxAudit: input.onSandboxAudit }); }
-  catch (error) {
-    result = { agent: policy.agent, status: "error", output: "", error: error instanceof Error ? error.message : "Agent execution failed" };
+  const verifyAfterClose = async (result: AgentResult) => {
+    let verificationAuditError: unknown;
+    const auditSafely = (type: "runtime_execution_completed" | "runtime_violation_detected", violation?: RuntimeViolation) => {
+      try { input.onAudit(type, policy, violation); }
+      catch (error) { verificationAuditError ??= error; }
+    };
+    let violations: RuntimeViolation[];
+    try { violations = compareRuntimeState(policy, before, await captureRuntimeState(task, policy)); }
+    catch { violations = ["worktree_escape"]; }
+    auditSafely("runtime_execution_completed");
+    if (violations.length) {
+      const violation = violations[0];
+      auditSafely("runtime_violation_detected", violation);
+      try { input.onViolation(policy, violation); } catch { /* violation still wins */ }
+      return { ...violationResult(policy.agent, violation), output: result.output };
+    }
+    if (verificationAuditError) throw verificationAuditError;
+    return result;
+  };
+  try {
+    const result = await adapter.run(input.prompt, {
+      signal: input.signal,
+      policy,
+      onSandboxAudit: input.onSandboxAudit,
+      // The adapter owns the active-agent gate, so verification belongs in its
+      // post-close finalization callback rather than after adapter.run().
+      afterClose: verifyAfterClose,
+    });
+    // Test and third-party adapters may not yet implement the lifecycle hook.
+    // Their result has no runner-held gate, so retain the established fallback.
+    return adapter.supportsPostCloseFinalization ? result : await verifyAfterClose(result);
+  } catch (error) {
+    return { agent: policy.agent, status: "error", output: "", error: error instanceof Error ? error.message : "Agent execution failed" };
   }
-  let violations: RuntimeViolation[];
-  try { violations = compareRuntimeState(policy, before, await captureRuntimeState(task, policy)); }
-  catch { violations = ["worktree_escape"]; }
-  input.onAudit("runtime_execution_completed", policy);
-  if (violations.length) {
-    const violation = violations[0];
-    input.onAudit("runtime_violation_detected", policy, violation);
-    input.onViolation(policy, violation);
-    return { ...violationResult(policy.agent, violation), output: result.output };
-  }
-  return result;
 }
 
 export function runtimeViolationMessage(violation: RuntimeViolation) {

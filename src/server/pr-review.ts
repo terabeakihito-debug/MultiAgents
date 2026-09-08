@@ -76,7 +76,7 @@ const defaults: PrReviewDependencies = {
 };
 
 export async function fetchReviewIntake(taskId: string, dependencies: Partial<PrReviewDependencies> = {}) {
-  if (!acquireTaskLock(taskId)) throw new ApprovalError("This task is already being processed");
+  const taskLock = acquireTaskLock(taskId); if (!taskLock) throw new ApprovalError("This task is already being processed");
   const deps = { ...defaults, ...dependencies };
   try {
     const task = requireTask(taskId);
@@ -119,13 +119,16 @@ export async function fetchReviewIntake(taskId: string, dependencies: Partial<Pr
       throw new ApprovalError(task.error);
     }
   } finally {
-    const task = getTask(taskId); if (task) persistTask(task);
-    releaseTaskLock(taskId);
+    try {
+      const task = getTask(taskId); if (task) persistTask(task);
+    } finally {
+      releaseTaskLock(taskId, taskLock);
+    }
   }
 }
 
 export async function applyReviewedFixes(taskId: string, input: { approved: true }, dependencies: Partial<PrReviewDependencies> = {}) {
-  if (!acquireTaskLock(taskId)) throw new ApprovalError("This task is already being processed");
+  const taskLock = acquireTaskLock(taskId); if (!taskLock) throw new ApprovalError("This task is already being processed");
   const deps = { ...defaults, ...dependencies };
   try {
     const task = requireTask(taskId);
@@ -200,13 +203,16 @@ export async function applyReviewedFixes(taskId: string, input: { approved: true
     transitionTask(task, "awaiting_final_approval");
     return publicTask(task);
   } finally {
-    const task = getTask(taskId); if (task) persistTask(task);
-    releaseTaskLock(taskId);
+    try {
+      const task = getTask(taskId); if (task) persistTask(task);
+    } finally {
+      releaseTaskLock(taskId, taskLock);
+    }
   }
 }
 
 export async function approveRework(taskId: string, input: ApprovalInput, dependencies: Partial<PrReviewDependencies> = {}) {
-  if (!acquireTaskLock(taskId)) throw new ApprovalError("This task is already being processed");
+  const taskLock = acquireTaskLock(taskId); if (!taskLock) throw new ApprovalError("This task is already being processed");
   const deps = { ...defaults, ...dependencies };
   try {
     const task = requireTask(taskId);
@@ -335,8 +341,11 @@ export async function approveRework(taskId: string, input: ApprovalInput, depend
       throw error instanceof ApprovalError ? failure : new ApprovalError(task.error ?? failure.message);
     }
   } finally {
-    const task = getTask(taskId); if (task) persistTask(task);
-    releaseTaskLock(taskId);
+    try {
+      const task = getTask(taskId); if (task) persistTask(task);
+    } finally {
+      releaseTaskLock(taskId, taskLock);
+    }
   }
 }
 
@@ -361,7 +370,7 @@ export async function fetchPullRequestReview(task: RepoTask): Promise<PullReques
 }
 
 export async function refreshPullRequestStatus(taskId: string, dependencies: { fetchReview?: (task: RepoTask) => Promise<PullRequestReview> } = {}) {
-  if (!acquireTaskLock(taskId)) throw new ApprovalError("This task is already being processed", 409);
+  const taskLock = acquireTaskLock(taskId); if (!taskLock) throw new ApprovalError("This task is already being processed", 409);
   try {
     const task = requireTask(taskId);
     if (!task.prNumber || !task.prUrl) throw new ApprovalError("Task does not have an existing pull request");
@@ -389,8 +398,11 @@ export async function refreshPullRequestStatus(taskId: string, dependencies: { f
     recordTaskEvent(task, "pr_status_refreshed", "user", { status: review.state.toLowerCase(), metadata: { prNumber: review.number } });
     return publicTask(task);
   } finally {
-    const task = getTask(taskId); if (task) persistTask(task);
-    releaseTaskLock(taskId);
+    try {
+      const task = getTask(taskId); if (task) persistTask(task);
+    } finally {
+      releaseTaskLock(taskId, taskLock);
+    }
   }
 }
 

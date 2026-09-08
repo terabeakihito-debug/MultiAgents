@@ -6,6 +6,8 @@ import { cursorArgs } from "./cursor";
 import { claudeArgs } from "./claude";
 import { createAgentAdapter } from "./runner";
 import { buildGenericRuntimePolicy } from "../server/runtime-policy";
+import { isAgentExecutionActive } from "../server/agent-execution-guard";
+import { activeChildProcesses } from "../server/child-process-registry";
 import type { AgentId } from "./types";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -248,6 +250,12 @@ describe("createAgentAdapter", () => {
     );
     const promise = adapter.run("test");
     await vi.advanceTimersByTimeAsync(10);
+    let settled = false;
+    void promise.then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(isAgentExecutionActive()).toBe(true);
+    child.emit("close", null, "SIGKILL");
     await expect(promise).resolves.toEqual({
       agent: "claude",
       status: "error",
@@ -269,9 +277,160 @@ describe("createAgentAdapter", () => {
     );
     const promise = adapter.run("review", { signal: controller.signal, onSandboxAudit: (event) => audits.push(event.type) });
     controller.abort();
+    let settled = false;
+    void promise.then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(isAgentExecutionActive()).toBe(true);
+    child.emit("close", null, "SIGTERM");
     await expect(promise).resolves.toMatchObject({ status: "error", error: "Request was aborted" });
+    expect(isAgentExecutionActive()).toBe(false);
     expect(child.kill).toHaveBeenCalledWith("SIGTERM");
     expect(audits).toEqual(["os_sandbox_created", "os_sandbox_process_cleanup"]);
+  });
+
+  it("keeps the abort result stable when abort and timeout race until close", async () => {
+    vi.useFakeTimers();
+    const child = fakeChild(); const controller = new AbortController();
+    const adapter = createAgentAdapter(
+      { id: "cursor", name: "Cursor", binary: "agent", args: (prompt) => ["-p", prompt] },
+      { timeoutMs: 10, unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
+    );
+    const pending = adapter.run("review", { signal: controller.signal });
+    controller.abort(); await vi.advanceTimersByTimeAsync(10);
+    expect(isAgentExecutionActive()).toBe(true);
+    child.emit("close", null, "SIGTERM");
+    await expect(pending).resolves.toMatchObject({ error: "Request was aborted" });
+    expect(child.kill).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
+  });
+
+  it("settles a PID-less spawn error because no OS child exists", async () => {
+    const child = fakeChild();
+    const adapter = createAgentAdapter(
+      { id: "cursor", name: "Cursor", binary: "agent", args: (prompt) => ["-p", prompt] },
+      { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
+    );
+    const pending = adapter.run("review");
+    child.emit("error", new Error("spawn unavailable"));
+    await expect(pending).resolves.toMatchObject({ status: "error", error: "spawn unavailable" });
+    expect(isAgentExecutionActive()).toBe(false);
+  });
+
+  it("keeps the guard and result pending while post-close verification runs", async () => {
+    const child = fakeChild();
+    let releaseVerification!: () => void;
+    const verification = new Promise<void>((resolve) => { releaseVerification = resolve; });
+    const adapter = createAgentAdapter(
+      { id: "cursor", name: "Cursor", binary: "agent", args: (prompt) => ["-p", prompt] },
+      { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
+    );
+    let settled = false;
+    const pending = adapter.run("review", { afterClose: async (result) => { await verification; return result; } }).then((result) => { settled = true; return result; });
+    child.emit("close", 0, null);
+    await Promise.resolve();
+    expect(isAgentExecutionActive()).toBe(true);
+    expect(settled).toBe(false);
+    releaseVerification();
+    await expect(pending).resolves.toMatchObject({ status: "completed" });
+    expect(isAgentExecutionActive()).toBe(false);
+  });
+
+  it("releases the guard after a post-close verification failure", async () => {
+    const child = fakeChild();
+    const adapter = createAgentAdapter(
+      { id: "cursor", name: "Cursor", binary: "agent", args: (prompt) => ["-p", prompt] },
+      { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
+    );
+    const pending = adapter.run("review", { afterClose: async () => { throw new Error("verification failed"); } });
+    child.emit("close", 0, null);
+    await expect(pending).resolves.toMatchObject({ status: "error", error: "verification failed" });
+    expect(isAgentExecutionActive()).toBe(false);
+  });
+
+  it("routes a post-spawn audit failure through close finalization", async () => {
+    const child = fakeChild() as ReturnType<typeof fakeChild> & { pid?: number };
+    Object.defineProperty(child, "pid", { value: 4321 });
+    const kill = vi.spyOn(process, "kill").mockReturnValue(true);
+    const adapter = createAgentAdapter(
+      { id: "cursor", name: "Cursor", binary: "agent", args: (prompt) => ["-p", prompt] },
+      { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
+    );
+    let settled = false;
+    const verify = vi.fn(async (result) => result);
+    const pending = adapter.run("review", { afterClose: verify, onSandboxAudit: (event) => { if (event.type === "os_sandbox_created") throw new Error("audit persistence failed"); } }).then((result) => { settled = true; return result; });
+    await Promise.resolve();
+    expect(activeChildProcesses()).toMatchObject([{ pid: 4321, purpose: "agent" }]);
+    expect(isAgentExecutionActive()).toBe(true);
+    expect(settled).toBe(false);
+    child.emit("close", null, "SIGTERM");
+    await expect(pending).resolves.toMatchObject({ status: "error", error: "audit persistence failed" });
+    expect(verify).toHaveBeenCalledOnce();
+    expect(activeChildProcesses()).toEqual([]);
+    expect(isAgentExecutionActive()).toBe(false);
+    expect(kill).toHaveBeenCalledWith(-4321, "SIGTERM");
+    kill.mockRestore();
+  });
+
+  it("continues process-error termination and finalization when its audit fails", async () => {
+    const child = fakeChild() as ReturnType<typeof fakeChild> & { pid?: number };
+    Object.defineProperty(child, "pid", { value: 4322 });
+    const kill = vi.spyOn(process, "kill").mockReturnValue(true);
+    const verify = vi.fn(async (result) => result);
+    const adapter = createAgentAdapter(
+      { id: "cursor", name: "Cursor", binary: "agent", args: (prompt) => ["-p", prompt] },
+      { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
+    );
+    let settled = 0;
+    const pending = adapter.run("review", {
+      afterClose: verify,
+      onSandboxAudit: (event) => { if (event.type === "os_sandbox_failed") throw new Error("failed audit persistence"); },
+    }).then((result) => { settled += 1; return result; });
+    child.emit("error", new Error("transport failed"));
+    await Promise.resolve();
+    expect(kill).toHaveBeenCalledWith(-4322, "SIGTERM");
+    expect(activeChildProcesses()).toMatchObject([{ pid: 4322 }]);
+    expect(isAgentExecutionActive()).toBe(true);
+    expect(settled).toBe(0);
+    child.emit("close", null, "SIGTERM");
+    await expect(pending).resolves.toMatchObject({ status: "error", error: "failed audit persistence" });
+    expect(verify).toHaveBeenCalledOnce();
+    expect(activeChildProcesses()).toEqual([]);
+    expect(isAgentExecutionActive()).toBe(false);
+    expect(settled).toBe(1);
+    kill.mockRestore();
+  });
+
+  it("continues close finalization when the sandbox-violation audit fails", async () => {
+    const child = fakeChild() as ReturnType<typeof fakeChild> & { pid?: number };
+    Object.defineProperty(child, "pid", { value: 4323 });
+    const verify = vi.fn(async (result) => result);
+    const adapter = createAgentAdapter(
+      { id: "cursor", name: "Cursor", binary: "agent", args: (prompt) => ["-p", prompt] },
+      { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
+    );
+    let settled = 0;
+    const pending = adapter.run("review", {
+      afterClose: verify,
+      onSandboxAudit: (event) => { if (event.type === "os_sandbox_violation") throw new Error("violation audit failed"); },
+    }).then((result) => { settled += 1; return result; });
+    child.stderr.write("bwrap: simulated violation");
+    child.emit("close", 1, null);
+    await expect(pending).resolves.toMatchObject({ status: "error", error: "violation audit failed" });
+    expect(verify).toHaveBeenCalledOnce();
+    expect(activeChildProcesses()).toEqual([]);
+    expect(isAgentExecutionActive()).toBe(false);
+    expect(settled).toBe(1);
+  });
+
+  it("returns a pre-spawn failure without acquiring the guard or waiting for close", async () => {
+    const adapter = createAgentAdapter(
+      { id: "cursor", name: "Cursor", binary: "agent", args: (prompt) => ["-p", prompt] },
+      { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => { throw new Error("spawn failed"); }) as never },
+    );
+    await expect(adapter.run("review")).resolves.toMatchObject({ status: "error", error: "spawn failed" });
+    expect(isAgentExecutionActive()).toBe(false);
+    expect(activeChildProcesses()).toEqual([]);
   });
 
   it("rejects a non-fixed launcher path", () => {

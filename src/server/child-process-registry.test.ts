@@ -32,6 +32,15 @@ describe("shutdown child process registry", () => {
     expect(activeChildProcesses()).toEqual([]);
   });
 
+  it("keeps a child registered after an error until close confirms termination", () => {
+    const child = fakeChild(43);
+    registerChildProcess({ child, purpose: "agent" });
+    child.emit("error", new Error("transport failure"));
+    expect(activeChildProcesses()).toMatchObject([{ pid: 43, purpose: "agent" }]);
+    child.emit("close", null, "SIGTERM");
+    expect(activeChildProcesses()).toEqual([]);
+  });
+
   it("uses process-group TERM, then KILL only for surviving registered children", async () => {
     const first = fakeChild(101); const second = fakeChild(102);
     registerChildProcess({ child: first, purpose: "git" });

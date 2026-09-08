@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { AgentAdapter, AgentId } from "../agents/types";
 import { buildChildProcessEnv } from "./child-process-env";
 import { prepareApproval } from "./pull-request";
-import { buildGenericRuntimePolicy, buildTaskRuntimePolicies, publicRuntimePolicy, RuntimePolicyError } from "./runtime-policy";
+import { buildGenericRuntimePolicy, buildTaskRuntimePolicies, publicRuntimePolicy, runTaskAgentWithPolicy, RuntimePolicyError } from "./runtime-policy";
 import { prepareTaskRuntime } from "./task-runtime";
 import { clearTasksForTests, createTask, getTaskHistory, reloadTasksFromStoreForTests, resumeTask } from "./tasks";
 import { runGit } from "./git";
@@ -123,6 +123,27 @@ describe("Phase 17 runtime capability policy", () => {
     reloadTasksFromStoreForTests();
     const restored = await resumeTask(task.id, { allowedRoot, worktreeRoot });
     expect(restored).toMatchObject({ recoveryStatus: "needs_attention", runtimeViolation: { type: "unexpected_write" } });
+  });
+
+  it("keeps a runtime violation authoritative when its final audit fails", async () => {
+    const { task } = await fixture();
+    const policy = (await buildTaskRuntimePolicies(task)).cursor;
+    const result = await runTaskAgentWithPolicy({
+      task,
+      policy,
+      prompt: "review",
+      adapter: {
+        id: "cursor", name: "cursor", supportsPostCloseFinalization: true,
+        run: async (_prompt, options) => {
+          await writeFile(join(task.worktreePath, "forbidden.txt"), "write\n");
+          return options!.afterClose!({ agent: "cursor", status: "completed", output: "done" });
+        },
+      },
+      onAudit: (type) => { if (type === "runtime_violation_detected") throw new Error("audit persistence failed"); },
+      onViolation: () => undefined,
+      onSandboxAudit: () => undefined,
+    });
+    expect(result).toMatchObject({ status: "error", runtimeViolation: "unexpected_write" });
   });
 
   it("persists only safe OS sandbox lifecycle metadata", async () => {

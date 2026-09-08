@@ -18,6 +18,7 @@ import {
 import type { PrReviewIntake, PullRequestReview, ReworkFlowResult } from "./pr-review-types";
 import { clearTaskLocksForTests } from "./task-lock";
 import { clearTasksForTests, createTask, getTaskHistory, transitionTask, type RepoTask } from "./tasks";
+import { getStateStore } from "./state-store";
 
 const roots: string[] = [];
 async function root() { const value = await mkdtemp(join(tmpdir(), "multiagents-phase6-")); roots.push(value); return value; }
@@ -134,6 +135,24 @@ describe("Phase 6 PR review intake", () => {
     release(); await first;
   });
 
+  it("releases the review-intake lock when final persistence fails", async () => {
+    const { task } = await existingPrTask();
+    const save = vi.spyOn(getStateStore(), "saveTask").mockImplementation(() => { throw new Error("injected SQLITE_FULL"); });
+    try {
+      await expect(fetchReviewIntake(task.id, fetchDeps(reviewFor(task)))).rejects.toThrow("injected SQLITE_FULL");
+      expect(isPrReviewLockedForTests(task.id)).toBe(false);
+    } finally { save.mockRestore(); }
+  });
+
+  it("releases the refresh lock when final persistence fails", async () => {
+    const { task } = await existingPrTask();
+    const save = vi.spyOn(getStateStore(), "saveTask").mockImplementation(() => { throw new Error("injected SQLITE_FULL"); });
+    try {
+      await expect(refreshPullRequestStatus(task.id, { fetchReview: async () => reviewFor(task) })).rejects.toThrow("injected SQLITE_FULL");
+      expect(isPrReviewLockedForTests(task.id)).toBe(false);
+    } finally { save.mockRestore(); }
+  });
+
   it("recovers restart state only when repo, registered worktree, branch, and PR head all match", async () => {
     const { task } = await existingPrTask();
     const pull = { number: 1, title: "Test PR", url: task.prUrl!, draft: false, base: task.baseBranch, head: task.branch, headSha: task.commitSha! };
@@ -191,6 +210,28 @@ function approvalDeps(review: PullRequestReview, overrides: Partial<PrReviewDepe
 }
 
 describe("Phase 6 rework approval and same PR update", () => {
+  it("releases the apply-review lock when final persistence fails", async () => {
+    const { task } = await existingPrTask();
+    const action = reviewFor(task, { items: [{ id: "thread:1", kind: "thread", author: "human", body: "fix", resolved: false, disposition: "action_required", reason: "unresolved" }], unresolvedCount: 1 });
+    await fetchReviewIntake(task.id, fetchDeps(action, actionIntake));
+    const save = vi.spyOn(getStateStore(), "saveTask").mockImplementation(() => { throw new Error("injected SQLITE_FULL"); });
+    try {
+      await expect(applyReviewedFixes(task.id, { approved: true }, { fetchDiff: async () => "diff", runRework: async () => ({ status: "completed", steps: [] }) })).rejects.toThrow("injected SQLITE_FULL");
+      expect(isPrReviewLockedForTests(task.id)).toBe(false);
+    } finally { save.mockRestore(); }
+  });
+
+  it("fails closed before push and releases the rework lock when commit persistence fails", async () => {
+    const { task, action, input } = await awaitingRework();
+    const push = vi.fn(async () => undefined);
+    const save = vi.spyOn(getStateStore(), "saveTask").mockImplementation(() => { throw new Error("injected SQLITE_FULL"); });
+    try {
+      await expect(approveRework(task.id, input, approvalDeps(action, { push }))).rejects.toThrow("injected SQLITE_FULL");
+      expect(push).not.toHaveBeenCalled();
+      expect(isPrReviewLockedForTests(task.id)).toBe(false);
+    } finally { save.mockRestore(); }
+  });
+
   it("does not issue an approval for Astra's binary rework fixture", async () => {
     const { task } = await existingPrTask();
     const action = reviewFor(task, { items: [{ id: "thread:1", kind: "thread", author: "human", body: "fix", resolved: false, disposition: "action_required", reason: "unresolved" }], unresolvedCount: 1 });

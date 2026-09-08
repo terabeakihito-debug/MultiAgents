@@ -7,6 +7,7 @@ import type { FlowStep } from "../agents/types";
 import { approveAndCreatePullRequest, prepareApproval, retryPullRequest } from "./pull-request";
 import { runGit } from "./git";
 import { SCHEMA_VERSION, StateStore, replaceStateStoreForTests } from "./state-store";
+import { acquireTaskLock, isTaskLocked, releaseTaskLock } from "./task-lock";
 import {
   beginTaskReview,
   clearTasksForTests,
@@ -62,6 +63,18 @@ const steps = (): FlowStep[] => [
 ];
 
 describe("Phase 8 SQLite state and audit history", () => {
+  it("releases the cleanup lease when cleanup persistence fails", async () => {
+    const { task } = await repositoryTask();
+    const save = vi.spyOn(store, "saveTask").mockImplementation(() => { throw new Error("injected SQLITE_FULL"); });
+    try {
+      await expect(deleteTask(task.id)).rejects.toThrow("injected SQLITE_FULL");
+      expect(isTaskLocked(task.id)).toBe(false);
+      const next = acquireTaskLock(task.id);
+      expect(next).toBeTruthy();
+      if (next) releaseTaskLock(task.id, next);
+    } finally { save.mockRestore(); }
+  });
+
   it("creates schema v2 with private directory and database permissions", async () => {
     expect(store.schemaVersion()).toBe(SCHEMA_VERSION);
     expect((await stat(join(testRoot, "data"))).mode & 0o777).toBe(0o700);

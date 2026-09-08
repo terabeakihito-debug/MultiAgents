@@ -10,7 +10,7 @@ export type ActiveChildProcess = {
   pgid?: number;
   startedAt: string;
   abort: () => void;
-  terminate: () => Promise<boolean>;
+  terminate: (options?: { graceMs?: number }) => Promise<boolean>;
 };
 
 type InternalChild = ActiveChildProcess & { child: ChildProcess; closed: Promise<void>; resolveClosed: () => void };
@@ -38,13 +38,18 @@ export function registerChildProcess(input: { child: ChildProcess; purpose: Regi
     id, operationId: input.operationId ?? operationContext.getStore(), purpose: input.purpose, pid, pgid: process.platform === "win32" ? undefined : pid,
     startedAt: new Date().toISOString(), child: input.child, closed, resolveClosed,
     abort: () => { signalProcessGroup(entry, "SIGTERM"); },
-    terminate: async () => terminateOne(entry),
+    terminate: async (options?: { graceMs?: number }) => terminateOne(entry, options?.graceMs),
   };
   active.set(id, entry);
+  // `error` is not proof that a spawned process has gone away.  In
+  // particular, a transport error can race a still-running child.  Keep the
+  // registry entry (and therefore its shutdown ownership) until close.
   input.child.once("close", () => unregisterChildProcess(id));
-  input.child.once("error", () => unregisterChildProcess(id));
+  // Also make a registry-only child safe to observe; callers that need the
+  // diagnostic install their own error listener.
+  input.child.once("error", () => undefined);
   audit("child_process_registered", entry);
-  return { id, unregister: () => unregisterChildProcess(id), terminate: () => terminateOne(entry) };
+  return { id, unregister: () => unregisterChildProcess(id), terminate: (options?: { graceMs?: number }) => terminateOne(entry, options?.graceMs) };
 }
 
 export function unregisterChildProcess(id: string) {
@@ -84,10 +89,10 @@ export function resetChildProcessRegistryForTests() {
   active.clear();
 }
 
-async function terminateOne(entry: InternalChild) {
+async function terminateOne(entry: InternalChild, graceMs = CHILD_PROCESS_GRACE_MS) {
   if (!active.has(entry.id)) return false;
   signalProcessGroup(entry, "SIGTERM");
-  if (await waitForClose(entry, CHILD_PROCESS_GRACE_MS)) return true;
+  if (await waitForClose(entry, graceMs)) return true;
   signalProcessGroup(entry, "SIGKILL");
   return waitForClose(entry, 1_000);
 }
