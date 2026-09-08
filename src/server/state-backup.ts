@@ -7,7 +7,7 @@ import { APP_STATE_COMPAT, getStateStore, STATE_DIRECTORY, type StateStore } fro
 import { securePrivateDirectory, validateSecureRegularFile } from "./state-path";
 
 export const BACKUP_DIRECTORY = join(STATE_DIRECTORY, "backups");
-const EXPECTED_TABLES = ["schema_version", "tasks", "task_events", "findings", "notifications", "operations", "backup_metadata"] as const;
+const EXPECTED_TABLES = ["schema_version", "tasks", "task_events", "findings", "notifications", "operations", "backup_metadata", "provider_compatibility_snapshots", "provider_compatibility_acknowledgements"] as const;
 
 export async function createStateBackup(options: { store?: StateStore; directory?: string; now?: Date; backupId?: string } = {}) {
   const store = options.store ?? getStateStore();

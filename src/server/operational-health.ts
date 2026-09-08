@@ -61,7 +61,11 @@ export async function operationsOverview(options: { forceProviders?: boolean; no
     lastNotificationAt: notificationPage.notifications[0]?.createdAt,
     attention: deliveries.filter((item) => item.status === "failed" || item.status === "ambiguous").map((item) => ({ notificationId: item.notificationId, taskId: item.taskId, title: item.title, status: item.status })),
   };
-  const providersView = providers.map((provider) => ({ ...provider, level: provider.status === "supported" ? "ok" as const : "attention" as const }));
+  const providersView = providers.map((provider) => {
+    const reviewRequired = provider.versionChanged && provider.acknowledgedVersion !== provider.version;
+    const level = provider.status === "supported" && !reviewRequired ? "ok" as const : provider.status === "supported_with_warning" && !reviewRequired ? "warning" as const : "attention" as const;
+    return { ...provider, reviewRequired, level };
+  });
   const worktrees = inventory.map((item) => ({ ...item, classification: item.cleanupCandidate ? "safe_cleanup_candidate" : item.inventoryStatus === "registered" ? "registered" : "needs_inspection" }));
   const upgradeReady = lifecycleState() === "RUNNING" && activeOperations().length === 0 && backupLevel === "ok" && diskLevel === "ok" && database.status === "ok" && sandboxResult.status === "enforced" && providersView.every((item) => item.level === "ok") && unfinished.length === 0;
   const issueCodes: string[] = [];
@@ -138,7 +142,7 @@ export async function healthReadiness(options: { providerCwd?: string; forceProv
     inspectWorktrees(),
   ]);
   const backup = latestVerifiedBackup(store);
-  const status = sandbox === "enforced" && providers.every((provider) => provider.status === "supported")
+  const status = sandbox === "enforced" && providers.every((provider) => ["supported", "supported_with_warning"].includes(provider.status))
     && Boolean(backup) && disk.worktreeCreationAllowed && store.loadUnfinishedOperations().length === 0 ? "ready" : "degraded";
   return {
     status,

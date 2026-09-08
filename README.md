@@ -613,6 +613,22 @@ OS/container process and network isolation is deferred to a later phase.
 
 ## Verification
 
+## Provider Upgrade Runbook
+
+Provider upgrades are human-controlled. MultiAgents never installs, updates,
+replaces, or changes authentication for Codex, Cursor, or Claude.
+
+1. Enter maintenance mode and create a verified state backup.
+2. Record the currently reported provider versions.
+3. Upgrade or roll back the provider manually, outside MultiAgents.
+4. Restart the server and refresh local provider diagnostics.
+5. Confirm version, required flags, private credential mount, and sandbox launch.
+6. Run a safe test flow, then acknowledge the new passing version through the
+   localhost human-action endpoint.
+7. Exit maintenance mode. If diagnostics fail, return to the previous
+   known-good provider version; retain MultiAgents state/worktrees and do not
+   delete credentials.
+
 Use a harmless prompt such as:
 
 ```text

@@ -239,12 +239,12 @@ describe("Phase 19 backup, compatibility, diagnostics, disk and drain", () => {
 
   it("reports provider compatibility without reading credential contents", async () => {
     const help = "--ignore-user-config --ignore-rules --ephemeral --sandbox --cd";
-    const execute = vi.fn(async (args: string[]) => args[0] === "--version" ? { code: 0, stdout: "codex-cli 0.150.1", stderr: "" } : { code: 0, stdout: help, stderr: "" });
-    await expect(diagnoseProvider("codex", { executableAvailable: true, credentialAvailable: true, execute })).resolves.toMatchObject({ status: "supported", version: "codex-cli 0.150.1" });
+    const execute = vi.fn(async (args: string[]) => args[0] === "--version" ? { code: 0, stdout: "codex-cli 0.153.4", stderr: "" } : { code: 0, stdout: help, stderr: "" });
+    await expect(diagnoseProvider("codex", { executableAvailable: true, credentialAvailable: true, execute })).resolves.toMatchObject({ status: "supported", version: "0.153.4" });
     await expect(diagnoseProvider("codex", { executableAvailable: true, credentialAvailable: true, execute: async () => ({ code: 0, stdout: "codex-cli 0.1.0", stderr: "" }) })).resolves.toMatchObject({ status: "unsupported_version" });
     await expect(diagnoseProvider("codex", { executableAvailable: false, credentialAvailable: true })).resolves.toMatchObject({ status: "missing" });
     await expect(diagnoseProvider("codex", { executableAvailable: true, credentialAvailable: false })).resolves.toMatchObject({ status: "credential_unavailable" });
-    await expect(diagnoseProvider("codex", { executableAvailable: true, credentialAvailable: true, execute: async () => { throw new Error("namespace failed"); } })).resolves.toMatchObject({ status: "sandbox_incompatible" });
+    await expect(diagnoseProvider("codex", { executableAvailable: true, credentialAvailable: true, execute: async () => { throw new Error("namespace failed"); } })).resolves.toMatchObject({ status: "version_probe_failed" });
   });
 
   it("blocks only new worktree creation below the disk threshold", async () => {

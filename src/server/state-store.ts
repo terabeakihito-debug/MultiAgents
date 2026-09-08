@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { FlowStep } from "../agents/types";
+import type { ProviderCompatibilitySnapshot } from "../health/types";
 import type { CredentialCapability, CredentialStatus } from "../credentials/types";
 import { redactKnownSecrets, redactKnownSecretsInValue } from "./credential-resolver";
 import type { DashboardCounts, DashboardSort, PrFilter, TaskBucket } from "../dashboard/types";
@@ -45,7 +46,7 @@ import {
 
 export const STATE_DIRECTORY = join(homedir(), ".multiagents");
 export const STATE_DATABASE = join(STATE_DIRECTORY, "state.db");
-export const APP_STATE_COMPAT = Object.freeze({ minSchema: 9, maxSchema: 11 });
+export const APP_STATE_COMPAT = Object.freeze({ minSchema: 9, maxSchema: 13 });
 export const SCHEMA_VERSION = APP_STATE_COMPAT.maxSchema;
 const MAX_STORED_PROMPT_CHARS = 20_000;
 const MAX_STORED_OUTPUT_CHARS = 1_000_000;
@@ -487,7 +488,7 @@ export class StateStore {
   clearForTests() {
     this.transaction(() => {
       this.dropAppendOnlyTriggers();
-      this.database.exec("DELETE FROM cleanup_audit_events; DELETE FROM retention_policy; DELETE FROM backup_metadata; DELETE FROM operations; DELETE FROM credential_audit_events; DELETE FROM outbound_audit_events; DELETE FROM notification_deliveries; DELETE FROM outbound_channel_settings; DELETE FROM notification_audit_events; DELETE FROM notifications; DELETE FROM watch_rule_state; DELETE FROM notification_preferences; DELETE FROM finding_events; DELETE FROM findings; DELETE FROM approval_events; DELETE FROM diff_versions; DELETE FROM step_versions; DELETE FROM task_events; DELETE FROM flow_steps; DELETE FROM tasks; DELETE FROM template_audit_events; DELETE FROM task_template_versions; DELETE FROM repo_template_settings; DELETE FROM task_templates; DELETE FROM profile_audit_events; DELETE FROM project_profile_versions; DELETE FROM project_profiles;");
+      this.database.exec("DELETE FROM provider_compatibility_snapshots; DELETE FROM provider_compatibility_acknowledgements; DELETE FROM cleanup_audit_events; DELETE FROM retention_policy; DELETE FROM backup_metadata; DELETE FROM operations; DELETE FROM credential_audit_events; DELETE FROM outbound_audit_events; DELETE FROM notification_deliveries; DELETE FROM outbound_channel_settings; DELETE FROM notification_audit_events; DELETE FROM notifications; DELETE FROM watch_rule_state; DELETE FROM notification_preferences; DELETE FROM finding_events; DELETE FROM findings; DELETE FROM approval_events; DELETE FROM diff_versions; DELETE FROM step_versions; DELETE FROM task_events; DELETE FROM flow_steps; DELETE FROM tasks; DELETE FROM template_audit_events; DELETE FROM task_template_versions; DELETE FROM repo_template_settings; DELETE FROM task_templates; DELETE FROM profile_audit_events; DELETE FROM project_profile_versions; DELETE FROM project_profiles;");
       this.createAppendOnlyTriggers();
     });
   }
@@ -495,6 +496,42 @@ export class StateStore {
   loadTaskIdentity(taskId: string): { repoId: string; repoName: string } | undefined {
     const row = this.database.prepare("SELECT repo_id, repo_name FROM tasks WHERE task_id = ?").get(taskId) as TaskRow | undefined;
     return row ? { repoId: String(row.repo_id), repoName: String(row.repo_name) } : undefined;
+  }
+
+  saveProviderCompatibility(snapshot: ProviderCompatibilitySnapshot) {
+    const statuses = ["supported", "supported_with_warning", "version_probe_failed", "unsupported_version", "missing", "credential_unavailable", "sandbox_incompatible", "flag_incompatible", "launch_failed"];
+    if (!["codex", "cursor", "claude"].includes(snapshot.provider) || !statuses.includes(snapshot.status)) throw new Error("Provider compatibility snapshot is invalid");
+    if (snapshot.version && !/^\d+(?:\.\d+){2}$/.test(snapshot.version)) throw new Error("Provider compatibility version is invalid");
+    if (snapshot.identity && (snapshot.identity.length > 500 || /[\r\n]/.test(snapshot.identity))) throw new Error("Provider compatibility identity is invalid");
+    this.database.prepare(`INSERT INTO provider_compatibility_snapshots
+      (provider, version, status, flags_compatible, credential_status, sandbox_compatible, launch_compatible, checked_at, identity)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(snapshot.provider, snapshot.version ?? null, snapshot.status, Number(snapshot.flagsCompatible), snapshot.credentialStatus, Number(snapshot.sandboxCompatible), Number(snapshot.launchCompatible), snapshot.checkedAt, snapshot.identity ?? null);
+    this.database.prepare(`DELETE FROM provider_compatibility_snapshots WHERE snapshot_id IN (
+      SELECT snapshot_id FROM provider_compatibility_snapshots WHERE provider = ? ORDER BY snapshot_id DESC LIMIT -1 OFFSET 20
+    )`).run(snapshot.provider);
+  }
+
+  loadLatestProviderCompatibility(provider: string): (ProviderCompatibilitySnapshot & { identity?: string }) | undefined {
+    if (!["codex", "cursor", "claude"].includes(provider)) return undefined;
+    const row = this.database.prepare("SELECT * FROM provider_compatibility_snapshots WHERE provider = ? ORDER BY snapshot_id DESC LIMIT 1").get(provider) as TaskRow | undefined;
+    return row ? rowToProviderCompatibility(row) : undefined;
+  }
+
+  loadProviderCompatibilityHistory(provider: string, limit = 20): Array<ProviderCompatibilitySnapshot & { identity?: string }> {
+    if (!["codex", "cursor", "claude"].includes(provider) || !Number.isSafeInteger(limit) || limit < 1 || limit > 20) return [];
+    return (this.database.prepare("SELECT * FROM provider_compatibility_snapshots WHERE provider = ? ORDER BY snapshot_id DESC LIMIT ?").all(provider, limit) as TaskRow[]).map(rowToProviderCompatibility);
+  }
+
+  acknowledgeProviderCompatibility(provider: string, version: string) {
+    if (!["codex", "cursor", "claude"].includes(provider) || !/^\d+(?:\.\d+){2}$/.test(version)) throw new Error("Provider acknowledgement is invalid");
+    this.database.prepare(`INSERT INTO provider_compatibility_acknowledgements(provider, version, acknowledged_at) VALUES (?, ?, ?)
+      ON CONFLICT(provider) DO UPDATE SET version = excluded.version, acknowledged_at = excluded.acknowledged_at`).run(provider, version, new Date().toISOString());
+  }
+
+  loadProviderCompatibilityAcknowledgement(provider: string) {
+    const row = this.database.prepare("SELECT version FROM provider_compatibility_acknowledgements WHERE provider = ?").get(provider) as { version?: string } | undefined;
+    return row?.version;
   }
 
   createBuiltInNotification(input: Omit<AppNotification, "notificationId" | "status" | "createdAt" | "readAt" | "dismissedAt" | "deliveries">): AppNotification | undefined {
@@ -1559,6 +1596,44 @@ export class StateStore {
       `);
       this.database.prepare("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)").run(11, new Date().toISOString());
     });
+    if (version < 11) version = 11;
+    if (version < 12) this.transaction(() => {
+      this.database.exec(`
+        CREATE TABLE IF NOT EXISTS provider_compatibility_snapshots (
+          snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          provider TEXT NOT NULL CHECK(provider IN ('codex','cursor','claude')),
+          version TEXT, status TEXT NOT NULL CHECK(status IN ('supported','supported_with_warning','unsupported_version','missing','credential_unavailable','sandbox_incompatible','flag_incompatible','launch_failed')),
+          flags_compatible INTEGER NOT NULL CHECK(flags_compatible IN (0,1)),
+          credential_status TEXT NOT NULL CHECK(credential_status IN ('available','missing','unsafe_permissions','unsupported_layout')),
+          sandbox_compatible INTEGER NOT NULL CHECK(sandbox_compatible IN (0,1)), launch_compatible INTEGER NOT NULL CHECK(launch_compatible IN (0,1)),
+          checked_at TEXT NOT NULL, identity TEXT
+        );
+        CREATE INDEX IF NOT EXISTS provider_compatibility_provider_checked_idx ON provider_compatibility_snapshots(provider, snapshot_id DESC);
+        CREATE TABLE IF NOT EXISTS provider_compatibility_acknowledgements (
+          provider TEXT PRIMARY KEY CHECK(provider IN ('codex','cursor','claude')), version TEXT NOT NULL, acknowledged_at TEXT NOT NULL
+        );
+      `);
+      this.database.prepare("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)").run(12, new Date().toISOString());
+    });
+    if (version < 12) version = 12;
+    if (version < 13) this.transaction(() => {
+      this.database.exec(`
+        ALTER TABLE provider_compatibility_snapshots RENAME TO provider_compatibility_snapshots_v12;
+        CREATE TABLE provider_compatibility_snapshots (
+          snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          provider TEXT NOT NULL CHECK(provider IN ('codex','cursor','claude')),
+          version TEXT, status TEXT NOT NULL CHECK(status IN ('supported','supported_with_warning','version_probe_failed','unsupported_version','missing','credential_unavailable','sandbox_incompatible','flag_incompatible','launch_failed')),
+          flags_compatible INTEGER NOT NULL CHECK(flags_compatible IN (0,1)),
+          credential_status TEXT NOT NULL CHECK(credential_status IN ('available','missing','unsafe_permissions','unsupported_layout')),
+          sandbox_compatible INTEGER NOT NULL CHECK(sandbox_compatible IN (0,1)), launch_compatible INTEGER NOT NULL CHECK(launch_compatible IN (0,1)),
+          checked_at TEXT NOT NULL, identity TEXT
+        );
+        INSERT INTO provider_compatibility_snapshots SELECT * FROM provider_compatibility_snapshots_v12;
+        DROP TABLE provider_compatibility_snapshots_v12;
+        CREATE INDEX provider_compatibility_provider_checked_idx ON provider_compatibility_snapshots(provider, snapshot_id DESC);
+      `);
+      this.database.prepare("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)").run(13, new Date().toISOString());
+    });
     this.createAppendOnlyTriggers();
   }
 
@@ -1731,6 +1806,14 @@ function rowToBackupMetadata(row: TaskRow): BackupMetadata {
   return {
     backupId: String(row.backup_id), createdAt: String(row.created_at), schemaVersion: Number(row.schema_version),
     integrityStatus: "ok", sizeBytes: Number(row.size_bytes), appCommit: optionalString(row.app_commit),
+  };
+}
+function rowToProviderCompatibility(row: TaskRow): ProviderCompatibilitySnapshot & { identity?: string } {
+  return {
+    provider: String(row.provider) as ProviderCompatibilitySnapshot["provider"], status: String(row.status) as ProviderCompatibilitySnapshot["status"],
+    version: optionalString(row.version), flagsCompatible: Number(row.flags_compatible) === 1,
+    credentialStatus: String(row.credential_status) as ProviderCompatibilitySnapshot["credentialStatus"], sandboxCompatible: Number(row.sandbox_compatible) === 1,
+    launchCompatible: Number(row.launch_compatible) === 1, checkedAt: String(row.checked_at), versionChanged: false, identityChanged: false, identity: optionalString(row.identity),
   };
 }
 function requireUuid(value: string, label: string) {

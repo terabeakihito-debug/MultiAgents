@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { AgentAdapter, AgentDefinition, AgentResult } from "./types";
 import { beginAgentExecution } from "../server/agent-execution-guard";
+import { assertProviderExecutionAllowed } from "../server/provider-diagnostics";
 import { buildChildProcessEnv } from "../server/child-process-env";
 import { registerChildProcess } from "../server/child-process-registry";
 import { redactKnownSecrets } from "../server/credential-resolver";
@@ -62,6 +63,12 @@ function runProcess(
     void launch();
 
     async function launch() {
+      if (!testBypass) try {
+        await assertProviderExecutionAllowed(definition.id);
+      } catch (error) {
+        resolve(errorResult(definition.id, error));
+        return;
+      }
       try {
         if (!testBypass) await assertOsSandboxAvailable();
       } catch (error) {
