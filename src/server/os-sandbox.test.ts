@@ -1,10 +1,11 @@
 import { spawn } from "node:child_process";
 import { mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createServer } from "node:http";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
+  BWRAP_BINARY,
   OsSandboxUnavailableError,
   SANDBOX_HOME,
   SANDBOX_PATH,
@@ -14,6 +15,23 @@ import {
 } from "./os-sandbox";
 import { runValidationCommand } from "./pull-request";
 import type { RepoTask } from "./tasks";
+
+const TEST_NODE_ROOT = dirname(dirname(process.execPath));
+const TEST_CODEX_ROOT = join(TEST_NODE_ROOT, "lib", "node_modules", "@openai", "codex");
+const CODEX_RUNTIME_FIXTURE = {
+  source: "vendor" as const,
+  mainPackageRoot: TEST_CODEX_ROOT,
+  installRoot: TEST_CODEX_ROOT,
+  packageRoot: TEST_CODEX_ROOT,
+  packageJson: join(TEST_CODEX_ROOT, "package.json"),
+  nativeExecutable: process.execPath,
+  optionalPackageName: "codex-linux-x64",
+  nativeIdentity: { digest: "fixture", dev: 0, ino: 0, size: 0, ctimeMs: 0, mode: 0o500, uid: 0, gid: 0 },
+  stagedExecutable: process.execPath,
+  stagedDigest: "fixture",
+};
+const CURSOR_RUNTIME_FIXTURE = { stagedRuntimeRoot: dirname(process.execPath), aggregateDigest: "fixture" };
+const CLAUDE_RUNTIME_FIXTURE = { stagedExecutable: process.execPath, digest: "fixture" };
 
 function shellCommand(command: ReturnType<typeof buildSandboxCommand>, script: string) {
   const args = [...command.args];
@@ -36,6 +54,14 @@ function run(command: ReturnType<typeof buildSandboxCommand>, timeoutMs = 10_000
 }
 
 describe("Phase 18 OS sandbox command policy", () => {
+  it("runs Cursor metadata pseudo-TTY probes inside the provider PID namespace", () => {
+    const command = buildSandboxCommand({ profile: "agent_read_only", provider: "cursor", cwd: "/tmp/task-worktree", command: { binary: "agent", args: ["--version"] }, pseudoTty: true, cursorRuntime: CURSOR_RUNTIME_FIXTURE });
+    expect(command.binary).toBe(BWRAP_BINARY);
+    expect(command.args).toContain("--unshare-pid");
+    expect(command.args).toContain("--die-with-parent");
+    expect(command.args).toContain("--unshare-net");
+    expect(command.args.slice(-5)).toEqual(["--", "/usr/bin/script", "-qefc", "'/opt/multiagents/cursor/cursor-agent' '--version'", "/dev/null"]);
+  });
   it("pins bubblewrap absolutely and fixes namespace, environment, mount, and validation network arguments", () => {
     const command = buildSandboxCommand({ profile: "validation", cwd: "/tmp/task-worktree", command: { binary: "/bin/sh", args: ["-c", "true"] } });
     expect(command.binary).toBe("/usr/bin/bwrap");
@@ -47,19 +73,19 @@ describe("Phase 18 OS sandbox command policy", () => {
   });
 
   it("constructs implement and review profiles with only the task worktree writable", () => {
-    const implement = buildSandboxCommand({ profile: "agent_implement", cwd: "/tmp/task", writableRoot: "/tmp/task", baseRepoRoot: "/tmp/base", provider: "codex", command: { binary: "codex", args: ["--version"] } });
-    const review = buildSandboxCommand({ profile: "agent_read_only", cwd: "/tmp/task", provider: "codex", command: { binary: "codex", args: ["--version"] } });
+    const implement = buildSandboxCommand({ profile: "agent_implement", cwd: "/tmp/task", writableRoot: "/tmp/task", baseRepoRoot: "/tmp/base", provider: "codex", codexRuntime: CODEX_RUNTIME_FIXTURE, command: { binary: "codex", args: ["--version"] } });
+    const review = buildSandboxCommand({ profile: "agent_read_only", cwd: "/tmp/task", provider: "codex", codexRuntime: CODEX_RUNTIME_FIXTURE, command: { binary: "codex", args: ["--version"] } });
     expect(implement.args).toEqual(expect.arrayContaining(["--bind", "/tmp/task", "/project", "--ro-bind", "/tmp/base", "/tmp/base"]));
     expect(review.args).toEqual(expect.arrayContaining(["--ro-bind", "/tmp/task", "/project"]));
     expect(review.args).not.toContain("--unshare-net");
-    expect(() => buildSandboxCommand({ profile: "agent_read_only", cwd: "/tmp/task", writableRoot: "/tmp/task", provider: "codex", command: { binary: "codex", args: [] } })).toThrow(OsSandboxUnavailableError);
+    expect(() => buildSandboxCommand({ profile: "agent_read_only", cwd: "/tmp/task", writableRoot: "/tmp/task", provider: "codex", codexRuntime: CODEX_RUNTIME_FIXTURE, command: { binary: "codex", args: [] } })).toThrow(OsSandboxUnavailableError);
   });
 
   it("mounts only provider-specific credential files and excludes history, plugins, projects, and server state", () => {
     const cases = [
-      buildSandboxCommand({ profile: "agent_read_only", cwd: "/tmp/task", provider: "codex", command: { binary: "codex", args: [] } }),
-      buildSandboxCommand({ profile: "agent_read_only", cwd: "/tmp/task", provider: "cursor", command: { binary: "agent", args: [] } }),
-      buildSandboxCommand({ profile: "agent_read_only", cwd: "/tmp/task", provider: "claude", command: { binary: join(homedir(), ".local", "bin", "claude"), args: [] } }),
+      buildSandboxCommand({ profile: "agent_read_only", cwd: "/tmp/task", provider: "codex", codexRuntime: CODEX_RUNTIME_FIXTURE, command: { binary: "codex", args: [] } }),
+      buildSandboxCommand({ profile: "agent_read_only", cwd: "/tmp/task", provider: "cursor", cursorRuntime: CURSOR_RUNTIME_FIXTURE, command: { binary: "agent", args: [] } }),
+      buildSandboxCommand({ profile: "agent_read_only", cwd: "/tmp/task", provider: "claude", claudeRuntime: CLAUDE_RUNTIME_FIXTURE, command: { binary: join(homedir(), ".local", "bin", "claude"), args: [] } }),
     ];
     const serialized = cases.map((item) => item.args.join("\0")).join("\n");
     expect(serialized).toContain("auth.json");
@@ -129,12 +155,12 @@ describe("Phase 18 real bubblewrap enforcement", () => {
   });
 
   it("makes implement worktree writable, base read-only, sibling hidden, and review project read-only", async () => {
-    const implement = shellCommand(buildSandboxCommand({ profile: "agent_implement", cwd: project, writableRoot: project, baseRepoRoot: base, provider: "codex", command: { binary: "codex", args: [] } }), [
+    const implement = shellCommand(buildSandboxCommand({ profile: "agent_implement", cwd: project, writableRoot: project, baseRepoRoot: base, provider: "codex", codexRuntime: CODEX_RUNTIME_FIXTURE, command: { binary: "codex", args: [] } }), [
       "set -eu", "touch /project/implement.txt", `! touch ${base}/forbidden`, `test ! -e ${sibling}`, "printf IMPLEMENT_OK",
     ].join("\n"));
     expect(await run(implement)).toMatchObject({ code: 0, stdout: "IMPLEMENT_OK" });
 
-    const review = shellCommand(buildSandboxCommand({ profile: "agent_read_only", cwd: project, provider: "codex", command: { binary: "codex", args: [] } }), "! touch /project/review.txt && printf REVIEW_OK");
+    const review = shellCommand(buildSandboxCommand({ profile: "agent_read_only", cwd: project, provider: "codex", codexRuntime: CODEX_RUNTIME_FIXTURE, command: { binary: "codex", args: [] } }), "! touch /project/review.txt && printf REVIEW_OK");
     expect(await run(review)).toMatchObject({ code: 0, stdout: "REVIEW_OK" });
   });
 
@@ -176,9 +202,9 @@ describe("Phase 18 real bubblewrap enforcement", () => {
     }
   });
 
-  it("kills background descendants when the sandbox command completes", async () => {
+  it("kills an escaped-session background descendant when the sandbox command completes", async () => {
     const raw = buildSandboxCommand({ profile: "validation", cwd: project, command: { binary: "/bin/sh", args: [] } });
-    const result = await run(shellCommand(raw, "(sleep 1; touch /project/orphan.txt) & exit 0"));
+    const result = await run(shellCommand(raw, "setsid /bin/sh -c 'trap \"\" TERM HUP; sleep 1; touch /project/orphan.txt' </dev/null >/dev/null 2>&1 & exit 0"));
     expect(result.code).toBe(0);
     await new Promise((resolve) => setTimeout(resolve, 1_300));
     await expect(readFile(join(project, "orphan.txt"))).rejects.toMatchObject({ code: "ENOENT" });

@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { AgentAdapter, AgentDefinition, AgentResult } from "./types";
 import { beginAgentExecution } from "../server/agent-execution-guard";
-import { assertProviderExecutionAllowed } from "../server/provider-diagnostics";
+import { assertProviderExecutionAllowed, assertProviderExecutionIdentity, prepareProviderImmutableBinding } from "../server/provider-diagnostics";
 import { buildChildProcessEnv } from "../server/child-process-env";
 import { registerChildProcess } from "../server/child-process-registry";
 import { redactKnownSecrets } from "../server/credential-resolver";
@@ -64,8 +64,9 @@ function runProcess(
     void launch();
 
     async function launch() {
+      let diagnostic;
       if (!testBypass) try {
-        await assertProviderExecutionAllowed(definition.id);
+        diagnostic = await assertProviderExecutionAllowed(definition.id);
       } catch (error) {
         resolve(errorResult(definition.id, error));
         return;
@@ -79,9 +80,13 @@ function runProcess(
       }
 
       let command: SandboxCommand;
+      let executionBinding: Awaited<ReturnType<typeof assertProviderExecutionIdentity>> | undefined;
+      let immutableRuntime: Awaited<ReturnType<typeof prepareProviderImmutableBinding>> | undefined;
       try {
         const safePrompt = redactKnownSecrets(prompt);
         const innerArgs = definition.args(safePrompt, SANDBOX_PROJECT_ROOT, policy.source === "task_snapshots", policy.allowWrite);
+        executionBinding = !testBypass ? await assertProviderExecutionIdentity(definition.id, diagnostic!) : undefined;
+        immutableRuntime = !testBypass && executionBinding ? await prepareProviderImmutableBinding(definition.id, executionBinding) : undefined;
         command = testBypass
           ? testSandboxCommand(definition.binary, innerArgs)
           : buildSandboxCommand({
@@ -90,10 +95,14 @@ function runProcess(
               writableRoot: policy.writableRoot,
               baseRepoRoot: policy.baseRepoRoot,
               provider: definition.id,
+              codexRuntime: immutableRuntime?.codexRuntime,
+              cursorRuntime: immutableRuntime?.cursorRuntime,
+              claudeRuntime: immutableRuntime?.claudeRuntime,
               command: { binary: definition.binary, args: innerArgs },
               env: buildChildProcessEnv({ purpose: "agent", baseEnv: options.env ?? process.env }),
             });
       } catch (error) {
+        await immutableRuntime?.cleanup().catch(() => undefined);
         audit?.({ type: "os_sandbox_failed", profile, provider: definition.id, capabilityClass: policy.policyClass, failureCode: "invalid_sandbox_configuration" });
         resolve(errorResult(definition.id, error));
         return;
@@ -111,6 +120,7 @@ function runProcess(
       try {
         child = spawnProcess(command.binary, command.args, spawnOptions);
       } catch (error) {
+        await immutableRuntime?.cleanup().catch(() => undefined);
         audit?.({ type: "os_sandbox_failed", profile, provider: definition.id, capabilityClass: policy.policyClass, failureCode: "sandbox_launch_failed" });
         resolve(errorResult(definition.id, error));
         return;
@@ -162,6 +172,8 @@ function runProcess(
         else finalResult = verifiedResult;
         // The guard spans close, unregister, and runtime verification, and
         // must release even if any finalization side effect has failed.
+        try { await immutableRuntime?.cleanup(); }
+        catch (error) { finalResult = errorResult(definition.id, error); }
         try { endAgentExecution(); }
         finally { resolve(finalResult); }
       };

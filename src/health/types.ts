@@ -26,8 +26,12 @@ export type ProviderDiagnostic = {
   versionChanged: boolean;
   identityChanged: boolean;
   acknowledgedVersion?: string;
+  /** Secret-free execution fingerprint, present for live diagnostics. */
+  identity?: string;
 };
 
+/** `identity` is a secret-free fingerprint of the exact host objects mounted into
+ * the provider sandbox.  It is checked again immediately before launch. */
 export type ProviderCompatibilitySnapshot = ProviderDiagnostic & { identity?: string };
 
 export type WorktreeInventoryStatus =

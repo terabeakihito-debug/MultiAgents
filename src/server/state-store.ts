@@ -502,7 +502,9 @@ export class StateStore {
     const statuses = ["supported", "supported_with_warning", "version_probe_failed", "unsupported_version", "missing", "credential_unavailable", "sandbox_incompatible", "flag_incompatible", "launch_failed"];
     if (!["codex", "cursor", "claude"].includes(snapshot.provider) || !statuses.includes(snapshot.status)) throw new Error("Provider compatibility snapshot is invalid");
     if (snapshot.version && !/^\d+(?:\.\d+){2}$/.test(snapshot.version)) throw new Error("Provider compatibility version is invalid");
-    if (snapshot.identity && (snapshot.identity.length > 500 || /[\r\n]/.test(snapshot.identity))) throw new Error("Provider compatibility identity is invalid");
+    // Identity is metadata only (paths and stat fields), never credential
+    // content. A complete launcher chain can legitimately exceed 500 chars.
+    if (snapshot.identity && (snapshot.identity.length > 4_000 || /[\r\n]/.test(snapshot.identity))) throw new Error("Provider compatibility identity is invalid");
     this.database.prepare(`INSERT INTO provider_compatibility_snapshots
       (provider, version, status, flags_compatible, credential_status, sandbox_compatible, launch_compatible, checked_at, identity)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)

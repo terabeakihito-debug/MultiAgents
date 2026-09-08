@@ -72,6 +72,10 @@ export type FixedProcessResult = {
   stdoutTruncated: boolean;
   stderrTruncated: boolean;
 };
+export type HardenedProcessInput = {
+  binary: string; args: readonly string[]; cwd: string; env: NodeJS.ProcessEnv;
+  purpose: ChildProcessPurpose; timeoutMs: number; terminateOnOutput?: boolean; spawnProcess?: typeof spawn;
+};
 
 export class ProcessExecutionError extends Error {
   constructor(public readonly result: FixedProcessResult) {
@@ -939,6 +943,13 @@ export async function runFixedProcess(binary: string, args: readonly string[], c
   return runFixedProcessWithEnv(binary, args, cwd, timeoutMs);
 }
 
+/** Common process lifecycle for fixed commands that are already sandboxed. */
+export async function runHardenedProcess(input: HardenedProcessInput) {
+  return runFixedProcessWithEnv(input.binary, input.args, input.cwd, input.timeoutMs, undefined, input.env, {
+    purpose: input.purpose, skipSandbox: true, terminateOnOutput: input.terminateOnOutput ?? true, spawnProcess: input.spawnProcess,
+  });
+}
+
 export async function runServerGitMutation(cwd: string, args: readonly string[], timeoutMs = COMMAND_TIMEOUT_MS) {
   const invocation = await serverGitMutationInvocation(cwd, args);
   const result = await runFixedProcessWithEnv(GIT_BINARY, invocation.args, cwd, timeoutMs, undefined, invocation.env);
@@ -946,13 +957,13 @@ export async function runServerGitMutation(cwd: string, args: readonly string[],
   return result;
 }
 
-async function runFixedProcessWithEnv(binary: string, args: readonly string[], cwd: string, timeoutMs: number, envOverrides?: NodeJS.ProcessEnv, exactEnv?: NodeJS.ProcessEnv) {
-  const purpose: ChildProcessPurpose = binary === GIT_BINARY ? "git" : binary === GH_BINARY ? "github" : "validation";
+async function runFixedProcessWithEnv(binary: string, args: readonly string[], cwd: string, timeoutMs: number, envOverrides?: NodeJS.ProcessEnv, exactEnv?: NodeJS.ProcessEnv, options: { purpose?: ChildProcessPurpose; skipSandbox?: boolean; terminateOnOutput?: boolean; spawnProcess?: typeof spawn } = {}) {
+  const purpose: ChildProcessPurpose = options.purpose ?? (binary === GIT_BINARY ? "git" : binary === GH_BINARY ? "github" : "validation");
   let launchBinary = binary;
   let launchArgs = [...args];
   let launchCwd = cwd;
   let launchEnv = exactEnv ?? buildChildProcessEnv({ purpose, overrides: envOverrides });
-  if (purpose === "validation") {
+  if (purpose === "validation" && !options.skipSandbox) {
     await assertOsSandboxAvailable();
     const sandbox = buildSandboxCommand({ profile: "validation", cwd, command: { binary, args }, env: launchEnv });
     launchBinary = sandbox.binary;
@@ -961,7 +972,7 @@ async function runFixedProcessWithEnv(binary: string, args: readonly string[], c
     launchEnv = sandbox.env;
   }
   return new Promise<FixedProcessResult>((resolve, reject) => {
-    const child = spawn(launchBinary, launchArgs, {
+    const child = (options.spawnProcess ?? spawn)(launchBinary, launchArgs, {
       cwd: launchCwd,
       env: launchEnv,
       shell: false,
@@ -978,10 +989,11 @@ async function runFixedProcessWithEnv(binary: string, args: readonly string[], c
     let stderrEnded = false;
     let settled = false;
     let timedOut = false;
+    let terminationStarted = false;
+    let terminalError: Error | undefined;
     let exitCode: number | null = null;
     let exitSignal: NodeJS.Signals | null = null;
     let killTimer: NodeJS.Timeout | undefined;
-    let forceCloseTimer: NodeJS.Timeout | undefined;
     const append = (current: Buffer, chunk: Buffer) => {
       if (chunk.length >= MAX_COMMAND_OUTPUT_BYTES) {
         return { value: chunk.subarray(chunk.length - MAX_COMMAND_OUTPUT_BYTES), truncated: true };
@@ -994,16 +1006,17 @@ async function runFixedProcessWithEnv(binary: string, args: readonly string[], c
       const appended = append(stdout, chunk);
       stdout = appended.value;
       stdoutTruncated ||= appended.truncated;
+      if (appended.truncated && (options.terminateOnOutput ?? purpose === "github")) beginTermination("output");
     });
     child.stderr.on("data", (chunk: Buffer) => {
       const appended = append(stderr, chunk);
       stderr = appended.value;
       stderrTruncated ||= appended.truncated;
+      if (appended.truncated && (options.terminateOnOutput ?? purpose === "github")) beginTermination("output");
     });
     const clearTimers = () => {
       clearTimeout(timeoutTimer);
       if (killTimer) clearTimeout(killTimer);
-      if (forceCloseTimer) clearTimeout(forceCloseTimer);
     };
     const result = (): FixedProcessResult => ({
       stdout: redactKnownSecrets(stdout.toString("utf8")),
@@ -1019,7 +1032,8 @@ async function runFixedProcessWithEnv(binary: string, args: readonly string[], c
       settled = true;
       clearTimers();
       registration.unregister();
-      resolve(result());
+      if (terminalError) reject(terminalError);
+      else resolve(result());
     };
     const finishAfterCloseAndOutput = () => {
       if (processClosed && stdoutEnded && stderrEnded) finish();
@@ -1029,25 +1043,43 @@ async function runFixedProcessWithEnv(binary: string, args: readonly string[], c
         try { process.kill(-child.pid, signal); } catch { child.kill(signal); }
       } else child.kill(signal);
     };
+    const beginTermination = (reason: "timeout" | "output" | "error") => {
+      if (settled || terminationStarted) return;
+      terminationStarted = true;
+      timedOut ||= reason === "timeout";
+      killProcessGroup("SIGTERM");
+      killTimer = setTimeout(() => {
+        if (settled) return;
+        killProcessGroup("SIGKILL");
+        // A descendant can retain inherited pipe descriptors. Once the owned
+        // tree has had TERM grace and received KILL, close our pipe ends too;
+        // settlement still waits for the child's close event.
+        child.stdout.destroy();
+        child.stderr.destroy();
+      }, PROCESS_TERMINATION_GRACE_MS);
+      killTimer.unref();
+    };
     child.once("error", (error) => {
       if (settled) return;
-      settled = true;
-      clearTimers();
-      registration.unregister();
-      reject(error);
+      terminalError ??= error;
+      beginTermination("error");
     });
     child.once("exit", (code, signal) => {
       exitCode = code;
       exitSignal = signal;
     });
-    child.stdout.once("end", () => {
+    const stdoutClosed = () => {
       stdoutEnded = true;
       finishAfterCloseAndOutput();
-    });
-    child.stderr.once("end", () => {
+    };
+    const stderrClosed = () => {
       stderrEnded = true;
       finishAfterCloseAndOutput();
-    });
+    };
+    child.stdout.once("end", stdoutClosed);
+    child.stdout.once("close", stdoutClosed);
+    child.stderr.once("end", stderrClosed);
+    child.stderr.once("close", stderrClosed);
     child.once("close", (code, signal) => {
       exitCode ??= code;
       exitSignal ??= signal;
@@ -1055,16 +1087,7 @@ async function runFixedProcessWithEnv(binary: string, args: readonly string[], c
       finishAfterCloseAndOutput();
     });
     const timeoutTimer = setTimeout(() => {
-      if (settled) return;
-      timedOut = true;
-      killProcessGroup("SIGTERM");
-      killTimer = setTimeout(() => {
-        if (settled) return;
-        killProcessGroup("SIGKILL");
-        forceCloseTimer = setTimeout(finish, 1_000);
-        forceCloseTimer.unref();
-      }, PROCESS_TERMINATION_GRACE_MS);
-      killTimer.unref();
+      beginTermination("timeout");
     }, timeoutMs);
     timeoutTimer.unref();
   });

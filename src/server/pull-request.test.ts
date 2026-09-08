@@ -1,4 +1,6 @@
 import { chmod, copyFile, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -14,6 +16,7 @@ import {
   prepareApproval,
   ProcessExecutionError,
   runFixedProcess,
+  runHardenedProcess,
   runServerGitMutation,
   runValidationCommand,
   scanSecrets,
@@ -35,6 +38,7 @@ import {
 } from "./tasks";
 import { getStateStore } from "./state-store";
 import { acquireTaskLock, releaseTaskLock } from "./task-lock";
+import { activeChildProcesses, resetChildProcessRegistryForTests } from "./child-process-registry";
 
 const roots: string[] = [];
 
@@ -43,6 +47,8 @@ async function createRoot() {
   roots.push(value);
   return value;
 }
+
+function nextTurn() { return new Promise<void>((resolve) => setImmediate(resolve)); }
 
 async function createRepo(origin = "https://github.com/example/project.git", seed: Record<string, string> = {}, templateId = "bug_fix") {
   const allowedRoot = await createRoot();
@@ -442,6 +448,30 @@ describe("Phase 5 approval and PR state machine", () => {
     const result = await runFixedProcess(process.execPath, ["-e", "setInterval(() => undefined, 1000)"], cwd, 20);
     expect(result.timedOut).toBe(true);
     expect(result.signal).toBe("SIGTERM");
+  });
+
+  it("keeps a post-spawn error owned until pipes and close confirm cleanup", async () => {
+    const child = Object.assign(new EventEmitter(), {
+      pid: 999_999,
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      kill: vi.fn(() => true),
+    });
+    const completion = runHardenedProcess({
+      binary: "/fixed/fixture", args: [], cwd: process.cwd(), env: process.env, purpose: "validation", timeoutMs: 10_000,
+      spawnProcess: vi.fn(() => child) as never,
+    });
+    let settled = false;
+    void completion.catch(() => { settled = true; });
+    child.emit("error", new Error("post-spawn fixture error"));
+    await nextTurn();
+    expect(settled).toBe(false);
+    expect(activeChildProcesses()).toHaveLength(1);
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    child.stdout.end(); child.stderr.end(); child.emit("close", null, "SIGTERM");
+    await expect(completion).rejects.toThrow("post-spawn fixture error");
+    expect(activeChildProcesses()).toHaveLength(0);
+    resetChildProcessRegistryForTests();
   });
 
   it("redacts environment assignments, credentials, and control sequences from stderr summaries", () => {

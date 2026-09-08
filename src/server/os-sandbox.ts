@@ -1,11 +1,12 @@
 import { spawn } from "node:child_process";
-import { accessSync, constants, lstatSync, realpathSync } from "node:fs";
+import { accessSync, constants, lstatSync } from "node:fs";
 import { access } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { AgentId } from "../agents/types";
 import type { RuntimePolicy } from "../runtime/types";
 import { registerChildProcess } from "./child-process-registry";
+import type { ExecutableContentIdentity } from "./immutable-executable-binding";
 
 export const BWRAP_BINARY = "/usr/bin/bwrap" as const;
 export const SANDBOX_PROJECT_ROOT = "/project" as const;
@@ -89,6 +90,11 @@ export function buildSandboxCommand(input: {
   provider?: AgentId;
   command: { binary: string; args: readonly string[] };
   env?: Readonly<Record<string, string | undefined>>;
+  /** Fixed Cursor metadata probe: pseudo-TTY inside the sandbox PID namespace. */
+  pseudoTty?: boolean;
+  codexRuntime?: StagedCodexRuntimeBinding;
+  cursorRuntime?: StagedCursorRuntimeBinding;
+  claudeRuntime?: StagedClaudeRuntimeBinding;
 }): SandboxCommand {
   const cwd = requireAbsoluteSafePath(input.cwd, "sandbox cwd");
   if (input.profile === "agent_implement") {
@@ -99,6 +105,7 @@ export function buildSandboxCommand(input: {
   }
   if (input.profile === "validation" && input.provider) invalid("Validation cannot mount an Agent credential set");
   if (input.profile !== "validation" && !input.provider) invalid("Agent sandbox requires a fixed provider");
+  if (input.pseudoTty && input.provider !== "cursor") invalid("Pseudo-TTY is restricted to the fixed Cursor diagnostic launcher");
 
   const args = [
     "--die-with-parent",
@@ -107,7 +114,7 @@ export function buildSandboxCommand(input: {
     "--unshare-pid",
     "--unshare-ipc",
     "--unshare-uts",
-    ...(input.profile === "validation" ? ["--unshare-net"] : []),
+    ...(input.profile === "validation" || input.pseudoTty ? ["--unshare-net"] : []),
     "--clearenv",
     "--ro-bind", "/usr", "/usr",
     "--ro-bind", "/bin", "/bin",
@@ -125,7 +132,7 @@ export function buildSandboxCommand(input: {
 
   addOptionalSystemFiles(args);
   const mappedCommand = input.provider
-    ? addProviderRuntime(args, input.provider, input.command)
+    ? addProviderRuntime(args, input.provider, input.command, { codex: input.codexRuntime, cursor: input.cursorRuntime, claude: input.claudeRuntime })
     : addValidationRuntime(args, input.command);
 
   if (input.profile === "agent_implement") {
@@ -147,7 +154,9 @@ export function buildSandboxCommand(input: {
 
   const innerEnv = sandboxEnvironment(input.profile, input.provider, input.env);
   for (const [name, value] of Object.entries(innerEnv)) args.push("--setenv", name, value);
-  args.push("--chdir", SANDBOX_PROJECT_ROOT, "--", mappedCommand.binary, ...mappedCommand.args);
+  const executable = input.pseudoTty ? "/usr/bin/script" : mappedCommand.binary;
+  const executableArgs = input.pseudoTty ? ["-qefc", shellCommand(mappedCommand.binary, mappedCommand.args), "/dev/null"] : mappedCommand.args;
+  args.push("--chdir", SANDBOX_PROJECT_ROOT, "--", executable, ...executableArgs);
 
   return {
     binary: BWRAP_BINARY,
@@ -202,31 +211,37 @@ function runProbe(binary: string) {
   });
 }
 
-function addProviderRuntime(args: string[], provider: AgentId, command: { binary: string; args: readonly string[] }) {
+function addProviderRuntime(args: string[], provider: AgentId, command: { binary: string; args: readonly string[] }, runtimes: { codex?: StagedCodexRuntimeBinding; cursor?: StagedCursorRuntimeBinding; claude?: StagedClaudeRuntimeBinding }) {
   const hostHome = homedir();
   if (provider === "codex") {
     if (command.binary !== "codex") invalid("Codex provider command is not fixed");
-    const nodeRoot = nodeInstallationRoot();
-    const packageRoot = join(nodeRoot, "lib", "node_modules", "@openai", "codex");
-    addNodeRuntime(args, false);
-    args.push("--ro-bind", packageRoot, "/opt/multiagents/codex");
+    if (!runtimes.codex) invalid("Codex sandbox requires a fresh runtime binding");
+    const runtime = runtimes.codex;
+    if (!runtime.stagedExecutable.startsWith("/")) invalid("Codex immutable runtime binding is invalid");
+    args.push("--dir", "/opt/multiagents/codex", "--ro-bind", runtime.stagedExecutable, "/opt/multiagents/codex/codex");
     addCredentialFile(args, join(hostHome, ".codex", "auth.json"), join(SANDBOX_HOME, ".codex", "auth.json"));
-    return { binary: "/opt/multiagents/node/bin/node", args: ["/opt/multiagents/codex/bin/codex.js", ...command.args] };
+    return { binary: "/opt/multiagents/codex/codex", args: [...command.args] };
   }
   if (provider === "cursor") {
     if (command.binary !== "agent") invalid("Cursor provider command is not fixed");
-    const launcher = join(hostHome, ".local", "bin", "agent");
-    const runtimeRoot = dirname(realpathKnown(launcher));
-    args.push("--ro-bind", runtimeRoot, "/opt/multiagents/cursor");
+    if (!runtimes.cursor?.stagedRuntimeRoot.startsWith("/")) invalid("Cursor sandbox requires an immutable runtime binding");
+    args.push("--ro-bind", runtimes.cursor.stagedRuntimeRoot, "/opt/multiagents/cursor");
     addCredentialFile(args, join(hostHome, ".config", "cursor", "auth.json"), join(SANDBOX_HOME, ".config", "cursor", "auth.json"));
     return { binary: "/opt/multiagents/cursor/cursor-agent", args: [...command.args] };
   }
   const expected = join(hostHome, ".local", "bin", "claude");
   if (command.binary !== expected) invalid("Claude provider command is not fixed");
-  args.push("--ro-bind", realpathKnown(expected), "/opt/multiagents/claude");
+  if (!runtimes.claude?.stagedExecutable.startsWith("/")) invalid("Claude sandbox requires an immutable runtime binding");
+  args.push("--ro-bind", runtimes.claude.stagedExecutable, "/opt/multiagents/claude");
   addCredentialFile(args, join(hostHome, ".claude", ".credentials.json"), join(SANDBOX_HOME, ".claude", ".credentials.json"));
   return { binary: "/opt/multiagents/claude", args: [...command.args] };
 }
+
+export type CodexRuntimeResolution = { source: "optional" | "vendor"; mainPackageRoot: string; installRoot: string; packageRoot: string; packageJson: string; nativeExecutable: string; optionalPackageName: string };
+export type CodexRuntimeBinding = CodexRuntimeResolution & { nativeIdentity: ExecutableContentIdentity };
+export type StagedCodexRuntimeBinding = CodexRuntimeBinding & { stagedExecutable: string; stagedDigest: string };
+export type StagedCursorRuntimeBinding = { stagedRuntimeRoot: string; aggregateDigest: string };
+export type StagedClaudeRuntimeBinding = { stagedExecutable: string; digest: string };
 
 function addValidationRuntime(args: string[], command: { binary: string; args: readonly string[] }) {
   const binary = requireAbsoluteSafePath(command.binary, "validation executable");
@@ -324,10 +339,6 @@ function firstHomeChild(path: string) {
 }
 
 function nodeInstallationRoot() { return dirname(dirname(process.execPath)); }
-function realpathKnown(path: string) {
-  try { return realpathSync(path); }
-  catch { throw new OsSandboxUnavailableError("sandbox_launch_failed", "Provider runtime is unavailable."); }
-}
 function existsKnown(path: string) { try { accessSync(path, constants.F_OK); return true; } catch { return false; } }
 function isRegularKnown(path: string) { try { const info = lstatSync(path); return info.isFile() && !info.isSymbolicLink(); } catch { return false; } }
 function requireAbsoluteSafePath(path: string, label: string) {
@@ -338,5 +349,6 @@ function requireAbsoluteSafePath(path: string, label: string) {
 }
 function safeLocale(value: string | undefined) { return value && /^[A-Za-z0-9_.@-]{1,64}$/.test(value) ? value : "C.UTF-8"; }
 function safeTerm(value: string | undefined) { return value && /^[A-Za-z0-9_.+-]{1,64}$/.test(value) ? value : "xterm-256color"; }
+function shellCommand(binary: string, args: readonly string[]) { return [binary, ...args].map((value) => `'${value.replaceAll("'", "'\\''")}'`).join(" "); }
 function safeNodeEnv(value: string | undefined): "development" | "production" | "test" { return value === "production" || value === "test" ? value : "development"; }
 function invalid(message: string): never { throw new OsSandboxUnavailableError("invalid_sandbox_configuration", message); }

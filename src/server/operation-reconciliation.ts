@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import { lstat, realpath } from "node:fs/promises";
 import { getStateStore } from "./state-store";
 import { lsRemoteTransport, runGit } from "./git";
@@ -6,7 +5,7 @@ import { validatedTaskRemoteUrl } from "./pull-request";
 import { getTask, listTasks, persistTask } from "./tasks";
 import type { DurableOperation } from "../operations/types";
 import { reconcileStaleSlackDeliveries } from "./outbound-notifications";
-import { registerChildProcess } from "./child-process-registry";
+import { GH_BINARY, runFixedProcess } from "./pull-request";
 
 type PullMatch = { number: number; url: string; headRefOid: string; headRefName: string; baseRefName: string };
 type ReconcileDependencies = { findPullRequests?: (taskId: string) => Promise<PullMatch[]>; now?: Date };
@@ -133,28 +132,14 @@ async function findPullRequests(task: NonNullable<ReturnType<typeof getTask>>): 
   const match = task.originUrl.match(/^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/)
     ?? task.originUrl.match(/^git@github\.com:([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/);
   if (!match) throw new Error("GitHub origin is unsupported");
-  const output = await spawnBounded("/usr/bin/gh", ["pr", "list", "--repo", `${match[1]}/${match[2]}`, "--state", "open", "--head", task.branch, "--base", task.baseBranch, "--json", "number,url,headRefOid,headRefName,baseRefName"], task.worktreePath);
+  const result = await runFixedProcess(GH_BINARY, ["pr", "list", "--repo", `${match[1]}/${match[2]}`, "--state", "open", "--head", task.branch, "--base", task.baseBranch, "--json", "number,url,headRefOid,headRefName,baseRefName"], task.worktreePath, 30_000);
+  if (result.timedOut || result.code !== 0 || result.stdoutTruncated || result.stderrTruncated) throw new Error("GitHub read-only reconciliation unavailable");
+  const output = result.stdout;
   const parsed: unknown = JSON.parse(output);
   if (!Array.isArray(parsed)) throw new Error("GitHub PR response is invalid");
   return parsed.filter(isPullMatch);
 }
 
-function spawnBounded(binary: string, args: string[], cwd: string) {
-  return new Promise<string>((resolve, reject) => {
-    const child = spawn(binary, args, { cwd, shell: false, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
-    const registration = registerChildProcess({ child, purpose: "github" });
-    let stdout = ""; let stderr = "";
-    child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => { if (stdout.length < 200_000) stdout += chunk; });
-    child.stderr.on("data", (chunk: string) => { if (stderr.length < 2_000) stderr += chunk; });
-    child.once("error", (error) => { registration.unregister(); reject(error); });
-    child.once("close", (code) => {
-      registration.unregister();
-      if (code === 0) resolve(stdout);
-      else reject(new Error(`GitHub read-only reconciliation failed (${code}): ${stderr.slice(0, 400)}`));
-    });
-  });
-}
 function stringMeta(operation: DurableOperation, key: string) {
   const value = operation.safeMetadata[key];
   if (typeof value !== "string" || !value) throw new Error(`Operation metadata ${key} is missing`);
