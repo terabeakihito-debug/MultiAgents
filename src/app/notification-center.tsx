@@ -121,7 +121,7 @@ export function NotificationCenter({ repos, refreshToken, onOpenTask, onError }:
   }
 
   return <div className="notificationRoot">
-    <button type="button" className="notificationBell" aria-haspopup="dialog" aria-expanded={open} onClick={() => setOpen((value) => !value)} aria-label={`${unreadCount} unread notifications`}>🔔 <strong>{unreadCount}</strong></button>
+    <button type="button" className="notificationBell" aria-haspopup="dialog" aria-expanded={open} onClick={() => setOpen((value) => !value)} aria-label={`${unreadCount} unread issues`}>Issues <strong>{unreadCount}</strong></button>
     {open ? <section className="notificationPanel" role="dialog" aria-label="Notifications">
       <div className="notificationHeading"><div><span className="eyebrow">Operational alerts</span><h2>Notifications</h2><p>Unread {unreadCount}</p></div><button type="button" className="secondary compactButton" onClick={() => void mutate("/api/notifications/read-all", "notification-read-all").catch((error: unknown) => onError(message(error)))}>Mark all as read</button></div>
       <div className="notificationFilters">

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { taskBuckets, type DashboardCounts, type DashboardResponse, type DashboardTask, type TaskBucket } from "@/dashboard/types";
 import { RemediationQueue } from "./remediation-queue";
 import { humanMutationFetch } from "./human-mutation";
@@ -11,11 +11,13 @@ type Props = {
   repos: Repo[];
   busy: boolean;
   refreshToken: number;
-  view: "tasks" | "findings" | "operations";
-  onViewChange: (view: "tasks" | "findings" | "operations") => void;
+  view: "tasks" | "findings" | "operations" | "settings";
+  onViewChange: (view: "tasks" | "findings" | "operations" | "settings") => void;
   onResume: (taskId: string) => void;
   onHistory: (taskId: string, label: string) => void;
   onError: (error: string) => void;
+  settings?: ReactNode;
+  startTask?: ReactNode;
 };
 
 const bucketLabels: Record<TaskBucket, string> = {
@@ -38,16 +40,17 @@ const taskStatuses = [
 export function TaskDashboard(props: Props) {
   const { view, onViewChange } = props;
   return <section className="dashboardShell">
-    <div className="dashboardTabs" role="tablist" aria-label="Operations dashboard">
+    <nav className="dashboardTabs" aria-label="Primary navigation">
       <button id="tasks-tab" type="button" role="tab" aria-selected={view === "tasks"} aria-controls="tasks-view" className={view === "tasks" ? "selected" : ""} onClick={() => onViewChange("tasks")}>Tasks</button>
       <button id="findings-tab" type="button" role="tab" aria-selected={view === "findings"} aria-controls="findings-view" className={view === "findings" ? "selected" : ""} onClick={() => onViewChange("findings")}>Findings</button>
       <button id="operations-tab" type="button" role="tab" aria-selected={view === "operations"} aria-controls="operations-view" className={view === "operations" ? "selected" : ""} onClick={() => onViewChange("operations")}>Operations</button>
-    </div>
-    {view === "tasks" ? <div id="tasks-view" role="tabpanel" aria-labelledby="tasks-tab"><TaskDashboardContent {...props} /></div> : view === "findings" ? <div id="findings-view" role="tabpanel" aria-labelledby="findings-tab"><RemediationQueue repos={props.repos} busy={props.busy} refreshToken={props.refreshToken} onOpenTask={props.onResume} onHistory={props.onHistory} onError={props.onError} /></div> : <div id="operations-view" role="tabpanel" aria-labelledby="operations-tab"><OperationalHealthPanel onOpenTask={props.onResume} /></div>}
+      <button id="settings-tab" type="button" role="tab" aria-selected={view === "settings"} aria-controls="settings-view" className={view === "settings" ? "selected" : ""} onClick={() => onViewChange("settings")}>Settings</button>
+    </nav>
+    {view === "tasks" ? <div id="tasks-view" role="tabpanel" aria-labelledby="tasks-tab"><TaskDashboardContent {...props} /></div> : view === "findings" ? <div id="findings-view" role="tabpanel" aria-labelledby="findings-tab"><RemediationQueue repos={props.repos} busy={props.busy} refreshToken={props.refreshToken} onOpenTask={props.onResume} onHistory={props.onHistory} onError={props.onError} /></div> : view === "operations" ? <div id="operations-view" role="tabpanel" aria-labelledby="operations-tab"><OperationalHealthPanel onOpenTask={props.onResume} /></div> : <div id="settings-view" role="tabpanel" aria-labelledby="settings-tab">{props.settings}</div>}
   </section>;
 }
 
-function TaskDashboardContent({ repos, busy, refreshToken, onResume, onHistory, onError }: Props) {
+function TaskDashboardContent({ repos, busy, refreshToken, onResume, onHistory, onError, startTask }: Props) {
   const [tasks, setTasks] = useState<DashboardTask[]>([]);
   const [counts, setCounts] = useState<DashboardCounts>(emptyCounts);
   const [bucket, setBucket] = useState<TaskBucket | "">("");
@@ -112,12 +115,16 @@ function TaskDashboardContent({ repos, busy, refreshToken, onResume, onHistory, 
     finally { setActionTaskId(""); }
   }
 
+  const attentionTasks = tasks.filter((task) => task.bucket === "needs_attention" || task.bucket === "ready_for_approval").slice(0, 5);
+  const recentTasks = tasks.slice(0, 5);
+  const [allTasks, setAllTasks] = useState(false);
+
   return <section className="dashboard" aria-labelledby="dashboard-title">
-    <div className="dashboardTitle"><div><span className="eyebrow">Operational task dashboard</span><h2 id="dashboard-title">Tasks</h2></div><button type="button" className="secondary" onClick={() => setRefreshSequence((value) => value + 1)}>Refresh dashboard</button></div>
-    <div className="bucketGrid" aria-label="Task buckets">
-      {taskBuckets.map((value) => <button type="button" key={value} className={`bucketTile ${bucket === value ? "selected" : ""}`} aria-pressed={bucket === value} onClick={() => { setBucket((current) => current === value ? "" : value); if (value === "archived") setIncludeArchived(true); }}><span>{bucketLabels[value]}</span><strong>{counts[value]}</strong></button>)}
-    </div>
-    <div className="dashboardFilters">
+    <div className="tasksPageTitle"><div><span className="eyebrow">Workspace</span><h2 id="dashboard-title">Tasks</h2><p>Start work, review changes, and follow up safely.</p></div><button type="button" className="refreshButton" onClick={() => setRefreshSequence((value) => value + 1)}>Refresh</button></div>
+    {startTask}
+    {!loading && attentionTasks.length > 0 ? <section className="taskSection attentionSection" aria-labelledby="attention-title"><div className="sectionHeading"><div><h2 id="attention-title">Needs your attention</h2><p>Only tasks waiting for a human decision or recovery.</p></div>{counts.needs_attention + counts.ready_for_approval > 5 ? <button type="button" className="secondary" onClick={() => setAllTasks(true)}>View all attention tasks</button> : null}</div><div className="attentionCards">{attentionTasks.map((task) => <TaskCard key={task.id} task={task} busy={busy || actionTaskId === task.id} onResume={onResume} onHistory={onHistory} onRefreshPr={refreshPr} onCleanup={setCleanupTask} attention />)}</div></section> : null}
+    <section className="taskSection recentSection" aria-labelledby="recent-title"><div className="sectionHeading"><div><h2 id="recent-title">Recent tasks</h2><p>{loading ? "Loading tasks…" : "Your five most recently updated tasks."}</p></div><button type="button" className="secondary" onClick={() => setAllTasks((value) => !value)}>{allTasks ? "Show recent" : "View all tasks"}</button></div>
+    {!allTasks ? (loading ? null : recentTasks.length ? <div className="recentList">{recentTasks.map((task) => <RecentTaskRow key={task.id} task={task} onOpen={onResume} />)}</div> : <section className="readyToStart"><h3>Ready to start</h3><p>Create a task above when you are ready.</p></section>) : <><details className="dashboardFilters" open><summary>Search and filter all tasks</summary><div className="dashboardFiltersInner">
       <label>Repository<select value={repo} onChange={(event) => setRepo(event.target.value)}><option value="">All repositories</option>{repos.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
       <label>Bucket<select value={bucket} onChange={(event) => setBucket(event.target.value as TaskBucket | "")}><option value="">All buckets</option>{taskBuckets.map((value) => <option key={value} value={value}>{bucketLabels[value]}</option>)}</select></label>
       <label>Status<select value={status} onChange={(event) => setStatus(event.target.value)}><option value="">All statuses</option>{taskStatuses.map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
@@ -125,30 +132,31 @@ function TaskDashboardContent({ repos, busy, refreshToken, onResume, onHistory, 
       <label>Sort<select value={sort} onChange={(event) => setSort(event.target.value)}><option value="updated_desc">Recently updated</option><option value="created_desc">Recently created</option><option value="repo_name">Repository name</option></select></label>
       <label className="searchFilter">Search<input type="search" maxLength={120} value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Repo, task summary, branch, PR #" /></label>
       <label className="archiveToggle"><input type="checkbox" checked={includeArchived} onChange={(event) => { setIncludeArchived(event.target.checked); if (!event.target.checked && bucket === "archived") setBucket(""); }} /> Include archived</label>
-    </div>
-    {loading ? <p className="muted">Loading tasks…</p> : tasks.length ? <div className="dashboardTasks">{tasks.map((task) => <TaskCard key={task.id} task={task} busy={busy || actionTaskId === task.id} onResume={onResume} onHistory={onHistory} onRefreshPr={refreshPr} onCleanup={setCleanupTask} />)}</div> : <p className="emptyDashboard">No tasks match these filters.</p>}
+    </div></details>{loading ? <p className="muted">Loading tasks…</p> : <div className="allTasksList">{tasks.map((task) => <RecentTaskRow key={task.id} task={task} onOpen={onResume} />)}</div>}</>}</section>
     {cleanupTask ? <div className="dialogBackdrop" role="presentation"><section className="cleanupDialog" role="dialog" aria-modal="true" aria-labelledby="cleanup-title"><span className="eyebrow">Safe cleanup</span><h2 id="cleanup-title">Delete managed task worktree?</h2><dl><div><dt>Repository</dt><dd>{cleanupTask.repoName}</dd></div><div><dt>Branch</dt><dd><code>{cleanupTask.branch}</code></dd></div></dl><p>{cleanupTask.cleanup.warning || "The task history will be retained locally."}</p><p>This will not delete the GitHub branch or PR.</p><div className="dialogActions"><button type="button" className="secondary" disabled={Boolean(actionTaskId)} onClick={() => setCleanupTask(null)}>Cancel</button><button type="button" className="danger" disabled={!cleanupTask.cleanup.allowed || Boolean(actionTaskId)} onClick={() => void cleanup(cleanupTask)}>{actionTaskId ? "Deleting…" : "Delete worktree"}</button></div></section></div> : null}
   </section>;
 }
 
-function TaskCard({ task, busy, onResume, onHistory, onRefreshPr, onCleanup }: { task: DashboardTask; busy: boolean; onResume: Props["onResume"]; onHistory: Props["onHistory"]; onRefreshPr: (task: DashboardTask) => void; onCleanup: (task: DashboardTask) => void }) {
+function TaskCard({ task, busy, onResume, onHistory, onRefreshPr, onCleanup, attention = false }: { task: DashboardTask; busy: boolean; onResume: Props["onResume"]; onHistory: Props["onHistory"]; onRefreshPr: (task: DashboardTask) => void; onCleanup: (task: DashboardTask) => void; attention?: boolean }) {
   return <article className={`dashboardCard bucket-${task.bucket}`}>
-    <div className="taskCardTop"><div><span className="repoName">{task.repoName}</span><h3>{task.summary}</h3></div><span className={`bucketBadge ${task.bucket}`}>{bucketLabels[task.bucket]}</span></div>
-    <div className="taskState"><code>{task.status}</code>{task.inactive ? <span className="inactiveBadge">INACTIVE · {relativeTime(task.updatedAt)}</span> : null}</div>
-    <dl className="taskFacts"><div><dt>Profile</dt><dd>{task.profileName} v{task.profileVersion}</dd></div><div><dt>Template</dt><dd>{task.templateName} v{task.templateVersion}</dd></div><div><dt>Branch</dt><dd><code>{task.branch}</code></dd></div><div><dt>Base</dt><dd>{baseLabel(task)}</dd></div><div><dt>PR</dt><dd>{task.prNumber ? `#${task.prNumber}${task.prState ? ` · ${task.prState}` : ""}` : "None"}</dd></div><div><dt>Recovery</dt><dd>{task.recoveryStatus}</dd></div><div><dt>Worktree</dt><dd>{task.worktreeInventoryStatus || task.worktreeStatus}{task.worktreeDirty === true ? " · dirty" : ""}</dd></div><div><dt>Size / age</dt><dd>{task.worktreeSizeBytes === undefined ? "—" : `${formatBytes(task.worktreeSizeBytes)} · ${Math.floor(task.worktreeAgeHours || 0)}h`}</dd></div><div><dt>Cleanup</dt><dd>{task.cleanupCandidate ? "Candidate" : "Retain"}</dd></div><div><dt>Updated</dt><dd>{relativeTime(task.updatedAt)}</dd></div></dl>
-    {task.source ? <div className="taskSource"><strong>Source</strong><p>Finding {task.source.severity.toUpperCase()} — {task.source.title}</p></div> : null}
-    {task.attentionReason ? <div className="attentionReason"><strong>Reason</strong><p>{task.attentionReason}</p></div> : null}
-    <div className="nextAction"><span>Next</span><strong>{task.nextActionLabel}</strong></div>
-    <div className="taskCardActions">
-      <button type="button" disabled={busy || !task.canResume} onClick={() => onResume(task.id)}>Resume</button>
-      <button type="button" className="secondary" disabled={busy || !task.canViewDiff} title={task.canViewDiff ? "Open current diff" : "Diff unavailable without a recoverable worktree"} onClick={() => onResume(task.id)}>Diff</button>
-      <button type="button" className="secondary" disabled={busy} onClick={() => onHistory(task.id, `${task.repoName} — ${task.summary}`)}>History</button>
-      {task.prUrl ? <a className="buttonLink" href={task.prUrl} target="_blank" rel="noreferrer">Open PR</a> : null}
-      {task.canRefreshPr ? <button type="button" className="secondary" disabled={busy} onClick={() => void onRefreshPr(task)}>Refresh PR status</button> : null}
-      <button type="button" className="cleanupButton" disabled={busy || !task.cleanup.allowed} title={task.cleanup.blockedReason} onClick={() => onCleanup(task)}>Cleanup</button>
-    </div>
+    <div className="taskCardTop"><div><h3>{task.summary}</h3><p className="taskCardMeta">{task.repoName} · {task.templateName}</p></div></div>
+    <div className="taskState"><span className={`status ${task.status}`}>{task.nextActionLabel || task.status.replaceAll("_", " ")}</span></div>
+    <p className="nextActionExplanation">{actionExplanation(task)}</p>
+    {attention ? <div className="taskCardActions"><button type="button" disabled={busy || !task.canResume} onClick={() => onResume(task.id)}>{task.nextActionLabel || "Open task"}</button></div> : null}
+    <details className="cardDetails"><summary>Details</summary><div>{task.attentionReason ? <p>{task.attentionReason}</p> : null}<button type="button" className="secondary" disabled={busy} onClick={() => onHistory(task.id, `${task.repoName} — ${task.summary}`)}>History</button>{task.prUrl ? <a className="buttonLink" href={task.prUrl} target="_blank" rel="noreferrer">Open PR</a> : null}{task.canRefreshPr ? <button type="button" className="secondary" disabled={busy} onClick={() => void onRefreshPr(task)}>Refresh PR status</button> : null}<p>Branch: <code>{task.branch}</code> · Profile: {task.profileName} v{task.profileVersion}</p><button type="button" className="cleanupButton" disabled={busy || !task.cleanup.allowed} title={task.cleanup.blockedReason} onClick={() => onCleanup(task)}>Cleanup worktree</button></div></details>
     {task.cleanup.blockedReason ? <small className="cleanupBlocked">{task.cleanup.blockedReason}</small> : null}
   </article>;
+}
+
+function RecentTaskRow({ task, onOpen }: { task: DashboardTask; onOpen: Props["onResume"] }) {
+  return <article className="recentTaskRow"><div><button type="button" className="taskTitleLink" onClick={() => onOpen(task.id)}>{task.summary}</button><p>{task.repoName} · {task.templateName}</p></div><span className={`status ${task.status}`}>{task.status.replaceAll("_", " ")}</span><time>{relativeTime(task.updatedAt)}</time><button type="button" className="secondary compactOpen" onClick={() => onOpen(task.id)}>Open</button></article>;
+}
+
+function actionExplanation(task: DashboardTask) {
+  if (task.bucket === "ready_for_approval") return "Changes are ready for your review.";
+  if (task.recoveryStatus !== "recoverable") return "This task needs a safe recovery decision.";
+  if (task.status === "pr_created") return "The pull request is open and ready for follow-up.";
+  return "Open the task to take the next safe action.";
 }
 
 function relativeTime(value: string) {
