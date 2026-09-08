@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, open, readlink, realpath } from "node:fs/promises";
+import { lstat, mkdir, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, relative, sep } from "node:path";
 import { runGit } from "./git";
@@ -127,8 +127,6 @@ export type TaskDiff = {
 
 export const MAX_UNTRACKED_FILE_BYTES = 100_000;
 export const MAX_UNTRACKED_TOTAL_BYTES = 500_000;
-const MAX_UNTRACKED_FILES = 1_000;
-const EXCLUDED_PARTS = new Set([".git", ".next", "node_modules"]);
 const tasks = new Map<string, RepoTask>();
 let tasksLoaded = false;
 let recoveryPromise: Promise<void> | undefined;
@@ -529,73 +527,12 @@ export function recordFlowEvent(task: RepoTask, event: FlowEvent | ReviewRerunEv
 }
 
 export async function getTaskDiff(task: RepoTask): Promise<TaskDiff> {
-  const root = await realpath(task.worktreePath);
-  const [statOutput, patch, trackedOutput, untrackedOutput] = await Promise.all([
-    runGit(root, ["diff", "--stat", "HEAD", "--"]),
-    runGit(root, ["diff", "--binary", "--full-index", "--no-ext-diff", "HEAD", "--"]),
-    runGit(root, ["diff", "--name-only", "HEAD", "--"]),
-    runGit(root, ["ls-files", "--others", "--exclude-standard", "-z"]),
-  ]);
-  const trackedFiles = trackedOutput ? trackedOutput.split("\n") : [];
-  const allCandidates = untrackedOutput.split("\0").filter(Boolean).filter((name) => !name.split(/[\\/]/).some((part) => EXCLUDED_PARTS.has(part)));
-  const candidates = allCandidates.slice(0, MAX_UNTRACKED_FILES);
-  const sections: string[] = [];
-  const untrackedFiles: string[] = [];
-  let totalBytes = 0;
-  let truncated = allCandidates.length > candidates.length;
-  let blockedReason = truncated ? "The untracked file list exceeds the review display limit." : undefined;
-  for (const name of candidates) {
-    const path = join(root, name);
-    const info = await lstat(path);
-    const nameBytes = Buffer.byteLength(name, "utf8");
-    if (totalBytes + nameBytes > MAX_UNTRACKED_TOTAL_BYTES) { truncated = true; blockedReason ??= "Untracked content exceeds the total review display limit."; break; }
-    totalBytes += nameBytes;
-    if (info.isSymbolicLink()) {
-      untrackedFiles.push(name);
-      sections.push(`Untracked symlink (content omitted): ${JSON.stringify(name)} -> ${JSON.stringify(await readlink(path))}`);
-      continue;
-    }
-    if (!info.isFile()) continue;
-    const target = await realpath(path);
-    const rel = relative(root, target);
-    if (!rel || rel === ".." || rel.startsWith(`..${sep}`)) continue;
-    untrackedFiles.push(name);
-    if (totalBytes >= MAX_UNTRACKED_TOTAL_BYTES) { truncated = true; blockedReason ??= "Untracked content exceeds the total review display limit."; break; }
-    const allowance = Math.min(MAX_UNTRACKED_FILE_BYTES, MAX_UNTRACKED_TOTAL_BYTES - totalBytes);
-    const handle = await open(target, "r");
-    try {
-      const buffer = Buffer.alloc(allowance + 1);
-      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-      const data = buffer.subarray(0, Math.min(bytesRead, allowance));
-      totalBytes += data.length;
-      const limited = bytesRead > allowance || info.size > allowance;
-      if (limited) { truncated = true; blockedReason ??= `Untracked file ${JSON.stringify(name)} exceeds the review display limit.`; }
-      let body: string;
-      try { body = new TextDecoder("utf-8", { fatal: true }).decode(data); }
-      catch {
-        blockedReason ??= `Untracked binary file ${JSON.stringify(name)} cannot be fully reviewed in this UI.`;
-        sections.push(`Binary/untracked file (content omitted): ${JSON.stringify(name)}`);
-        continue;
-      }
-      if (data.includes(0)) {
-        blockedReason ??= `Untracked binary file ${JSON.stringify(name)} cannot be fully reviewed in this UI.`;
-        sections.push(`Binary/untracked file (content omitted): ${JSON.stringify(name)}`);
-        continue;
-      }
-      const lines = body.split("\n").map((line) => `+${line}`).join("\n");
-      sections.push(`diff --git a/${name} b/${name}\nnew file mode ${info.mode & 0o111 ? "100755" : "100644"}\n--- /dev/null\n+++ b/${name}\n@@ untracked file @@\n${lines}${limited ? "\n[untracked file truncated]" : ""}`);
-    } finally { await handle.close(); }
+  try {
+    const { createDiffSnapshot, taskDiffFromSnapshot } = await import("./pull-request");
+    return taskDiffFromSnapshot(await createDiffSnapshot(task));
+  } catch (error) {
+    return { trackedFiles: [], untrackedFiles: [], stat: "", patch: "", untrackedPatch: "", truncated: true, approvable: false, blockedReason: error instanceof Error ? error.message : "The approval snapshot cannot be displayed safely." };
   }
-  return redactKnownSecretsInValue({
-    trackedFiles,
-    untrackedFiles,
-    stat: statOutput,
-    patch,
-    untrackedPatch: sections.join("\n\n"),
-    truncated,
-    approvable: !blockedReason,
-    blockedReason,
-  });
 }
 
 export async function deleteTask(id: string, input: { confirmedPrCleanup?: boolean } = {}) {

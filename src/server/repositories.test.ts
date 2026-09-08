@@ -38,12 +38,12 @@ describe("repository discovery and isolated worktrees", () => {
     expect(task.branch).toMatch(/^multiagents\/[0-9a-f-]{36}$/);
     expect(await runGit(task.worktreePath, ["branch", "--show-current"])).toBe(task.branch);
     await writeFile(join(task.worktreePath, "README.md"), "initial\nisolated\n");
-    const diff = await getTaskDiff(task); expect(diff.stat).toContain("README.md"); expect(diff.patch).toContain("+isolated");
+    const diff = await getTaskDiff(task); expect(diff.approvable, diff.blockedReason).toBe(true); expect(diff.stat).toContain("README.md"); expect(diff.patch).toContain("+isolated");
     expect(await runGit(join(allowed, "clean"), ["status", "--porcelain"])).toBe("");
     await expect(deleteTask(task.id)).rejects.toThrow("uncommitted changes");
     await runGit(task.worktreePath, ["restore", "README.md"]); await deleteTask(task.id);
   });
-  it("shows safe untracked text, identifies binary, excludes build directories, and omits symlink content", async () => {
+  it("shows every untracked approval entry, identifies binary, and renders a symlink target without reading its target", async () => {
     const allowed = await root(); await repo(allowed, "files");
     const task = await createTask("files", { allowedRoot: allowed, worktreeRoot: join(await root(), "worktrees") });
     await writeFile(join(task.worktreePath, "new.txt"), "こんにちは\n");
@@ -51,11 +51,12 @@ describe("repository discovery and isolated worktrees", () => {
     await mkdir(join(task.worktreePath, "node_modules")); await writeFile(join(task.worktreePath, "node_modules", "secret.txt"), "excluded");
     const outside = join(await root(), "outside.txt"); await writeFile(outside, "must not be read"); await symlink(outside, join(task.worktreePath, "escape.txt"));
     const diff = await getTaskDiff(task);
-    expect(diff.untrackedFiles).toEqual(["escape.txt", "image.bin", "new.txt"]);
+    expect(diff.untrackedFiles).toEqual(["escape.txt", "image.bin", "new.txt", "node_modules/secret.txt"]);
     expect(diff.untrackedPatch).toContain("+こんにちは");
-    expect(diff.untrackedPatch).toContain("Binary/untracked file");
-    expect(diff.untrackedPatch).toContain("Untracked symlink (content omitted)");
+    expect(diff.untrackedPatch).toContain("[binary content omitted]");
+    expect(diff.untrackedPatch).toContain("symlink target:");
     expect(diff.untrackedPatch).not.toContain("must not be read");
-    expect(diff.untrackedPatch).not.toContain("excluded");
+    expect(diff.untrackedPatch).toContain("excluded");
+    expect(diff.approvable).toBe(false);
   });
 });

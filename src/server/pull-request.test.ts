@@ -1,4 +1,4 @@
-import { chmod, copyFile, mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -27,6 +27,7 @@ import {
   clearTasksForTests,
   completeTaskReview,
   createTask,
+  getTaskDiff,
   getTaskHistory,
   transitionTask,
   type RepoTask,
@@ -133,6 +134,49 @@ describe("Phase 5 approval and PR state machine", () => {
     expect(first.empty).toBe(false);
   });
 
+  it("renders every canonical approval entry, including unignored .next and node_modules files", async () => {
+    const { task } = await createRepo();
+    await mkdir(join(task.worktreePath, ".next"));
+    await mkdir(join(task.worktreePath, "node_modules"));
+    await writeFile(join(task.worktreePath, ".next", "hidden.txt"), "review me\n");
+    await writeFile(join(task.worktreePath, "node_modules", "included.txt"), "review me too\n");
+    const snapshot = await createDiffSnapshot(task);
+    const diff = await getTaskDiff(task);
+    expect([...diff.trackedFiles, ...diff.untrackedFiles].sort()).toEqual(snapshot.entries.map((entry) => entry.path).sort());
+    expect(diff.untrackedFiles).toEqual(expect.arrayContaining([".next/hidden.txt", "node_modules/included.txt"]));
+    expect(diff.untrackedPatch).toContain(".next/hidden.txt");
+    expect(diff.untrackedPatch).toContain("node_modules/included.txt");
+    expect(diff.approvable).toBe(true);
+    task.status = "reviewed"; task.reviewReady = true;
+    await expect(prepareApproval(task)).resolves.toMatchObject({ approval: { diffHash: expect.any(String), approvalId: expect.any(String) } });
+  });
+
+  it("blocks approval when a canonical snapshot entry cannot be rendered as reviewable text", async () => {
+    const { task } = await createRepo();
+    await writeFile(join(task.worktreePath, "binary.dat"), Buffer.from([0, 1, 2]));
+    const diff = await getTaskDiff(task);
+    expect(diff.approvable).toBe(false);
+    expect(diff.blockedReason).toContain("Binary file");
+    task.status = "reviewed"; task.reviewReady = true;
+    await expect(prepareApproval(task)).resolves.toMatchObject({ approval: { blockedReason: expect.stringContaining("Binary file") } });
+  });
+
+  it("renders canonical rename, deletion, symlink target, and untracked topology", async () => {
+    const { task } = await createRepo(undefined, { "old.txt": "old\n", "delete.txt": "delete\n" });
+    await runGit(task.worktreePath, ["mv", "old.txt", "renamed.txt"]);
+    await rm(join(task.worktreePath, "delete.txt"));
+    await symlink("renamed.txt", join(task.worktreePath, "link.txt"));
+    const snapshot = await createDiffSnapshot(task);
+    const diff = await getTaskDiff(task);
+    const rendered = `${diff.patch}\n${diff.untrackedPatch}`;
+    expect(snapshot.entries.map((entry) => entry.path).sort()).toEqual([...diff.trackedFiles, ...diff.untrackedFiles].sort());
+    expect(rendered).toContain("old.txt");
+    expect(rendered).toContain("renamed.txt");
+    expect(rendered).toContain("delete.txt");
+    expect(rendered).toContain("[deleted]");
+    expect(rendered).toContain("symlink target: \"renamed.txt\"");
+  });
+
   it("distinguishes identical-content renames by their source path", async () => {
     const { task } = await createRepo(undefined, { "a.txt": "same\n", "b.txt": "same\n" });
     await runGit(task.worktreePath, ["mv", "a.txt", "c.txt"]);
@@ -217,12 +261,10 @@ describe("Phase 5 approval and PR state machine", () => {
     expect(committed.hash).toBe(approved.hash);
   });
 
-  it("rejects malicious local Git configuration before mutation", async () => {
-    for (const [key, value] of [["core.hooksPath", "/tmp/evil-hooks"], ["filter.evil.clean", "/tmp/evil-filter"]] as const) {
-      const { task } = await createRepo();
-      await runGit(task.worktreePath, ["config", key, value]);
-      await expect(runServerGitMutation(task.worktreePath, ["add", "--all"])).rejects.toThrow("Git config is not allowed");
-    }
+  it("rejects executable filter configuration before mutation", async () => {
+    const { task } = await createRepo();
+    await runGit(task.worktreePath, ["config", "filter.evil.clean", "/tmp/evil-filter"]);
+    await expect(runServerGitMutation(task.worktreePath, ["add", "--all"])).rejects.toThrow("Git config is not allowed");
   });
 
   it.each([

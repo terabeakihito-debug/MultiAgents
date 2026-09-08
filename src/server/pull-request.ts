@@ -6,7 +6,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { GIT_BINARY, runGit, runGitBytes, serverGitMutationInvocation } from "./git";
 import { buildChildProcessEnv, type ChildProcessPurpose } from "./child-process-env";
 import { registerChildProcess, withChildProcessOperation } from "./child-process-registry";
-import { containsKnownSecret, redactKnownSecrets } from "./credential-resolver";
+import { containsKnownSecret, redactKnownSecrets, redactKnownSecretsInValue } from "./credential-resolver";
 import { validateRepository } from "./repositories";
 import { validationScript, validationTimeoutMs, type ValidationStep } from "../profiles/policy";
 import { acquireTaskLock, clearTaskLocksForTests, isTaskLocked, releaseTaskLock } from "./task-lock";
@@ -18,7 +18,6 @@ import {
   MAX_UNTRACKED_TOTAL_BYTES,
   TASK_BRANCH_PATTERN,
   getTask,
-  getTaskDiff,
   invalidateApproval,
   persistTask,
   publicTask,
@@ -31,6 +30,7 @@ import {
   transitionTask,
   type RepoTask,
   type SecretFinding,
+  type TaskDiff,
 } from "./tasks";
 
 export const GH_BINARY = "/usr/bin/gh";
@@ -39,7 +39,7 @@ const MAX_COMMAND_OUTPUT_BYTES = 200_000;
 const PROCESS_TERMINATION_GRACE_MS = 5_000;
 const STDERR_SUMMARY_CHARS = 1_200;
 
-type SnapshotEntry = { status: string; oldPath?: string; path: string; kind: "file" | "symlink" | "deleted"; mode: string; content: Buffer };
+export type SnapshotEntry = { status: string; oldPath?: string; path: string; kind: "file" | "symlink" | "deleted"; mode: string; content: Buffer; untracked?: boolean };
 export type DiffSnapshot = { hash: string; empty: boolean; baseHead: string; treeId: string; entries: SnapshotEntry[] };
 export type ApprovalInput = { approved: true; diffHash: string; approvalId: string };
 export type PullRequestResult = ReturnType<typeof publicTask>;
@@ -108,7 +108,14 @@ export class ApprovalError extends Error {
 
 export async function prepareApproval(task: RepoTask) {
   requireNoRuntimeViolation(task);
-  const diff = await getTaskDiff(task);
+  let snapshot: DiffSnapshot | undefined;
+  let diff: TaskDiff;
+  try {
+    snapshot = await createDiffSnapshot(task);
+    diff = taskDiffFromSnapshot(snapshot);
+  } catch (error) {
+    diff = { trackedFiles: [], untrackedFiles: [], stat: "", patch: "", untrackedPatch: "", truncated: true, approvable: false, blockedReason: error instanceof Error ? error.message : "The approval snapshot cannot be displayed safely." };
+  }
   const template = requireTaskTemplate(task);
   if (template.readOnly || !template.requireHumanApproval || !template.requirePr) {
     invalidateApproval(task);
@@ -116,7 +123,7 @@ export async function prepareApproval(task: RepoTask) {
     return { diff, approval: { blockedReason: "This task template is read-only and forbids commit, push, and pull request creation." }, task: publicTask(task) };
   }
   if (template.taskType === "documentation") {
-    const outOfScope = [...diff.trackedFiles, ...diff.untrackedFiles].find((path) => !isDocumentationPath(path));
+    const outOfScope = snapshot?.entries.map((entry) => entry.path).find((path) => !isDocumentationPath(path));
     if (outOfScope) {
       invalidateApproval(task);
       persistTask(task);
@@ -137,12 +144,10 @@ export async function prepareApproval(task: RepoTask) {
     persistTask(task);
     return { diff, approval: { blockedReason: diff.blockedReason }, task: publicTask(task) };
   }
-  let snapshot: DiffSnapshot;
-  try { snapshot = await createDiffSnapshot(task); }
-  catch (error) {
+  if (!snapshot) {
     invalidateApproval(task);
     persistTask(task);
-    return { diff, approval: { blockedReason: error instanceof Error ? error.message : "The diff cannot be safely approved." }, task: publicTask(task) };
+    return { diff, approval: { blockedReason: diff.blockedReason ?? "The diff cannot be safely approved." }, task: publicTask(task) };
   }
   if (snapshot.empty) {
     invalidateApproval(task);
@@ -490,6 +495,7 @@ async function createCanonicalDiffSnapshot(root: string, baseHead: string, targe
   try {
     const invocation = await serverGitMutationInvocation(root, []);
     const context = { args: invocation.args, env: { ...invocation.env, GIT_INDEX_FILE: indexPath } };
+    const untracked = target ? new Set<string>() : new Set((await runGitBytes(root, ["ls-files", "--others", "--exclude-standard", "-z"], invocation.env)).toString("utf8").split("\0").filter(Boolean));
     await runSnapshotGit(root, context, ["read-tree", target ?? baseHead]);
     if (!target) await runSnapshotGit(root, context, ["add", "--all", "--"]);
     const [tracked, treeIdBuffer] = await Promise.all([
@@ -518,7 +524,7 @@ async function createCanonicalDiffSnapshot(root: string, baseHead: string, targe
       if (!kind) throw new Error(`Changed path ${JSON.stringify(change.path)} is not a regular file or symlink`);
       const content = await runSnapshotGit(root, context, ["cat-file", "blob", indexedEntry.objectId]);
       if (content.length > MAX_UNTRACKED_FILE_BYTES) throw new Error(`Changed file ${JSON.stringify(change.path)} exceeds the approval limit`);
-      entries.push({ ...change, kind, mode: indexedEntry.mode, content });
+      entries.push({ ...change, kind, mode: indexedEntry.mode, content, untracked: untracked.has(change.path) });
       totalBytes += content.length;
       if (totalBytes > MAX_UNTRACKED_TOTAL_BYTES) throw new Error("Changed content exceeds the approval limit");
     }
@@ -541,8 +547,48 @@ async function createCanonicalDiffSnapshot(root: string, baseHead: string, targe
   }
 }
 
+/** The human view is a total projection of the exact canonical approval snapshot. */
+export function taskDiffFromSnapshot(snapshot: DiffSnapshot): TaskDiff {
+  const trackedFiles: string[] = [];
+  const untrackedFiles: string[] = [];
+  const tracked: string[] = [];
+  const untracked: string[] = [];
+  let blockedReason: string | undefined;
+  for (const entry of snapshot.entries) {
+    const destination = entry.untracked ? untracked : tracked;
+    if (entry.untracked) untrackedFiles.push(entry.path); else trackedFiles.push(entry.path);
+    const topology = `${entry.status}${entry.oldPath ? ` ${JSON.stringify(entry.oldPath)} ->` : ""} ${JSON.stringify(entry.path)}`;
+    const header = `diff --multiagents ${topology}\nmode ${entry.mode}\ntype ${entry.kind}`;
+    if (entry.kind === "deleted") { destination.push(`${header}\n[deleted]`); continue; }
+    if (entry.kind === "symlink") {
+      let target: string;
+      try { target = new TextDecoder("utf-8", { fatal: true }).decode(entry.content); }
+      catch { blockedReason ??= `Symlink ${JSON.stringify(entry.path)} has an invalid target.`; destination.push(`${header}\n[symlink target is not valid UTF-8]`); continue; }
+      destination.push(`${header}\nsymlink target: ${JSON.stringify(target)}`);
+      continue;
+    }
+    if (entry.content.includes(0)) {
+      blockedReason ??= `Binary file ${JSON.stringify(entry.path)} cannot be reviewed safely.`;
+      destination.push(`${header}\n[binary content omitted]`);
+      continue;
+    }
+    try {
+      const content = new TextDecoder("utf-8", { fatal: true }).decode(entry.content);
+      destination.push(`${header}\n--- content ---\n${content.split("\n").map((line) => `+${line}`).join("\n")}`);
+    } catch {
+      blockedReason ??= `Binary file ${JSON.stringify(entry.path)} cannot be reviewed safely.`;
+      destination.push(`${header}\n[binary content omitted]`);
+    }
+  }
+  const stat = snapshot.entries.map((entry) => `${entry.status}\t${entry.oldPath ? `${entry.oldPath}\t` : ""}${entry.path}\t${entry.kind}\t${entry.mode}`).join("\n");
+  return redactKnownSecretsInValue({
+    trackedFiles, untrackedFiles, stat, patch: tracked.join("\n\n"), untrackedPatch: untracked.join("\n\n"),
+    truncated: false, approvable: !blockedReason, blockedReason,
+  });
+}
+
 async function runSnapshotGit(root: string, context: { args: readonly string[]; env: NodeJS.ProcessEnv }, args: readonly string[]) {
-  return runGitBytes(root, [...context.args, ...args], context.env);
+  return runGitBytes(root, [...context.args, ...args], context.env, { allowServerIndexFile: true });
 }
 
 function parseIndexEntries(value: string) {
