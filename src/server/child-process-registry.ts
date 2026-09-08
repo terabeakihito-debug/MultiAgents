@@ -28,7 +28,7 @@ export function registerChildProcess(input: { child: ChildProcess; purpose: Regi
   const childPid = input.child.pid;
   // Test doubles and a failed spawn may not expose a PID. They cannot be safely
   // signalled, so deliberately leave them out of the shutdown registry.
-  if (typeof childPid !== "number" || !Number.isSafeInteger(childPid) || childPid < 2) return { id: "", unregister: () => undefined };
+  if (typeof childPid !== "number" || !Number.isSafeInteger(childPid) || childPid < 2) return { id: "", unregister: () => undefined, terminate: async () => false };
   const pid = childPid;
   const id = crypto.randomUUID();
   let resolved = false;
@@ -44,7 +44,7 @@ export function registerChildProcess(input: { child: ChildProcess; purpose: Regi
   input.child.once("close", () => unregisterChildProcess(id));
   input.child.once("error", () => unregisterChildProcess(id));
   audit("child_process_registered", entry);
-  return { id, unregister: () => unregisterChildProcess(id) };
+  return { id, unregister: () => unregisterChildProcess(id), terminate: () => terminateOne(entry) };
 }
 
 export function unregisterChildProcess(id: string) {

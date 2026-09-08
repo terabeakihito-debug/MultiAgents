@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
 import { lstat, realpath } from "node:fs/promises";
 import { getStateStore } from "./state-store";
-import { runGit } from "./git";
+import { lsRemoteTransport, runGit } from "./git";
+import { validatedTaskRemoteUrl } from "./pull-request";
 import { getTask, listTasks, persistTask } from "./tasks";
 import type { DurableOperation } from "../operations/types";
 import { reconcileStaleSlackDeliveries } from "./outbound-notifications";
@@ -79,7 +80,7 @@ async function reconcilePush(operation: DurableOperation) {
   const task = operation.taskId ? getTask(operation.taskId) : undefined;
   if (!task) return void store.updateOperation(operation.operationId, "reconcile_required", undefined, "task_missing");
   const expected = stringMeta(operation, "expectedSha");
-  const output = await runGit(task.worktreePath, ["ls-remote", "--heads", "origin", task.branch]);
+  const output = await lsRemoteTransport(validatedTaskRemoteUrl(task), task.branch);
   const matches = output.split("\n").filter(Boolean).map((line) => line.split(/\s+/)[0]);
   if (!matches.length) {
     task.status = "push_failed"; task.recoveryStatus = "needs_attention"; task.recoveryMessage = "Remote branch was not found; push may be retried by a human.";

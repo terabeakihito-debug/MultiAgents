@@ -191,6 +191,28 @@ function approvalDeps(review: PullRequestReview, overrides: Partial<PrReviewDepe
 }
 
 describe("Phase 6 rework approval and same PR update", () => {
+  it("does not issue an approval for Astra's binary rework fixture", async () => {
+    const { task } = await existingPrTask();
+    const action = reviewFor(task, { items: [{ id: "thread:1", kind: "thread", author: "human", body: "fix", resolved: false, disposition: "action_required", reason: "unresolved" }], unresolvedCount: 1 });
+    await fetchReviewIntake(task.id, fetchDeps(action, actionIntake));
+    const result = await applyReviewedFixes(task.id, { approved: true }, {
+      fetchDiff: async () => "diff",
+      runRework: async () => { await writeFile(join(task.worktreePath, "binary.dat"), Buffer.from([0, 1, 2])); return { status: "completed", steps: [] }; },
+    });
+    expect(result).toMatchObject({ status: "rework_failed", approvalState: "invalidated" });
+    expect(task.approvalId).toBeUndefined();
+    expect(task.diffHash).toBeUndefined();
+  });
+
+  it("blocks a binary introduced after rework approval before commit or push", async () => {
+    const { task, action, input } = await awaitingRework();
+    await writeFile(join(task.worktreePath, "binary.dat"), Buffer.from([0, 1, 2]));
+    const commit = vi.fn(async () => undefined); const push = vi.fn(async () => undefined);
+    await expect(approveRework(task.id, input, approvalDeps(action, { commit, push }))).rejects.toThrow("Approval invalidated");
+    expect(commit).not.toHaveBeenCalled(); expect(push).not.toHaveBeenCalled();
+    expect(task).toMatchObject({ status: "approval_invalidated", approvalState: "invalidated" });
+  });
+
   it("requires a new revised-diff approval and appends a commit on the same branch", async () => {
     const { task, repoPath, action, input } = await awaitingRework();
     const mainBefore = await runGit(repoPath, ["rev-parse", "HEAD"]);

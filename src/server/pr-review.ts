@@ -3,12 +3,13 @@ import { lstat, realpath } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 import { agents } from "../agents";
 import { hasRequiredAction, pullRequestCanBeMergedByHuman, runPrReviewIntake, runPrReworkFlow } from "../flows/pr-review";
-import { runGit } from "./git";
+import { pushCommitTransport, runGit } from "./git";
 import {
   COMMAND_TIMEOUT_MS,
   GH_BINARY,
   ApprovalError,
   createDiffSnapshot,
+  validateSnapshotForHumanApproval,
   runServerGitMutation,
   verifyCommittedApproval,
   verifyStagedApproval,
@@ -16,6 +17,7 @@ import {
   runProjectValidation,
   scanSecrets,
   validateGitHubRemote,
+  validatedTaskRemoteUrl,
   type ApprovalDependencies,
   type ApprovalInput,
 } from "./pull-request";
@@ -58,7 +60,10 @@ const defaults: PrReviewDependencies = {
   runRework: runPrReworkFlow,
   stage: async (task) => { await runServerGitMutation(task.worktreePath, ["add", "--all"]); },
   commit: async (task) => { await runServerGitMutation(task.worktreePath, ["commit", "-m", "multiagents: address PR review"]); },
-  push: async (task) => { await runServerGitMutation(task.worktreePath, ["push", "origin", task.branch]); },
+  push: async (task) => {
+    if (!task.commitSha) throw new Error("Task commit is unavailable for push");
+    await pushCommitTransport(task.worktreePath, validatedTaskRemoteUrl(task), task.commitSha, task.branch);
+  },
   checkGhAuth: async (task) => { await checkedGh(["auth", "status", "--hostname", "github.com"], task.worktreePath); },
   checkDependencies: async (task) => { const { checkTaskDependencies } = await import("./pull-request"); await checkTaskDependencies(task); },
   runValidation: async (task, script, timeoutMs) => { const { runValidationCommand } = await import("./pull-request"); await runValidationCommand(task, script, timeoutMs); },
@@ -170,6 +175,18 @@ export async function applyReviewedFixes(taskId: string, input: { approved: true
       task.error = "Rework produced no revised diff. Nothing was committed or pushed.";
       throw new ApprovalError(task.error);
     }
+    const approvalCheck = validateSnapshotForHumanApproval(task, snapshot);
+    if (approvalCheck.blockedReason) {
+      task.reviewReady = false;
+      task.approvalState = "invalidated";
+      task.approvalPurpose = undefined;
+      task.diffHash = undefined;
+      task.approvalId = undefined;
+      task.error = approvalCheck.blockedReason;
+      recordDiffVersion(task, snapshot.hash, approvalCheck.diff);
+      transitionTask(task, "rework_failed");
+      return publicTask(task);
+    }
     task.reviewReady = true;
     task.diffHash = snapshot.hash;
     task.approvalId = randomUUID();
@@ -213,6 +230,8 @@ export async function approveRework(taskId: string, input: ApprovalInput, depend
       await validateReworkSafety(task, task.prReview);
       const snapshot = await createDiffSnapshot(task);
       if (snapshot.empty || snapshot.hash !== input.diffHash) throw approvalInvalidated(task);
+      const approvalCheck = validateSnapshotForHumanApproval(task, snapshot);
+      if (approvalCheck.blockedReason) throw approvalPolicyInvalidated(task, approvalCheck.blockedReason);
       task.validation.push({ name: "Diff hash", status: "pass", detail: "MATCH" });
       const findings = await scanSecrets(snapshot);
       task.secretFindings = findings;
@@ -229,7 +248,10 @@ export async function approveRework(taskId: string, input: ApprovalInput, depend
       task.validation.push({ name: "GitHub origin", status: "pass", detail: repositoryName(task) });
       await deps.checkGhAuth(task);
       task.validation.push({ name: "gh auth", status: "pass" });
-      if ((await createDiffSnapshot(task)).hash !== input.diffHash) throw approvalInvalidated(task);
+      const beforeCommit = await createDiffSnapshot(task);
+      if (beforeCommit.hash !== input.diffHash) throw approvalInvalidated(task);
+      const beforeCommitApprovalCheck = validateSnapshotForHumanApproval(task, beforeCommit);
+      if (beforeCommitApprovalCheck.blockedReason) throw approvalPolicyInvalidated(task, beforeCommitApprovalCheck.blockedReason);
       recordTaskEvent(task, "validation_passed", "system", { status: "passed", metadata: { diffHash: input.diffHash } });
 
       transitionTask(task, "committing_rework");
@@ -240,6 +262,8 @@ export async function approveRework(taskId: string, input: ApprovalInput, depend
         await deps.stage(task);
         approvedSnapshot = await createDiffSnapshot(task);
         if (approvedSnapshot.hash !== input.diffHash) throw approvalInvalidated(task);
+        const stagedApprovalCheck = validateSnapshotForHumanApproval(task, approvedSnapshot);
+        if (stagedApprovalCheck.blockedReason) throw approvalPolicyInvalidated(task, stagedApprovalCheck.blockedReason);
         stagedTree = await verifyStagedApproval(task, approvedSnapshot);
         const expectedParent = await runGit(task.worktreePath, ["rev-parse", "HEAD"]);
         commitOperation = getStateStore().createOperation({ type: "git_commit", taskId: task.id, idempotencyKey: `git_commit:${task.id}:${input.approvalId}`, safeMetadata: { expectedParent, expectedTree: stagedTree, approvalId: input.approvalId } });
@@ -629,6 +653,14 @@ function approvalInvalidated(task: RepoTask) {
   task.approvalState = "invalidated";
   transitionTask(task, "approval_invalidated");
   task.error = "Approval invalidated because the revised worktree changed. Review the latest diff again.";
+  return new ApprovalError(task.error);
+}
+
+function approvalPolicyInvalidated(task: RepoTask, reason: string) {
+  task.validation.push({ name: "Human review", status: "fail", detail: "UNREVIEWABLE" });
+  task.approvalState = "invalidated";
+  transitionTask(task, "approval_invalidated");
+  task.error = `Approval invalidated because the revised snapshot cannot be reviewed safely: ${reason}`;
   return new ApprovalError(task.error);
 }
 

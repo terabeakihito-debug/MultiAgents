@@ -1,4 +1,4 @@
-import { chmod, copyFile, mkdir, mkdtemp, rename, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rename, stat, symlink, writeFile } from "node:fs/promises";
 import { execFile as execFileCallback } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { APP_STATE_COMPAT, StateStore, replaceStateStoreForTests } from "./state-store";
 import { clearTasksForTests, createTask, getTask, persistTask, reloadTasksFromStoreForTests, resumeTask } from "./tasks";
-import { runGit } from "./git";
+import { runGit, setGitTransportRootForTests } from "./git";
 import { reconcileUnfinishedOperations } from "./operation-reconciliation";
 import { createStateBackup, validateBackupFile, validateStateBackup } from "./state-backup";
 import { diagnoseProvider } from "./provider-diagnostics";
@@ -37,6 +37,7 @@ beforeEach(async () => {
   await runGit(repoPath, ["commit", "-m", "initial"]);
   await runGit(fixtureRoot, ["init", "--bare", remotePath]);
   await runGit(repoPath, ["remote", "add", "origin", remotePath]);
+  setGitTransportRootForTests(join(fixtureRoot, "transport-runtime", "git-transport"));
   store = new StateStore(join(fixtureRoot, "state", "state.db"));
   replaceStateStoreForTests(store);
   clearTasksForTests();
@@ -44,6 +45,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  setGitTransportRootForTests();
   replaceStateStoreForTests(new StateStore(":memory:"));
   clearTasksForTests();
   resetOperationRegistryForTests();
@@ -134,7 +136,7 @@ describe("Phase 19 durable journal reconciliation", () => {
     expect(store.loadOperation(operation.operationId)?.state).toBe("persisted");
   });
 
-  it("adopts an exact remote SHA after the push/DB crash window", async () => {
+  it("does not reconcile a push through an unvalidated local remote", async () => {
     const task = await taskFixture();
     await writeFile(join(task.worktreePath, "pushed.txt"), "pushed\n");
     await runGit(task.worktreePath, ["add", "pushed.txt"]);
@@ -146,8 +148,21 @@ describe("Phase 19 durable journal reconciliation", () => {
     await runGit(task.worktreePath, ["push", "origin", `HEAD:refs/heads/${task.branch}`]);
 
     await reconcileUnfinishedOperations();
-    expect(getTask(task.id)).toMatchObject({ latestPushedSha: head, status: "pr_failed", recoveryStatus: "needs_attention" });
-    expect(store.loadOperation(operation.operationId)?.state).toBe("persisted");
+    expect(getTask(task.id)).toMatchObject({ status: "pushing" });
+    expect(getTask(task.id)?.latestPushedSha).toBeUndefined();
+    expect(store.loadOperation(operation.operationId)?.state).toBe("reconcile_required");
+  });
+
+  it("rejects uploadpack before push reconciliation can execute it", async () => {
+    const task = await taskFixture();
+    const marker = join(fixtureRoot, "uploadpack-marker"); const script = join(fixtureRoot, "uploadpack");
+    await writeFile(script, `#!/bin/sh\nprintf executed > ${marker}\n`); await chmod(script, 0o700);
+    await runGit(task.worktreePath, ["config", "remote.origin.uploadpack", script]);
+    const operation = store.createOperation({ type: "git_push", taskId: task.id, idempotencyKey: `git_push:${task.id}:uploadpack`, safeMetadata: { branch: task.branch, expectedSha: task.baseSha } });
+    store.updateOperation(operation.operationId, "executing");
+    await reconcileUnfinishedOperations();
+    await expect(readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    expect(store.loadOperation(operation.operationId)?.state).toBe("reconcile_required");
   });
 
   it("adopts exactly one matching PR and never creates a duplicate", async () => {

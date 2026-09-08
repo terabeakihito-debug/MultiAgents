@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { lstat, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { GIT_BINARY, runGit, runGitBytes, serverGitMutationInvocation } from "./git";
+import { GIT_BINARY, pushCommitTransport, runGit, runGitBytes, serverGitMutationInvocation } from "./git";
 import { buildChildProcessEnv, type ChildProcessPurpose } from "./child-process-env";
 import { registerChildProcess, withChildProcessOperation } from "./child-process-registry";
 import { containsKnownSecret, redactKnownSecrets, redactKnownSecretsInValue } from "./credential-resolver";
@@ -82,7 +82,10 @@ export class ProcessExecutionError extends Error {
 const defaultDependencies: ApprovalDependencies = {
   stage: async (task) => { await runServerGitMutation(task.worktreePath, ["add", "--all"]); },
   commit: async (task, message) => { await runServerGitMutation(task.worktreePath, ["commit", "-m", message]); },
-  push: async (task) => { await runServerGitMutation(task.worktreePath, ["push", "-u", "origin", task.branch]); },
+  push: async (task) => {
+    if (!task.commitSha) throw new Error("Task commit is unavailable for push");
+    await pushCommitTransport(task.worktreePath, validatedTaskRemoteUrl(task), task.commitSha, task.branch);
+  },
   checkGhAuth: async (task) => { await checkedProcess(GH_BINARY, ["auth", "status", "--hostname", "github.com"], task.worktreePath, 30_000); },
   createPr: async (task, remote, title, body) => {
     const output = await checkedProcess(GH_BINARY, [
@@ -112,7 +115,7 @@ export async function prepareApproval(task: RepoTask) {
   let diff: TaskDiff;
   try {
     snapshot = await createDiffSnapshot(task);
-    diff = taskDiffFromSnapshot(snapshot);
+    diff = validateSnapshotForHumanApproval(task, snapshot).diff;
   } catch (error) {
     diff = { trackedFiles: [], untrackedFiles: [], stat: "", patch: "", untrackedPatch: "", truncated: true, approvable: false, blockedReason: error instanceof Error ? error.message : "The approval snapshot cannot be displayed safely." };
   }
@@ -121,14 +124,6 @@ export async function prepareApproval(task: RepoTask) {
     invalidateApproval(task);
     persistTask(task);
     return { diff, approval: { blockedReason: "This task template is read-only and forbids commit, push, and pull request creation." }, task: publicTask(task) };
-  }
-  if (template.taskType === "documentation") {
-    const outOfScope = snapshot?.entries.map((entry) => entry.path).find((path) => !isDocumentationPath(path));
-    if (outOfScope) {
-      invalidateApproval(task);
-      persistTask(task);
-      return { diff, approval: { blockedReason: `Documentation template scope forbids non-documentation path ${JSON.stringify(outOfScope)}.` }, task: publicTask(task) };
-    }
   }
   if (["validating", "committing", "pushing", "creating_pr", "pr_created", "push_failed", "pr_failed", "fetching_review", "reworking", "reviewing_rework", "committing_rework", "pushing_rework", "checking_ci", "ready_for_human_merge", "review_fetch_failed", "rework_failed", "ci_failed", "ci_pending"].includes(task.status)) {
     return { diff, approval: undefined, task: publicTask(task) };
@@ -189,6 +184,24 @@ function isDocumentationPath(path: string) {
   return lower.startsWith("docs/") || lower.startsWith("documentation/") || ["readme", "changelog", "contributing", "license", "security", "code_of_conduct"].some((prefix) => name === prefix || name.startsWith(`${prefix}.`)) || [".md", ".mdx", ".rst", ".txt"].some((extension) => lower.endsWith(extension));
 }
 
+/** The sole server-side gate for issuing or accepting any human approval. */
+export function validateSnapshotForHumanApproval(task: RepoTask, snapshot: DiffSnapshot): { diff: TaskDiff; blockedReason?: string } {
+  const diff = taskDiffFromSnapshot(snapshot);
+  if (!diff.approvable) return { diff, blockedReason: diff.blockedReason };
+  const template = requireTaskTemplate(task);
+  if (template.taskType === "documentation") {
+    for (const entry of snapshot.entries) {
+      for (const path of [entry.oldPath, entry.path].filter((value): value is string => Boolean(value))) {
+        if (!isDocumentationPath(path)) {
+          const blockedReason = `Documentation template scope forbids non-documentation path ${JSON.stringify(path)}.`;
+          return { diff: { ...diff, approvable: false, blockedReason }, blockedReason };
+        }
+      }
+    }
+  }
+  return { diff };
+}
+
 export async function approveAndCreatePullRequest(taskId: string, input: ApprovalInput, dependencies: Partial<ApprovalDependencies> = {}): Promise<PullRequestResult> {
   if (!acquireTaskLock(taskId)) throw new ApprovalError("This task is already being processed", 409);
   const deps = { ...defaultDependencies, ...dependencies };
@@ -218,6 +231,8 @@ export async function approveAndCreatePullRequest(taskId: string, input: Approva
       const first = await createDiffSnapshot(task);
       if (first.empty) throw invalidate(task, "The final diff is empty.");
       if (first.hash !== input.diffHash) throw invalidate(task, "Approval invalidated because the worktree changed. Review the latest diff again.");
+      const firstApprovalCheck = validateSnapshotForHumanApproval(task, first);
+      if (firstApprovalCheck.blockedReason) throw invalidate(task, `Approval invalidated because the snapshot cannot be reviewed safely: ${firstApprovalCheck.blockedReason}`);
       pass(task, "Diff hash", "MATCH");
 
       const findings = await scanSecrets(first);
@@ -263,6 +278,8 @@ export async function approveAndCreatePullRequest(taskId: string, input: Approva
 
       const beforeStage = await createDiffSnapshot(task);
       if (beforeStage.hash !== input.diffHash) throw invalidate(task, "Approval invalidated because the worktree changed. Review the latest diff again.");
+      const beforeStageApprovalCheck = validateSnapshotForHumanApproval(task, beforeStage);
+      if (beforeStageApprovalCheck.blockedReason) throw invalidate(task, `Approval invalidated because the snapshot cannot be reviewed safely: ${beforeStageApprovalCheck.blockedReason}`);
 
       transitionTask(task, "committing");
       let commitOperation: DurableOperation | undefined;
@@ -270,6 +287,8 @@ export async function approveAndCreatePullRequest(taskId: string, input: Approva
         await deps.stage(task);
         const beforeCommit = await createDiffSnapshot(task);
         if (beforeCommit.hash !== input.diffHash) throw invalidate(task, "Approval invalidated because the worktree changed. Review the latest diff again.");
+        const beforeCommitApprovalCheck = validateSnapshotForHumanApproval(task, beforeCommit);
+        if (beforeCommitApprovalCheck.blockedReason) throw invalidate(task, `Approval invalidated because the snapshot cannot be reviewed safely: ${beforeCommitApprovalCheck.blockedReason}`);
         const stagedTree = await verifyStagedApproval(task, beforeCommit);
         const expectedParent = await runGit(task.worktreePath, ["rev-parse", "HEAD"]);
         commitOperation = getStateStore().createOperation({
@@ -781,6 +800,12 @@ export function validateGitHubRemote(url: string): GitHubRemote {
     throw new Error("origin must be a standard GitHub HTTPS or SSH URL");
   }
   return { owner: match[1], repo: match[2], url };
+}
+
+/** Network Git uses this persisted, strictly validated literal URL—not a configurable remote name. */
+export function validatedTaskRemoteUrl(task: Pick<RepoTask, "originUrl">): string {
+  if (!task.originUrl) throw new Error("GitHub origin is unavailable");
+  return validateGitHubRemote(task.originUrl).url;
 }
 
 function validatePrUrl(url: string, remote: GitHubRemote, number: number) {

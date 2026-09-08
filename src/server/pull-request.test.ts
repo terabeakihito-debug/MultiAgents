@@ -1,6 +1,6 @@
 import { chmod, copyFile, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runGit } from "./git";
 import {
@@ -18,6 +18,7 @@ import {
   runValidationCommand,
   scanSecrets,
   summarizeStderr,
+  validateSnapshotForHumanApproval,
   VALIDATION_TIMEOUT_MS,
   validateGitHubRemote,
   type ApprovalDependencies,
@@ -41,7 +42,7 @@ async function createRoot() {
   return value;
 }
 
-async function createRepo(origin = "https://github.com/example/project.git", seed: Record<string, string> = {}) {
+async function createRepo(origin = "https://github.com/example/project.git", seed: Record<string, string> = {}, templateId = "bug_fix") {
   const allowedRoot = await createRoot();
   const repoPath = join(allowedRoot, "project");
   await mkdir(repoPath);
@@ -49,11 +50,11 @@ async function createRepo(origin = "https://github.com/example/project.git", see
   await runGit(repoPath, ["config", "user.email", "test@example.com"]);
   await runGit(repoPath, ["config", "user.name", "Test"]);
   await writeFile(join(repoPath, "README.md"), "initial\n");
-  for (const [path, content] of Object.entries(seed)) await writeFile(join(repoPath, path), content);
+  for (const [path, content] of Object.entries(seed)) { await mkdir(dirname(join(repoPath, path)), { recursive: true }); await writeFile(join(repoPath, path), content); }
   await runGit(repoPath, ["add", "--all"]);
   await runGit(repoPath, ["commit", "-m", "initial"]);
   await runGit(repoPath, ["remote", "add", "origin", origin]);
-  const task = await createTask("project", { allowedRoot, worktreeRoot: join(await createRoot(), "worktrees") });
+  const task = await createTask("project", { allowedRoot, worktreeRoot: join(await createRoot(), "worktrees"), templateId });
   return { allowedRoot, repoPath, task };
 }
 
@@ -159,6 +160,33 @@ describe("Phase 5 approval and PR state machine", () => {
     expect(diff.blockedReason).toContain("Binary file");
     task.status = "reviewed"; task.reviewReady = true;
     await expect(prepareApproval(task)).resolves.toMatchObject({ approval: { blockedReason: expect.stringContaining("Binary file") } });
+  });
+
+  it("uses every canonical rename and copy endpoint for documentation scope", async () => {
+    const blockedRename = await createRepo(undefined, { "code.ts": "code\n" }, "documentation");
+    await runGit(blockedRename.task.worktreePath, ["mv", "code.ts", "code.md"]);
+    const renameCheck = validateSnapshotForHumanApproval(blockedRename.task, await createDiffSnapshot(blockedRename.task));
+    expect(renameCheck.blockedReason).toContain("code.ts");
+
+    const allowedRename = await createRepo(undefined, { "docs/a.md": "docs\n" }, "documentation");
+    await runGit(allowedRename.task.worktreePath, ["mv", "docs/a.md", "docs/b.md"]);
+    expect(validateSnapshotForHumanApproval(allowedRename.task, await createDiffSnapshot(allowedRename.task)).blockedReason).toBeUndefined();
+
+    const allowedDeletion = await createRepo(undefined, { "docs/delete.md": "docs\n" }, "documentation");
+    await rm(join(allowedDeletion.task.worktreePath, "docs/delete.md"));
+    expect(validateSnapshotForHumanApproval(allowedDeletion.task, await createDiffSnapshot(allowedDeletion.task)).blockedReason).toBeUndefined();
+
+    const blockedDeletion = await createRepo(undefined, { "code.ts": "code\n" }, "documentation");
+    await rm(join(blockedDeletion.task.worktreePath, "code.ts"));
+    expect(validateSnapshotForHumanApproval(blockedDeletion.task, await createDiffSnapshot(blockedDeletion.task)).blockedReason).toContain("code.ts");
+
+    const blockedCopy = await createRepo(undefined, { "code.ts": "code\n" }, "documentation");
+    await copyFile(join(blockedCopy.task.worktreePath, "code.ts"), join(blockedCopy.task.worktreePath, "code.md"));
+    expect(validateSnapshotForHumanApproval(blockedCopy.task, await createDiffSnapshot(blockedCopy.task)).blockedReason).toContain("code.ts");
+
+    const allowedCopy = await createRepo(undefined, { "docs/a.md": "docs\n" }, "documentation");
+    await copyFile(join(allowedCopy.task.worktreePath, "docs/a.md"), join(allowedCopy.task.worktreePath, "docs/b.md"));
+    expect(validateSnapshotForHumanApproval(allowedCopy.task, await createDiffSnapshot(allowedCopy.task)).blockedReason).toBeUndefined();
   });
 
   it("renders canonical rename, deletion, symlink target, and untracked topology", async () => {
