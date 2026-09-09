@@ -7,7 +7,8 @@ import { APP_STATE_COMPAT, getStateStore, type StateStore } from "./state-store"
 import { checkOsSandboxAvailability } from "./os-sandbox";
 import { providerDiagnostics } from "./provider-diagnostics";
 import { latestVerifiedBackup } from "./state-backup";
-import { activeOperations, lifecycleState } from "./operation-registry";
+import { activeOperations, hasMutationOwnershipPredicate, lifecycleState, ownershipLostEver } from "./operation-registry";
+import { hasActiveServerOwnershipLease } from "./server-lifecycle";
 import { listTasks, WORKTREE_ROOT } from "./tasks";
 import { runGit } from "./git";
 
@@ -67,8 +68,10 @@ export async function operationsOverview(options: { forceProviders?: boolean; no
     return { ...provider, reviewRequired, level };
   });
   const worktrees = inventory.map((item) => ({ ...item, classification: item.cleanupCandidate ? "safe_cleanup_candidate" : item.inventoryStatus === "registered" ? "registered" : "needs_inspection" }));
-  const upgradeReady = lifecycleState() === "RUNNING" && activeOperations().length === 0 && backupLevel === "ok" && diskLevel === "ok" && database.status === "ok" && sandboxResult.status === "enforced" && providersView.every((item) => item.level === "ok") && unfinished.length === 0;
+  const ownershipActive = hasActiveServerOwnershipLease();
+  const upgradeReady = ownershipActive && lifecycleState() === "RUNNING" && activeOperations().length === 0 && backupLevel === "ok" && diskLevel === "ok" && database.status === "ok" && sandboxResult.status === "enforced" && providersView.every((item) => item.level === "ok") && unfinished.length === 0;
   const issueCodes: string[] = [];
+  if (!ownershipActive) issueCodes.push("ownership_lost");
   if (sandboxResult.status !== "enforced") issueCodes.push("sandbox_unavailable");
   if (providersView.some((item) => item.level !== "ok")) issueCodes.push("provider_unavailable");
   if (backupLevel === "attention") issueCodes.push("backup_attention");
@@ -76,7 +79,7 @@ export async function operationsOverview(options: { forceProviders?: boolean; no
   if (worktrees.some((item) => item.inventoryStatus !== "registered")) issueCodes.push("worktree_inventory");
   if (reconcile.length) issueCodes.push("reconcile_required");
   if (outbound.failed || outbound.ambiguous) issueCodes.push("outbound_attention");
-  const overall: OperationsOverall = issueCodes.includes("sandbox_unavailable") ? "critical" : issueCodes.length ? "attention" : "ready";
+  const overall: OperationsOverall = issueCodes.includes("sandbox_unavailable") || issueCodes.includes("ownership_lost") ? "critical" : issueCodes.length ? "attention" : "ready";
   return {
     checkedAt, overall, nextAction: nextActionFor(issueCodes), database,
     backup: { level: backupLevel, latest: latest ? { backupId: latest.backupId, createdAt: latest.createdAt, ageHours: Number(latest.ageHours.toFixed(2)), schemaVersion: latest.schemaVersion, sizeBytes: latest.sizeBytes, integrity: latest.integrityStatus } : null, count: backups.length, items: backups.map((item) => ({ backupId: item.backupId, createdAt: item.createdAt, schemaVersion: item.schemaVersion, sizeBytes: item.sizeBytes, integrity: item.integrityStatus })) },
@@ -104,6 +107,7 @@ function unavailableOverview(checkedAt: string) {
 }
 
 function nextActionFor(issues: string[]) {
+  if (issues.includes("ownership_lost")) return "Ownership lost — restart required";
   if (issues.includes("sandbox_unavailable")) return "Repair sandbox availability";
   if (issues.includes("provider_unavailable")) return "Refresh or reauthenticate provider diagnostics";
   if (issues.includes("backup_attention")) return "Create a verified backup";
@@ -142,11 +146,13 @@ export async function healthReadiness(options: { providerCwd?: string; forceProv
     inspectWorktrees(),
   ]);
   const backup = latestVerifiedBackup(store);
-  const status = sandbox === "enforced" && providers.every((provider) => ["supported", "supported_with_warning"].includes(provider.status))
+  const ownershipActive = hasActiveServerOwnershipLease();
+  const ownershipUsable = ownershipActive && lifecycleState() === "RUNNING" && !ownershipLostEver() && hasMutationOwnershipPredicate();
+  const status = ownershipUsable && sandbox === "enforced" && providers.every((provider) => ["supported", "supported_with_warning"].includes(provider.status))
     && Boolean(backup) && disk.worktreeCreationAllowed && store.loadUnfinishedOperations().length === 0 ? "ready" : "degraded";
   return {
     status,
-    lifecycle: lifecycleState(),
+    lifecycle: lifecycleState(), ownership: ownershipUsable ? "active" : "lost", nextAction: ownershipUsable ? undefined : "Ownership lost — restart required",
     database,
     sandbox,
     providers: Object.fromEntries(providers.map((provider) => [provider.provider, { status: provider.status, version: provider.version }])),

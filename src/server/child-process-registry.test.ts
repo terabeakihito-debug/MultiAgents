@@ -1,13 +1,13 @@
 import { EventEmitter } from "node:events";
 import { spawn, type ChildProcess } from "node:child_process";
-import { access, mkdtemp, writeFile } from "node:fs/promises";
+import { access, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { activeChildProcesses, registerChildProcess, resetChildProcessRegistryForTests, terminateRegisteredChildren } from "./child-process-registry";
 import { StateStore, replaceStateStoreForTests } from "./state-store";
-import { drainForMaintenance, finalizeShutdownForTests, gracefulDrainForTests } from "./server-lifecycle";
-import { beginRegisteredOperation, leaveMaintenanceMode, lifecycleState, resetOperationRegistryForTests } from "./operation-registry";
+import { finalizeServerShutdown, gracefulDrainOperations } from "./server-lifecycle";
+import { createOperationRegistryState } from "./operation-registry";
 
 function fakeChild(pid = 42) {
   const child = new EventEmitter() as EventEmitter & Partial<ChildProcess>;
@@ -18,7 +18,6 @@ function fakeChild(pid = 42) {
 
 afterEach(() => {
   resetChildProcessRegistryForTests();
-  resetOperationRegistryForTests();
   replaceStateStoreForTests(new StateStore(":memory:"));
   vi.restoreAllMocks();
 });
@@ -78,7 +77,7 @@ describe("shutdown child process registry", () => {
       if (pid === -555 && signal === "SIGTERM") child.emit("close", null, "SIGTERM");
       return true;
     }) as typeof process.kill);
-    await gracefulDrainForTests(100);
+    await gracefulDrainOperations(100);
     expect(store.loadOperation(operation.operationId)).toMatchObject({ state: "reconcile_required", errorCode: "shutdown_child_terminated" });
   });
 
@@ -89,30 +88,30 @@ describe("shutdown child process registry", () => {
     const source = `setTimeout(() => require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'created'), 1000); setInterval(() => {}, 1000);`;
     const child = spawn(process.execPath, ["-e", source], { detached: true, stdio: "ignore" });
     registerChildProcess({ child, purpose: "github", operationId: operation.operationId });
-    await gracefulDrainForTests(500);
+    await gracefulDrainOperations(500);
     await new Promise((resolve) => setTimeout(resolve, 1_100));
     await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
     expect(store.loadOperation(operation.operationId)).toMatchObject({ state: "reconcile_required", errorCode: "shutdown_child_terminated" });
   });
 
-  it("applies the same termination policy before maintenance mode remains draining", async () => {
+  it("applies the same termination policy before maintenance mode becomes resumable", async () => {
     const child = fakeChild(666); registerChildProcess({ child, purpose: "agent" });
     vi.spyOn(process, "kill").mockImplementation(((pid: number, signal: NodeJS.Signals) => {
       if (pid === -666 && signal === "SIGTERM") child.emit("close", null, "SIGTERM");
       return true;
     }) as typeof process.kill);
-    await drainForMaintenance(100);
-    expect(lifecycleState()).toBe("DRAINING");
-    expect(() => beginRegisteredOperation(crypto.randomUUID(), "mutation")).toThrow("draining");
-    leaveMaintenanceMode();
+    await terminateRegisteredChildren({ graceMs: 100 });
+    const registry = createOperationRegistryState(() => true);
+    registry.enterMaintenanceMode();
+    expect(registry.lifecycleState()).toBe("MAINTENANCE");
+    expect(() => registry.beginRegisteredOperation(crypto.randomUUID(), "mutation")).toThrow("draining");
+    registry.leaveMaintenanceMode();
   });
 
-  it("flushes shutdown state by closing the database and removing the server lock", async () => {
+  it("flushes shutdown state by closing the database", async () => {
     const root = await mkdtemp(join(tmpdir(), "multiagents-phase196-lock-"));
     const store = new StateStore(join(root, "state.db")); replaceStateStoreForTests(store);
-    const lock = join(root, "server.lock"); await writeFile(lock, "fixture\n", { mode: 0o600 });
-    await finalizeShutdownForTests(100, lock);
-    await expect(import("node:fs/promises").then(({ lstat }) => lstat(lock))).rejects.toMatchObject({ code: "ENOENT" });
+    await finalizeServerShutdown(100);
     expect(() => store.schemaVersion()).toThrow();
   });
 

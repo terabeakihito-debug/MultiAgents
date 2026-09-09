@@ -9,16 +9,15 @@ vi.mock("./provider-diagnostics", () => ({ providerDiagnostics: vi.fn(async () =
   { provider: "cursor", status: "supported", version: "2026.1" },
   { provider: "claude", status: "supported", version: "2.1" },
 ]) }));
+vi.mock("./server-lifecycle", () => ({ hasActiveServerOwnershipLease: () => true }));
 
 import { operationsOverview } from "./operational-health";
-import { resetOperationRegistryForTests } from "./operation-registry";
 import { StateStore, replaceStateStoreForTests } from "./state-store";
 import { clearTasksForTests } from "./tasks";
 
 beforeEach(() => {
   replaceStateStoreForTests(new StateStore(":memory:"));
   clearTasksForTests();
-  resetOperationRegistryForTests();
 });
 
 describe("Phase 20A operations overview", () => {

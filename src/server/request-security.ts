@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { isAgentExecutionActive } from "./agent-execution-guard";
 import type { HumanMutationAction } from "../security/human-actions";
-import { lifecycleState } from "./operation-registry";
+import { canAdmitMutations, lifecycleState } from "./operation-registry";
 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 const HUMAN_SESSION_COOKIE = "multiagents_human_session";
@@ -71,7 +71,7 @@ export function requireHumanMutation(
   if (request.method !== method) return auditExistingRejection(expectedAction, "wrong_method", methodRejected(method));
   const label = options.label ?? "Mutation";
   if (isAgentExecutionActive()) return humanGateRejected(expectedAction, "agent_active", 423, `${label} changes are blocked while an agent process is running`);
-  if (lifecycleState() !== "RUNNING" && expectedAction !== "maintenance-mode") {
+  if ((lifecycleState() !== "RUNNING" || !canAdmitMutations()) && expectedAction !== "maintenance-mode") {
     return humanGateRejected(expectedAction, "server_draining", 503, `${label} changes are blocked while the server is draining`);
   }
 

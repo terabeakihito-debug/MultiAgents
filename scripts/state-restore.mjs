@@ -1,8 +1,10 @@
 import { constants } from "node:fs";
-import { chmod, copyFile, lstat, readFile, rename, rm } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import net from "node:net";
+import { getServerOwnershipSocketName } from "../src/server/server-ownership-socket.mjs";
 
 const backupId = process.argv[2];
 if (!backupId || !/^[0-9a-f-]{36}$/i.test(backupId)) fail("Usage: npm run state:restore -- <backup-id>");
@@ -10,7 +12,8 @@ const stateDir = join(homedir(), ".multiagents");
 const source = join(stateDir, "backups", `${backupId}.db`);
 const target = join(stateDir, "state.db");
 const temporary = join(stateDir, `.restore-${backupId}.tmp`);
-await requireServerStopped(join(stateDir, "server.lock"));
+await mkdir(join(stateDir, "runtime"), { recursive: true, mode: 0o700 });
+const restoreLease = await acquireRestoreLease();
 await validate(source);
 await rm(temporary, { force: true });
 await copyFile(source, temporary, constants.COPYFILE_EXCL);
@@ -27,7 +30,7 @@ try {
   if (moved) await rename(retained, target).catch(() => undefined);
   await rm(temporary, { force: true });
   throw error;
-}
+} finally { await new Promise((resolve) => restoreLease.close(resolve)); }
 
 async function validate(path) {
   const info = await lstat(path);
@@ -45,15 +48,17 @@ async function validate(path) {
   } finally { db.close(); }
 }
 
-async function requireServerStopped(lockPath) {
-  try {
-    const info = await lstat(lockPath);
-    if (!info.isFile() || info.isSymbolicLink()) fail("Server lock is invalid; inspect it manually");
-    const pid = Number((await readFile(lockPath, "utf8")).trim());
-    if (Number.isSafeInteger(pid) && pid > 1) {
-      try { process.kill(pid, 0); fail("MultiAgents server is running; restore is offline-only"); }
-      catch (error) { if (!(error && error.code === "ESRCH")) throw error; }
-    }
-  } catch (error) { if (!(error && error.code === "ENOENT")) throw error; }
+async function acquireRestoreLease() {
+  if (process.platform !== "linux") fail("Offline restore requires Linux abstract Unix socket ownership");
+  const server = net.createServer();
+  await new Promise((resolve, reject) => {
+    server.once("listening", resolve);
+    server.once("error", reject);
+    server.listen({ path: getServerOwnershipSocketName(), exclusive: true });
+  }).catch((error) => {
+    if (error?.code === "EADDRINUSE") fail("MultiAgents server is running; restore is offline-only");
+    throw error;
+  });
+  return server;
 }
 function fail(message) { throw new Error(message); }

@@ -12,7 +12,7 @@ import { reconcileUnfinishedOperations } from "./operation-reconciliation";
 import { createStateBackup, validateBackupFile, validateStateBackup } from "./state-backup";
 import { diagnoseProvider } from "./provider-diagnostics";
 import { assertWorktreeDiskCapacity, backupStatus, inspectTaskWorktrees, inspectWorktrees, MINIMUM_WORKTREE_FREE_BYTES } from "./operational-health";
-import { beginRegisteredOperation, drainOperations, lifecycleState, resetOperationRegistryForTests } from "./operation-registry";
+import { beginRegisteredOperation, drainOperations, lifecycleState } from "./operation-registry";
 
 let fixtureRoot: string;
 let allowedRoot: string;
@@ -41,14 +41,12 @@ beforeEach(async () => {
   store = new StateStore(join(fixtureRoot, "state", "state.db"));
   replaceStateStoreForTests(store);
   clearTasksForTests();
-  resetOperationRegistryForTests();
 });
 
 afterEach(() => {
   setGitTransportRootForTests();
   replaceStateStoreForTests(new StateStore(":memory:"));
   clearTasksForTests();
-  resetOperationRegistryForTests();
 });
 
 async function taskFixture() {
