@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { enterDrainingMode, enterMaintenanceMode, enterOwnershipLost, ownershipLostEver, transitionOperationState, type LifecycleToken, waitForOperations } from "./operation-registry";
 import { activeChildProcesses, CHILD_PROCESS_GRACE_MS, terminateRegisteredChildren } from "./child-process-registry";
+import { hasUnconfirmedAgentExecution, reconcileUnconfirmedAgentExecutions } from "./agent-execution-guard";
 import { getStateStore } from "./state-store";
 import { acquireServerInstanceLock, type ServerInstanceLease } from "./server-instance-lock";
 import { notifyServerOwnershipLost } from "./server-ownership-events";
@@ -144,9 +145,12 @@ async function finalizeShutdownInternal(timeoutMs: number, reason: string): Prom
   let childDrainFailed = false;
   try { result = await drainServerProcesses(remaining(deadline), "STOPPED", false); } catch (error) { childDrainFailed = true; recordFailure("child_drain", error, errors, phases, false); }
   const registeredChildrenAfterDrain = activeChildProcesses().length;
+  await reconcileUnconfirmedAgentExecutions();
+  const unconfirmedAgentProcesses = hasUnconfirmedAgentExecution();
+  if (unconfirmedAgentProcesses) { childDrainFailed = true; errors.push(new Error("unconfirmed_agent_processes_remaining")); }
   if (registeredChildrenAfterDrain) { childDrainFailed = true; errors.push(new Error("registered_children_remaining")); }
-  if (childDrainFailed) terminal("child_drain", childDrainTimedOut(result, registeredChildrenAfterDrain) ? "timed_out" : "failed", phases, { registeredChildrenBeforeDrain, registeredChildrenAfterDrain });
-  else terminal("child_drain", "completed", phases, { registeredChildrenBeforeDrain, registeredChildrenAfterDrain });
+  if (childDrainFailed) terminal("child_drain", childDrainTimedOut(result, registeredChildrenAfterDrain) || unconfirmedAgentProcesses ? "timed_out" : "failed", phases, { registeredChildrenBeforeDrain, registeredChildrenAfterDrain, unconfirmedAgentProcesses });
+  else terminal("child_drain", "completed", phases, { registeredChildrenBeforeDrain, registeredChildrenAfterDrain, unconfirmedAgentProcesses });
   // Each durable entry gets its own attempt. One corrupt journal row must not
   // prevent the remaining entries from being made reconcile-required.
   let unfinished: Array<{ operationId: string }> = [];

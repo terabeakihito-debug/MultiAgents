@@ -5,6 +5,7 @@ import type { ServerInstanceLease } from "./server-instance-lock";
 import { initializeTaskRecovery } from "./tasks";
 import { onServerOwnershipLost } from "./server-ownership-events";
 import { hasMutationOwnershipPredicate, lifecycleState, ownershipLostEver } from "./operation-registry";
+import { restoreDurableUnconfirmedAgentExecutions } from "./agent-execution-guard";
 
 type StartupState = { state: "UNINITIALIZED" | "STARTING" | "RUNNING" | "FAILED"; promise?: Promise<void>; attemptId?: string; lease?: ServerInstanceLease };
 // Startup state is module-private.  Ownership is revalidated before RUNNING,
@@ -25,6 +26,9 @@ export function initializeOperationalStartup() {
   startup.promise = (async () => {
     startup.lease = await installServerLifecycle();
     databaseReadiness();
+    // This barrier installs durable unresolved-process ownership before any
+    // provider can become ready or an execution can be admitted.
+    await restoreDurableUnconfirmedAgentExecutions();
     await initializeTaskRecovery();
     assertCurrentAttempt(attemptId);
     await providerDiagnostics();

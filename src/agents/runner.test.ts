@@ -372,7 +372,7 @@ describe("createAgentAdapter", () => {
     kill.mockRestore();
   });
 
-  it("continues process-error termination and finalization when its audit fails", async () => {
+  it("preserves a process failure when its audit also fails", async () => {
     const child = fakeChild() as ReturnType<typeof fakeChild> & { pid?: number };
     Object.defineProperty(child, "pid", { value: 4322 });
     const kill = vi.spyOn(process, "kill").mockReturnValue(true);
@@ -393,7 +393,7 @@ describe("createAgentAdapter", () => {
     expect(isAgentExecutionActive()).toBe(true);
     expect(settled).toBe(0);
     child.emit("close", null, "SIGTERM");
-    await expect(pending).resolves.toMatchObject({ status: "error", error: "failed audit persistence" });
+    await expect(pending).resolves.toMatchObject({ status: "error", error: "transport failed" });
     expect(verify).toHaveBeenCalledOnce();
     expect(activeChildProcesses()).toEqual([]);
     expect(isAgentExecutionActive()).toBe(false);
@@ -401,7 +401,7 @@ describe("createAgentAdapter", () => {
     kill.mockRestore();
   });
 
-  it("continues close finalization when the sandbox-violation audit fails", async () => {
+  it("preserves a sandbox-violation result when its audit fails", async () => {
     const child = fakeChild() as ReturnType<typeof fakeChild> & { pid?: number };
     Object.defineProperty(child, "pid", { value: 4323 });
     const verify = vi.fn(async (result) => result);
@@ -416,7 +416,7 @@ describe("createAgentAdapter", () => {
     }).then((result) => { settled += 1; return result; });
     child.stderr.write("bwrap: simulated violation");
     child.emit("close", 1, null);
-    await expect(pending).resolves.toMatchObject({ status: "error", error: "violation audit failed" });
+    await expect(pending).resolves.toMatchObject({ status: "error", error: "OS sandbox unavailable. Task execution blocked." });
     expect(verify).toHaveBeenCalledOnce();
     expect(activeChildProcesses()).toEqual([]);
     expect(isAgentExecutionActive()).toBe(false);
@@ -430,6 +430,34 @@ describe("createAgentAdapter", () => {
     );
     await expect(adapter.run("review")).resolves.toMatchObject({ status: "error", error: "spawn failed" });
     expect(isAgentExecutionActive()).toBe(false);
+    expect(activeChildProcesses()).toEqual([]);
+  });
+
+  it("settles once with the primary pre-launch failure when synchronous or asynchronous audits fail", async () => {
+    for (const audit of [
+      () => { throw new Error("sync audit failed"); },
+      async () => { throw new Error("async audit failed"); },
+    ]) {
+      const adapter = createAgentAdapter(
+        { id: "cursor", name: "Cursor", binary: "agent", args: () => { throw new Error("spawn preparation failed"); } },
+        { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn() as never },
+      );
+      let settled = 0;
+      await expect(adapter.run("review", { onSandboxAudit: audit }).then((result) => { settled++; return result; })).resolves.toMatchObject({ status: "error", error: "spawn preparation failed" });
+      expect(settled).toBe(1);
+      expect(activeChildProcesses()).toEqual([]);
+      expect(isAgentExecutionActive()).toBe(false);
+    }
+  });
+
+  it("settles once with the primary spawn failure when a pre-launch audit fails", async () => {
+    const adapter = createAgentAdapter(
+      { id: "cursor", name: "Cursor", binary: "agent", args: (prompt) => ["-p", prompt] },
+      { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => { throw new Error("spawn failed"); }) as never },
+    );
+    let settled = 0;
+    await expect(adapter.run("review", { onSandboxAudit: async () => { throw new Error("audit failed"); } }).then((result) => { settled++; return result; })).resolves.toMatchObject({ status: "error", error: "spawn failed" });
+    expect(settled).toBe(1);
     expect(activeChildProcesses()).toEqual([]);
   });
 

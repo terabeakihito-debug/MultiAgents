@@ -9,6 +9,10 @@ export type AgentResult = {
   output: string;
   error?: string;
   runtimeViolation?: import("../runtime/types").RuntimeViolation;
+  /** Caller settled before process death could be confirmed; admission remains quarantined. */
+  finalizationUnconfirmed?: true;
+  /** Durable ownership write failed; this server remains quarantined but restart safety is not established. */
+  finalizationPersistenceFailed?: true;
 };
 
 export type AgentDefinition = {
@@ -21,7 +25,7 @@ export type AgentDefinition = {
 export type AgentRunOptions = {
   signal?: AbortSignal;
   policy?: import("../runtime/types").RuntimePolicy;
-  onSandboxAudit?: (event: import("../server/os-sandbox").OsSandboxAudit) => void;
+  onSandboxAudit?: (event: import("../server/os-sandbox").OsSandboxAudit) => unknown;
   /** Runs after child close/unregister while the active-agent gate is held. */
   afterClose?: (result: AgentResult) => Promise<AgentResult> | AgentResult;
 };

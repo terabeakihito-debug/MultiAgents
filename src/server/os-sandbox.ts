@@ -22,7 +22,7 @@ export type SandboxFailureCode =
   | "sandbox_launch_failed";
 
 export type OsSandboxAudit = {
-  type: "os_sandbox_created" | "os_sandbox_failed" | "os_sandbox_violation" | "os_sandbox_process_cleanup";
+  type: "os_sandbox_created" | "os_sandbox_failed" | "os_sandbox_violation" | "os_sandbox_process_cleanup" | "os_sandbox_finalization_unconfirmed" | "os_sandbox_finalization_persistence_failed";
   profile: OsSandboxProfile;
   provider?: AgentId;
   capabilityClass: string;

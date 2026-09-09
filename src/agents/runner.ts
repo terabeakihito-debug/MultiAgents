@@ -1,8 +1,10 @@
 import { spawn, type SpawnOptions } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { AgentAdapter, AgentDefinition, AgentResult } from "./types";
-import { beginAgentExecution } from "../server/agent-execution-guard";
+import { assertAgentExecutionAdmissible, beginAgentExecution, captureUnresolvedAgentExecution, durablyQuarantineCapturedUnresolvedAgentExecution, inspectUnresolvedAgentProcess, quarantineUnconfirmedAgentExecution } from "../server/agent-execution-guard";
+import { runtimeBindingDirectory } from "../server/immutable-executable-binding";
 import { assertProviderExecutionAllowed, assertProviderExecutionIdentity, prepareProviderImmutableBinding } from "../server/provider-diagnostics";
 import { buildChildProcessEnv } from "../server/child-process-env";
 import { registerChildProcess } from "../server/child-process-registry";
@@ -23,6 +25,10 @@ const MAX_OUTPUT_BYTES = 1_000_000;
 
 type SpawnLike = typeof spawn;
 const FORCE_KILL_GRACE_MS = 2_000;
+const FALLBACK_CLOSE_TIMEOUT_MS = 4_000;
+// Sandbox lifecycle records are part of the execution result.  Keep their
+// wait bounded so an unavailable audit sink cannot strand an agent forever.
+const AUTHORITATIVE_AUDIT_TIMEOUT_MS = 2_000;
 
 export function createAgentAdapter(
   definition: AgentDefinition,
@@ -51,31 +57,62 @@ function runProcess(
   runOptions?: import("./types").AgentRunOptions,
 ): Promise<AgentResult> {
   return new Promise((resolve) => {
+    let settled = false;
+    const settle = (result: AgentResult) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
     const spawnProcess = options.spawnProcess ?? spawn;
     const signal = runOptions?.signal;
     const policy = runOptions?.policy ?? buildGenericRuntimePolicy(definition.id, options.cwd ?? process.cwd());
     const profile = sandboxProfileForRuntimePolicy(policy);
     const audit = runOptions?.onSandboxAudit;
     const testBypass = options.unsafeTestOnlyBypassOsSandbox === true && process.env.NODE_ENV === "test";
+    let finalizeSpawnedFailure: ((error: unknown) => void) | undefined;
     if (policy.agent !== definition.id) {
-      resolve(errorResult(definition.id, new Error("Runtime policy agent does not match the fixed launcher")));
+      settle(errorResult(definition.id, new Error("Runtime policy agent does not match the fixed launcher")));
       return;
     }
-    void launch();
+    void launch().catch((error) => {
+      if (finalizeSpawnedFailure) {
+        finalizeSpawnedFailure(error);
+        return;
+      }
+      // This boundary is reachable only before spawn.  Every path after a
+      // ChildProcess exists installs the spawned-child coordinator first.
+      settle(errorResult(definition.id, error));
+    });
+
+    async function safePreLaunchAudit(event: Parameters<NonNullable<typeof audit>>[0]) {
+      try {
+        const pending = audit?.(event);
+        if (pending && typeof (pending as Promise<void>).then === "function") {
+          void Promise.resolve(pending).catch(() => recordAuditFailure(definition.id, "pre_launch"));
+        }
+        return undefined;
+      }
+      catch (error) {
+        recordAuditFailure(definition.id, "pre_launch");
+        return error;
+      }
+    }
 
     async function launch() {
+      try { assertAgentExecutionAdmissible(); }
+      catch (error) { settle(errorResult(definition.id, error)); return; }
       let diagnostic;
       if (!testBypass) try {
         diagnostic = await assertProviderExecutionAllowed(definition.id);
       } catch (error) {
-        resolve(errorResult(definition.id, error));
+        settle(errorResult(definition.id, error));
         return;
       }
       try {
         if (!testBypass) await assertOsSandboxAvailable();
       } catch (error) {
-        audit?.({ type: "os_sandbox_failed", profile, provider: definition.id, capabilityClass: policy.policyClass, failureCode: error instanceof OsSandboxUnavailableError ? error.failureCode : "namespace_unsupported" });
-        resolve(errorResult(definition.id, error));
+        await safePreLaunchAudit({ type: "os_sandbox_failed", profile, provider: definition.id, capabilityClass: policy.policyClass, failureCode: error instanceof OsSandboxUnavailableError ? error.failureCode : "namespace_unsupported" });
+        settle(errorResult(definition.id, error));
         return;
       }
 
@@ -103,8 +140,8 @@ function runProcess(
             });
       } catch (error) {
         await immutableRuntime?.cleanup().catch(() => undefined);
-        audit?.({ type: "os_sandbox_failed", profile, provider: definition.id, capabilityClass: policy.policyClass, failureCode: "invalid_sandbox_configuration" });
-        resolve(errorResult(definition.id, error));
+        await safePreLaunchAudit({ type: "os_sandbox_failed", profile, provider: definition.id, capabilityClass: policy.policyClass, failureCode: "invalid_sandbox_configuration" });
+        settle(errorResult(definition.id, error));
         return;
       }
 
@@ -115,36 +152,115 @@ function runProcess(
         detached: process.platform !== "win32",
         stdio: ["ignore", "pipe", "pipe"],
       };
+      // This is the final admission decision. There is deliberately no await
+      // between lease acquisition and spawn: a newly quarantined process must
+      // reject prepared work before it can create an unmanaged child.
       let child;
-      let registration: ReturnType<typeof registerChildProcess> | undefined;
+      let endAgentExecution: (() => void) | undefined;
       try {
+        endAgentExecution = beginAgentExecution();
         child = spawnProcess(command.binary, command.args, spawnOptions);
       } catch (error) {
+        endAgentExecution?.();
         await immutableRuntime?.cleanup().catch(() => undefined);
-        audit?.({ type: "os_sandbox_failed", profile, provider: definition.id, capabilityClass: policy.policyClass, failureCode: "sandbox_launch_failed" });
-        resolve(errorResult(definition.id, error));
+        await safePreLaunchAudit({ type: "os_sandbox_failed", profile, provider: definition.id, capabilityClass: policy.policyClass, failureCode: "sandbox_launch_failed" });
+        settle(errorResult(definition.id, error));
         return;
       }
 
-      // From here a ChildProcess object exists. Every later failure is a
-      // post-spawn failure and must converge through close finalization.
-      const endAgentExecution = beginAgentExecution();
+      // From here a ChildProcess object exists.  Initialize every state used
+      // by close/finalization before attempting optional listener setup.
+      // The lease was acquired immediately before synchronous spawn and is now
+      // owned by this common spawned-child finalizer.
       const stdout = new BoundedUtf8Output(MAX_OUTPUT_BYTES);
       const stderr = new BoundedUtf8Output(MAX_OUTPUT_BYTES);
-      let finished = false;
+      let closeObserved = false;
+      let finalizing = false;
+      let settledSpawned = false;
       let terminationRequested = false;
-      let pendingResult: AgentResult | undefined;
       let cleanupAudited = false;
       let forceKillTimer: NodeJS.Timeout | undefined;
+      let fallbackCloseTimer: NodeJS.Timeout | undefined;
+      let fallbackDeadlineTimer: NodeJS.Timeout | undefined;
+      let unconfirmedRetryTimer: NodeJS.Timeout | undefined;
+      let fallbackCloseActive = false;
+      let finalizationUnconfirmed = false;
+      // This is set only by the fallback observer after group death and all
+      // owned streams have crossed their close boundary.
+      let terminationConfirmed = false;
+      let releaseQuarantine: (() => void) | undefined;
+      let runtimeCleanupDeferred = false;
+      let runtimeCleaned = false;
+      let reconcileFallbackClose: (() => void) | undefined;
+      let timer: NodeJS.Timeout | undefined;
+      let abort: (() => void) | undefined;
+      let registration: ReturnType<typeof registerChildProcess> | undefined;
+      let primaryResult: AgentResult | undefined;
+      let primaryOperational = false;
       let auditError: unknown;
+      const authoritativeAudits: Promise<void>[] = [];
       let lifecycleError: unknown;
-      const auditFailure = (error: unknown) => errorResult(definition.id, error);
-      // Auditing is diagnostic side-effect work, never lifecycle control flow.
-      // Precedence at settlement is runtime violation/verification failure,
-      // then lifecycle cleanup failure, then audit failure, then process result.
+      // Identity is captured while spawn's leader is known to exist. It is
+      // retained for a later durable handoff even if that leader exits first.
+      let capturedExecution: ReturnType<typeof captureUnresolvedAgentExecution> | undefined;
+      let identityCaptureFailure: unknown;
+      try { capturedExecution = captureUnresolvedAgentExecution({ provider: definition.id, pid: child.pid ?? (process.env.NODE_ENV === "test" ? 2 : 0), runtimeBindingPath: runtimeBindingDirectory(immutableRuntime) }); }
+      catch (failure) { identityCaptureFailure = failure; }
+      const output = () => redactKnownSecrets(stdout.value()).trim();
+      const error = (reason: unknown) => errorResult(definition.id, reason);
+
+      const setOperationalFailure = (result: AgentResult) => {
+        if (primaryOperational) return;
+        primaryOperational = true;
+        primaryResult = result;
+      };
+      const signalChild = (signal: NodeJS.Signals) => {
+        try {
+          if (child.pid && process.platform !== "win32") process.kill(-child.pid, signal);
+          else child.kill(signal);
+        } catch { try { child.kill(signal); } catch { /* close observation remains authoritative */ } }
+      };
+      const requestTermination = () => {
+        if (terminationRequested) return;
+        terminationRequested = true;
+        if (registration?.id) {
+          void registration.terminate({ graceMs: FORCE_KILL_GRACE_MS }).catch((failure) => { lifecycleError ??= failure; });
+          return;
+        }
+        signalChild("SIGTERM");
+        forceKillTimer = setTimeout(() => signalChild("SIGKILL"), FORCE_KILL_GRACE_MS);
+        forceKillTimer.unref();
+      };
+      const requestFailure = (failure: unknown, terminate = true) => {
+        setOperationalFailure(error(failure));
+        if (terminate) requestTermination();
+      };
+
+      const cleanupRuntime = async () => {
+        if (runtimeCleaned) return;
+        await immutableRuntime?.cleanup();
+        runtimeCleaned = true;
+      };
+
+      // Sandbox lifecycle audits are authoritative when execution otherwise
+      // succeeds.  If execution already has an operational failure, the audit
+      // remains recorded secondary context and cannot overwrite that result.
       const captureAuditFailure = (event: Parameters<NonNullable<typeof audit>>[0]) => {
-        try { audit?.(event); }
-        catch (error) { auditError ??= error; }
+        let value: unknown;
+        try {
+          value = audit?.(event);
+        } catch (error) {
+          auditError ??= error;
+          recordAuditFailure(definition.id, "post_launch");
+          return auditError;
+        }
+        const bounded = boundedAudit(Promise.resolve(value));
+        authoritativeAudits.push(bounded);
+        void bounded.catch((error) => {
+          auditError ??= error;
+          recordAuditFailure(definition.id, "post_launch");
+          if (!closeObserved) requestTermination();
+        });
         return auditError;
       };
       const cleanupAudit = () => {
@@ -152,110 +268,241 @@ function runProcess(
         cleanupAudited = true;
         captureAuditFailure({ type: "os_sandbox_process_cleanup", profile, provider: definition.id, capabilityClass: policy.policyClass });
       };
-      // This is deliberately the only completion path after spawn.  A result
-      // can be selected by abort, timeout, an error, or normal exit, but is
-      // never exposed while the child could still be mutating its worktree.
-      const finishAfterClose = async (result: AgentResult) => {
-        if (finished) return;
-        finished = true;
-        clearTimeout(timer);
-        signal?.removeEventListener("abort", abort);
-        let verifiedResult = result;
-        let verificationError: unknown;
-        try { verifiedResult = await runOptions?.afterClose?.(result) ?? result; }
-        catch (error) { verificationError = error; }
-        let finalResult: AgentResult;
-        if (verifiedResult.runtimeViolation) finalResult = verifiedResult;
-        else if (verificationError) finalResult = errorResult(definition.id, verificationError);
-        else if (lifecycleError) finalResult = errorResult(definition.id, lifecycleError);
-        else if (auditError) finalResult = errorResult(definition.id, auditError);
-        else finalResult = verifiedResult;
-        // The guard spans close, unregister, and runtime verification, and
-        // must release even if any finalization side effect has failed.
-        try { await immutableRuntime?.cleanup(); }
-        catch (error) { finalResult = errorResult(definition.id, error); }
-        try { endAgentExecution(); }
-        finally { resolve(finalResult); }
-      };
-
-      const output = () => redactKnownSecrets(stdout.value()).trim();
-      const requestTermination = () => {
-        if (terminationRequested) return;
-        terminationRequested = true;
-        cleanupAudit();
-        if (registration?.id) {
-          // The shared registry owns process-group TERM/KILL escalation.  Do
-          // not await it here: `close` remains the definitive lifecycle gate.
-          void registration.terminate({ graceMs: FORCE_KILL_GRACE_MS }).catch((error) => { lifecycleError ??= error; });
-        } else {
-          const signalDirectGroup = (signal: NodeJS.Signals) => {
-            try {
-              if (child.pid && process.platform !== "win32") process.kill(-child.pid, signal);
-              else child.kill(signal);
-            } catch { try { child.kill(signal); } catch { /* close remains authoritative */ } }
-          };
-          signalDirectGroup("SIGTERM");
-          forceKillTimer = setTimeout(() => signalDirectGroup("SIGKILL"), FORCE_KILL_GRACE_MS);
-          forceKillTimer.unref();
-        }
-      };
-      const chooseTerminalResult = (result: AgentResult, terminate = false) => {
-        if (finished || pendingResult) return;
-        pendingResult = result;
-        if (terminate) requestTermination();
-      };
-
-      child.stdout?.on("data", (chunk) => stdout.append(chunk));
-      child.stderr?.on("data", (chunk) => stderr.append(chunk));
-      child.on("error", (error) => {
-        captureAuditFailure({ type: "os_sandbox_failed", profile, provider: definition.id, capabilityClass: policy.policyClass, failureCode: "sandbox_launch_failed" });
-        // A spawn failure with no PID has no OS child to wait for.
-        if (!child.pid) {
-          cleanupAudit();
-          finishAfterClose(errorResult(definition.id, error));
-          return;
-        }
-        chooseTerminalResult(errorResult(definition.id, error), true);
-      });
-      child.on("close", (code, closeSignal) => {
+      const finishAfterClose = async (fallback: AgentResult) => {
+        if (finalizing) return;
+        finalizing = true;
+        if (timer) clearTimeout(timer);
+        if (fallbackCloseTimer) clearInterval(fallbackCloseTimer);
+        if (fallbackDeadlineTimer) clearTimeout(fallbackDeadlineTimer);
+        if (abort) signal?.removeEventListener("abort", abort);
         try { registration?.unregister(); }
-        catch (error) { lifecycleError ??= error; }
-        if (forceKillTimer) clearTimeout(forceKillTimer);
+        catch (failure) { lifecycleError ??= failure; }
+        let verifiedResult = primaryResult ?? fallback;
+        let verificationError: unknown;
+        try { verifiedResult = await runOptions?.afterClose?.(verifiedResult) ?? verifiedResult; }
+        catch (failure) { verificationError = failure; }
+        // This is the single post-close audit location for every spawned
+        // execution, including setup and registration failures.
         cleanupAudit();
-        if (pendingResult) {
-          void finishAfterClose(pendingResult);
-          return;
+        await Promise.all(authoritativeAudits.map((audit) => audit.catch(() => undefined)));
+        let finalResult: AgentResult;
+        if (primaryOperational) finalResult = primaryResult!;
+        else if (verifiedResult.runtimeViolation) finalResult = verifiedResult;
+        else if (verificationError) finalResult = error(verificationError);
+        else if (lifecycleError) finalResult = error(lifecycleError);
+        else if (auditError) finalResult = error(auditError);
+        else finalResult = verifiedResult;
+        try { await cleanupRuntime(); }
+        catch (failure) { if (!primaryOperational) finalResult = error(failure); }
+        try { endAgentExecution!(); }
+        finally {
+          if (!settledSpawned) {
+            settledSpawned = true;
+            settle(finalResult);
+          }
         }
-        if (code === 0) {
-          void finishAfterClose({ agent: definition.id, status: "completed", output: output() });
-          return;
-        }
-        const diagnostic = stderr.value().trim();
-        if (diagnostic.startsWith("bwrap:")) {
-          captureAuditFailure({ type: "os_sandbox_violation", profile, provider: definition.id, capabilityClass: policy.policyClass, failureCode: "sandbox_launch_failed" });
-          void finishAfterClose(errorResult(definition.id, new OsSandboxUnavailableError("sandbox_launch_failed")));
-          return;
-        }
-        const exit = `Process exited with code ${code ?? "unknown"}${closeSignal ? ` (${closeSignal})` : ""}`;
-        void finishAfterClose({ agent: definition.id, status: "error", output: output(), error: diagnostic ? `${exit}: ${redactKnownSecrets(diagnostic)}` : exit });
-      });
-      const abort = () => {
-        chooseTerminalResult({ agent: definition.id, status: "error", output: output(), error: "Request was aborted" }, true);
       };
-      signal?.addEventListener("abort", abort, { once: true });
-      const timer = setTimeout(() => {
-        chooseTerminalResult({ agent: definition.id, status: "error", output: output(), error: `Process timed out after ${options.timeoutMs ?? DEFAULT_TIMEOUT_MS} ms` }, true);
-      }, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-      timer.unref();
+
+      const onClose = (code: number | null, closeSignal: NodeJS.Signals | null) => {
+        if (closeObserved) return;
+        closeObserved = true;
+        if (forceKillTimer) clearTimeout(forceKillTimer);
+        if (finalizationUnconfirmed) {
+          // A real ChildProcess close event is the canonical lifecycle
+          // boundary, including inherited stdio held by descendants.
+          terminationConfirmed = true;
+          if (terminationConfirmed) void resolveUnconfirmedTermination({ terminationConfirmed: true }).catch((failure) => { lifecycleError ??= failure; });
+          return;
+        }
+        let fallback: AgentResult;
+        if (code === 0) fallback = { agent: definition.id, status: "completed", output: output() };
+        else {
+          const diagnostic = stderr.value().trim();
+          fallback = diagnostic.startsWith("bwrap:")
+            ? error(new OsSandboxUnavailableError("sandbox_launch_failed"))
+            : { agent: definition.id, status: "error", output: output(), error: diagnostic ? `Process exited with code ${code ?? "unknown"}${closeSignal ? ` (${closeSignal})` : ""}: ${redactKnownSecrets(diagnostic)}` : `Process exited with code ${code ?? "unknown"}${closeSignal ? ` (${closeSignal})` : ""}` };
+          // A requested audit termination has no independent process failure.
+          if (!primaryOperational && !auditError) setOperationalFailure(fallback);
+        }
+        void finishAfterClose(fallback);
+      };
+      let unconfirmedReconcile: Promise<void> | undefined;
+      const scheduleUnconfirmedRetry = () => {
+        if (unconfirmedRetryTimer || !finalizationUnconfirmed) return;
+        unconfirmedRetryTimer = setTimeout(() => {
+          unconfirmedRetryTimer = undefined;
+          if (terminationConfirmed) void resolveUnconfirmedTermination({ terminationConfirmed: true }).catch((failure) => { lifecycleError ??= failure; });
+        }, 1_000);
+        unconfirmedRetryTimer.unref();
+      };
+      const resolveUnconfirmedTermination = async (confirmation: { terminationConfirmed: true }) => {
+        // This resolver is an ownership-release boundary. Its proof is
+        // intentionally non-boolean and is checked again at the boundary.
+        if (confirmation.terminationConfirmed !== true || !terminationConfirmed) throw new Error("agent_finalization_termination_unconfirmed");
+        if (unconfirmedReconcile) return unconfirmedReconcile;
+        unconfirmedReconcile = (async () => {
+        if (!finalizationUnconfirmed) return;
+        try { registration?.unregister(); }
+        catch (failure) { lifecycleError ??= failure; }
+        if (runtimeCleanupDeferred) {
+          try { await cleanupRuntime(); }
+          catch (failure) { lifecycleError ??= failure; recordAuditFailure(definition.id, "post_launch"); scheduleUnconfirmedRetry(); return; }
+        }
+        try { releaseQuarantine?.(); }
+        catch (failure) { lifecycleError ??= failure; scheduleUnconfirmedRetry(); return; }
+        releaseQuarantine = undefined;
+        finalizationUnconfirmed = false;
+        if (fallbackCloseTimer) clearInterval(fallbackCloseTimer);
+        if (fallbackDeadlineTimer) clearTimeout(fallbackDeadlineTimer);
+        if (unconfirmedRetryTimer) clearTimeout(unconfirmedRetryTimer);
+        endAgentExecution?.();
+        console.warn("agent_finalization_reconciled", JSON.stringify({ agent: definition.id }));
+        })().finally(() => { unconfirmedReconcile = undefined; });
+        return unconfirmedReconcile;
+      };
+      const reconcileUnconfirmedProcess = async () => {
+        signalChild("SIGKILL");
+        // A manual or shutdown retry does not inherit a prior assumption: it
+        // obtains a fresh identity/group result and advances only on death.
+        if (!capturedExecution) return;
+        const status = inspectUnresolvedAgentProcess(capturedExecution);
+        if (status !== "TERMINATED") {
+          console.warn("agent_finalization_reconcile_pending", JSON.stringify({ agent: definition.id, status }));
+          return;
+        }
+        terminationConfirmed = true;
+        reconcileFallbackClose?.();
+        await resolveUnconfirmedTermination({ terminationConfirmed: true });
+      };
+      const settleUnconfirmedTermination = () => {
+        if (finalizationUnconfirmed) return;
+        finalizationUnconfirmed = true;
+        // Handoff occurs before normal guard release, leaving no admission gap.
+        let quarantine;
+        try {
+          if (!capturedExecution) throw identityCaptureFailure ?? new Error("Unable to establish durable managed-process identity");
+          quarantine = durablyQuarantineCapturedUnresolvedAgentExecution(capturedExecution, async () => {
+              await reconcileUnconfirmedProcess();
+            });
+        } catch (failure) {
+          // Without a committed durable record, retain the ordinary lease as
+          // the fail-closed admission barrier. The caller still gets a bounded
+          // error, but no new execution is admitted in this server process.
+          lifecycleError ??= failure;
+          // Persistence failure cannot create a restart-safe record, but it
+          // must still be visible to shutdown as unresolved ownership. Keep
+          // both this barrier and the ordinary lease; neither is released.
+          releaseQuarantine = quarantineUnconfirmedAgentExecution({ reconcile: reconcileUnconfirmedProcess }).release;
+          runtimeCleanupDeferred = true;
+          captureAuditFailure({ type: "os_sandbox_finalization_persistence_failed", profile, provider: definition.id, capabilityClass: policy.policyClass });
+          if (!settledSpawned) { settledSpawned = true; settle({ ...(primaryOperational ? primaryResult! : error(failure)), status: "error", finalizationUnconfirmed: true, finalizationPersistenceFailed: true }); }
+          return;
+        }
+        releaseQuarantine = quarantine.release;
+        runtimeCleanupDeferred = true;
+        captureAuditFailure({ type: "os_sandbox_finalization_unconfirmed", profile, provider: definition.id, capabilityClass: policy.policyClass });
+        const finalResult: AgentResult = {
+          ...(primaryOperational ? primaryResult! : error(new Error("agent_finalization_unconfirmed"))),
+          status: "error",
+          finalizationUnconfirmed: true,
+        };
+        endAgentExecution!();
+        if (!settledSpawned) {
+          settledSpawned = true;
+          settle(finalResult);
+        }
+      };
+      if (identityCaptureFailure) requestFailure(identityCaptureFailure, true);
+      const startFallbackCloseObservation = () => {
+        if (fallbackCloseActive) return;
+        fallbackCloseActive = true;
+        const streams = [child.stdout, child.stderr].filter((stream): stream is NonNullable<typeof stream> => Boolean(stream));
+        const streamClosed = new Set(streams.filter((stream) => stream.destroyed || stream.readableEnded));
+        const markStreamClosed = (stream: NonNullable<typeof child.stdout>) => {
+          streamClosed.add(stream);
+          maybeConfirmFallbackClose();
+        };
+        const groupAlive = () => {
+          if (!child.pid || process.platform === "win32") return false;
+          try { process.kill(-child.pid, 0); return true; }
+          catch (failure) { return !(failure instanceof Error && "code" in failure && failure.code === "ESRCH"); }
+        };
+        const maybeConfirmFallbackClose = () => {
+          // exitCode/signalCode establish only leader exit; the fallback waits
+          // for the entire managed group and every owned output stream.
+          if (!groupAlive() && streamClosed.size === streams.length) {
+            terminationConfirmed = true;
+            if (finalizationUnconfirmed) void resolveUnconfirmedTermination({ terminationConfirmed: true }).catch((failure) => { lifecycleError ??= failure; });
+            else onClose(null, "SIGKILL");
+          }
+        };
+        reconcileFallbackClose = maybeConfirmFallbackClose;
+        for (const stream of streams) {
+          try {
+            EventEmitter.prototype.once.call(stream, "end", () => markStreamClosed(stream));
+            EventEmitter.prototype.once.call(stream, "close", () => markStreamClosed(stream));
+          } catch {
+            // The deadline below destroys an unobservable stream and returns
+            // a fail-closed result if no equivalent close boundary emerges.
+          }
+        }
+        fallbackCloseTimer = setInterval(maybeConfirmFallbackClose, 25);
+        fallbackCloseTimer.unref();
+        fallbackDeadlineTimer = setTimeout(() => {
+          signalChild("SIGKILL");
+          for (const stream of streams) {
+            try { stream.destroy(); } catch { /* bounded fail-closed fallback */ }
+            if (stream.destroyed || stream.readableEnded) markStreamClosed(stream);
+          }
+          maybeConfirmFallbackClose();
+          if (!closeObserved) {
+            requestFailure(new Error("Unable to confirm spawned child close boundary"), false);
+            settleUnconfirmedTermination();
+          }
+        }, FALLBACK_CLOSE_TIMEOUT_MS);
+        fallbackDeadlineTimer.unref();
+        maybeConfirmFallbackClose();
+      };
+      // Bypass overridable instance listener methods.  ChildProcess inherits
+      // EventEmitter, so this remains a confirmed-close observation even when
+      // a setup fixture makes child.on/once throw.
+      try { EventEmitter.prototype.once.call(child, "close", onClose); }
+      catch (failure) {
+        try {
+          // `on` preserves the actual ChildProcess close boundary too. It is
+          // only a one-shot observer in effect because onClose is guarded.
+          EventEmitter.prototype.on.call(child, "close", onClose);
+        } catch {
+          // Only when no EventEmitter-level close observation can be attached
+          // do we fall back to group and owned-stream confirmation.
+          startFallbackCloseObservation();
+        }
+        requestFailure(failure, true);
+      }
+      try { EventEmitter.prototype.once.call(child, "error", (failure: unknown) => {
+        captureAuditFailure({ type: "os_sandbox_failed", profile, provider: definition.id, capabilityClass: policy.policyClass, failureCode: "sandbox_launch_failed" });
+        if (!child.pid) {
+          setOperationalFailure(error(failure));
+          onClose(null, null);
+          return;
+        }
+        requestFailure(failure, true);
+      }); } catch (failure) { requestFailure(failure, true); }
+
+      finalizeSpawnedFailure = (failure) => requestFailure(failure, true);
       try {
+        child.stdout?.on("data", (chunk) => stdout.append(chunk));
+        child.stderr?.on("data", (chunk) => stderr.append(chunk));
         registration = registerChildProcess({ child, purpose: "agent" });
-        const createdAuditFailure = captureAuditFailure({ type: "os_sandbox_created", profile, provider: definition.id, capabilityClass: policy.policyClass });
-        if (createdAuditFailure) chooseTerminalResult(auditFailure(createdAuditFailure), true);
+        const createdAuditError = captureAuditFailure({ type: "os_sandbox_created", profile, provider: definition.id, capabilityClass: policy.policyClass });
+        if (createdAuditError) requestTermination();
+        abort = () => requestFailure(new Error("Request was aborted"), true);
+        signal?.addEventListener("abort", abort, { once: true });
+        timer = setTimeout(() => requestFailure(new Error(`Process timed out after ${options.timeoutMs ?? DEFAULT_TIMEOUT_MS} ms`), true), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+        timer.unref();
         if (signal?.aborted) abort();
-      } catch (error) {
-        // Listener setup is complete, so this post-spawn failure follows the
-        // exact same TERM/KILL -> close -> verification finalization path.
-        chooseTerminalResult(auditFailure(error), true);
+      } catch (failure) {
+        requestFailure(failure, true);
       }
     }
   });
@@ -263,6 +510,28 @@ function runProcess(
 
 function testSandboxCommand(binary: string, args: readonly string[]): SandboxCommand {
   return { binary: BWRAP_BINARY, args: ["--", binary, ...args], cwd: "/", env: { HOME: "/home/runtime", PATH: "/usr/bin:/bin", NODE_ENV: "test" }, sandboxCwd: SANDBOX_PROJECT_ROOT };
+}
+
+/** Audit persistence must not take ownership of an agent's lifecycle result. */
+function recordAuditFailure(agent: AgentDefinition["id"], phase: "pre_launch" | "post_launch") {
+  console.warn("agent_audit_failure", JSON.stringify({ agent, phase, reason: "audit_callback_failed" }));
+}
+
+function boundedAudit(promise: Promise<unknown>): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let done = false;
+    const finish = (action: () => void) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      action();
+    };
+    const timer = setTimeout(() => finish(() => reject(new Error("Authoritative sandbox audit timed out"))), AUTHORITATIVE_AUDIT_TIMEOUT_MS);
+    timer.unref();
+    // Both handlers are installed immediately, so a rejection occurring after
+    // timeout is still observed rather than becoming an unhandled rejection.
+    void promise.then(() => finish(resolve), (error) => finish(() => reject(error)));
+  });
 }
 
 function assertFixedLauncher(definition: AgentDefinition) {

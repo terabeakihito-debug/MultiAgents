@@ -149,7 +149,7 @@ export async function previewCleanup(candidateIds: string[], options: Evaluation
 
 export async function executeCleanup(candidateIds: string[], options: EvaluationOptions = {}) {
   const store = options.store ?? getStateStore();
-  if (Array.isArray(candidateIds) && candidateIds.length && candidateIds.every((id) => store.loadOperationByKey(`cleanup:${id}`)?.state === "persisted")) {
+  if (await cleanupPostconditionsAlreadySatisfied(candidateIds, store)) {
     return { completed: [...candidateIds], estimatedBytes: 0, idempotent: true };
   }
   const summary = await evaluateCleanupCandidates({ ...options, store });
@@ -159,7 +159,8 @@ export async function executeCleanup(candidateIds: string[], options: Evaluation
   store.appendCleanupAudit("cleanup_requested", { count: selected.length, reclaimBytes: selected.reduce((sum, item) => sum + item.estimatedBytes, 0) });
   const completed: string[] = [];
   for (const item of selected) {
-    const operation = store.createOperation({ type: operationType(item.type), taskId: item.taskId, notificationId: notificationId(item), idempotencyKey: `cleanup:${item.candidateId}`, safeMetadata: { candidateType: item.type, estimatedBytes: item.estimatedBytes } });
+    const generation = item.type === "worktree_node_modules" ? await nodeModulesGeneration(item) : undefined;
+    const operation = store.createOperation({ type: operationType(item.type), taskId: item.taskId, notificationId: notificationId(item), idempotencyKey: cleanupOperationKey(item, generation), safeMetadata: { candidateType: item.type, estimatedBytes: item.estimatedBytes, generation } });
     if (operation.state === "persisted") { completed.push(item.candidateId); continue; }
     // A worktree cleanup owns the task lease for its entire delete/persist sequence.
     // Do not register a second task operation: deleteTask receives this exact lease.
@@ -183,6 +184,50 @@ export async function executeCleanup(candidateIds: string[], options: Evaluation
   return { completed, estimatedBytes: selected.reduce((sum, item) => sum + item.estimatedBytes, 0) };
 }
 
+/**
+ * `node_modules` is regeneratable, so a prior completed deletion is reusable
+ * only while its absence is still true.  An unfinished matching journal row
+ * can safely be adopted after a crash once that absence is independently
+ * revalidated.
+ */
+async function cleanupPostconditionsAlreadySatisfied(candidateIds: string[], store: StateStore) {
+  if (!Array.isArray(candidateIds) || !candidateIds.length) return false;
+  for (const candidateId of candidateIds) {
+    const nodeModulesMatch = candidateId.match(/^worktree_node_modules:([0-9a-f-]{36})$/i);
+    if (!nodeModulesMatch) {
+      if (store.loadOperationByKey(`cleanup:${candidateId}`)?.state !== "persisted") return false;
+      continue;
+    }
+    const task = listTasks().find((item) => item.id === nodeModulesMatch[1]);
+    if (!task || !(await nodeModulesAbsentInVerifiedWorktree(task))) return false;
+    const operation = store.loadCleanupOperations("cleanup_node_modules", task.id)[0];
+    if (!operation) return false;
+    if (operation.state !== "persisted") store.updateOperation(operation.operationId, "persisted", undefined, "cleanup_postcondition_adopted");
+  }
+  return true;
+}
+
+async function nodeModulesAbsentInVerifiedWorktree(task: RepoTask) {
+  const identity = await inspectWorktree(task);
+  if (identity.reasons.length || !identity.root) return false;
+  try { await lstat(join(identity.root, "node_modules")); return false; }
+  catch (error) { return isMissing(error); }
+}
+
+async function nodeModulesGeneration(item: CleanupCandidate) {
+  const task = listTasks().find((value) => value.id === item.taskId);
+  if (!task) throw new CleanupBlockedError("Task is missing.");
+  const inspected = await inspectWorktree(task);
+  if (inspected.reasons.length || !inspected.root) throw new CleanupBlockedError("node_modules path is no longer safe.");
+  const info = await lstat(join(inspected.root, "node_modules"));
+  if (!info.isDirectory() || info.isSymbolicLink()) throw new CleanupBlockedError("node_modules path is no longer safe.");
+  return `${info.dev}-${info.ino}-${Math.trunc(info.ctimeMs)}`;
+}
+
+function cleanupOperationKey(item: CleanupCandidate, generation?: string) {
+  return generation ? `cleanup:${item.candidateId}:${generation}` : `cleanup:${item.candidateId}`;
+}
+
 function select(summary: CleanupSummary, candidateIds: string[]) {
   if (!Array.isArray(candidateIds) || !candidateIds.length || candidateIds.length > 50 || new Set(candidateIds).size !== candidateIds.length || candidateIds.some((id) => typeof id !== "string" || !/^(worktree|worktree_node_modules|backup|notification|outbound_delivery):[0-9a-f-]{36}$/i.test(id))) throw new CleanupBlockedError("Cleanup selection is invalid.");
   const byId = new Map(summary.candidates.map((item) => [item.candidateId, item]));
@@ -199,3 +244,4 @@ async function deleteCandidate(item: CleanupCandidate, store: StateStore, backup
   const id = notificationId(item)!; if (item.type === "notification") store.deleteNotificationForRetention(id); else store.deleteDeliveredOutboundForRetention(id);
 }
 export class CleanupBlockedError extends Error {}
+function isMissing(error: unknown): error is NodeJS.ErrnoException { return error instanceof Error && "code" in error && error.code === "ENOENT"; }

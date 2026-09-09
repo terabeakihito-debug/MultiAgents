@@ -41,13 +41,21 @@ export function registerChildProcess(input: { child: ChildProcess; purpose: Regi
     terminate: async (options?: { graceMs?: number }) => terminateOne(entry, options?.graceMs),
   };
   active.set(id, entry);
-  // `error` is not proof that a spawned process has gone away.  In
-  // particular, a transport error can race a still-running child.  Keep the
-  // registry entry (and therefore its shutdown ownership) until close.
-  input.child.once("close", () => unregisterChildProcess(id));
-  // Also make a registry-only child safe to observe; callers that need the
-  // diagnostic install their own error listener.
-  input.child.once("error", () => undefined);
+  try {
+    // `error` is not proof that a spawned process has gone away.  In
+    // particular, a transport error can race a still-running child.  Keep the
+    // registry entry (and therefore its shutdown ownership) until close.
+    input.child.once("close", () => unregisterChildProcess(id));
+    // Also make a registry-only child safe to observe; callers that need the
+    // diagnostic install their own error listener.
+    input.child.once("error", () => undefined);
+  } catch (error) {
+    // Registration is atomic from the runner's perspective.  A listener
+    // setup failure must not leave an unreachable active entry behind.
+    active.delete(id);
+    entry.resolveClosed();
+    throw error;
+  }
   audit("child_process_registered", entry);
   return { id, unregister: () => unregisterChildProcess(id), terminate: (options?: { graceMs?: number }) => terminateOne(entry, options?.graceMs) };
 }

@@ -61,7 +61,7 @@ export const taskEventTypes = [
   "profile_snapshot_created", "template_snapshot_created",
   "finding_created", "finding_status_changed", "finding_converted", "implementation_task_created",
   "runtime_policy_created", "runtime_execution_started", "runtime_execution_completed", "runtime_violation_detected",
-  "os_sandbox_created", "os_sandbox_failed", "os_sandbox_violation", "os_sandbox_process_cleanup",
+  "os_sandbox_created", "os_sandbox_failed", "os_sandbox_violation", "os_sandbox_process_cleanup", "os_sandbox_finalization_unconfirmed", "os_sandbox_finalization_persistence_failed",
   "human_gate_rejected", "approval_snapshot_mismatch", "post_commit_verification_failed",
 ] as const;
 export type TaskEventType = (typeof taskEventTypes)[number];
@@ -133,6 +133,16 @@ export type ApprovalEvent = {
   status?: string;
 };
 export type TaskHistory = { events: TaskEvent[]; stepVersions: StepVersion[]; diffVersions: DiffVersion[]; approvalEvents: ApprovalEvent[] };
+export type UnresolvedAgentProcess = {
+  executionId: string;
+  provider: "codex" | "cursor" | "claude";
+  pid: number;
+  pgid: number;
+  leaderStartTicks: string;
+  runtimeBindingPath?: string;
+  createdAt: string;
+  phase: "UNCONFIRMED" | "PROCESS_GONE_CLEANUP_PENDING" | "PROCESS_GONE_CLEANED";
+};
 
 type TaskRow = Record<string, unknown>;
 type FlowStepRow = Record<string, unknown>;
@@ -489,7 +499,7 @@ export class StateStore {
   clearForTests() {
     this.transaction(() => {
       this.dropAppendOnlyTriggers();
-      this.database.exec("DELETE FROM provider_compatibility_snapshots; DELETE FROM provider_compatibility_acknowledgements; DELETE FROM cleanup_audit_events; DELETE FROM retention_policy; DELETE FROM backup_metadata; DELETE FROM operations; DELETE FROM credential_audit_events; DELETE FROM outbound_audit_events; DELETE FROM notification_deliveries; DELETE FROM outbound_channel_settings; DELETE FROM notification_audit_events; DELETE FROM notifications; DELETE FROM watch_rule_state; DELETE FROM notification_preferences; DELETE FROM finding_events; DELETE FROM findings; DELETE FROM approval_events; DELETE FROM diff_versions; DELETE FROM step_versions; DELETE FROM task_events; DELETE FROM flow_steps; DELETE FROM tasks; DELETE FROM template_audit_events; DELETE FROM task_template_versions; DELETE FROM repo_template_settings; DELETE FROM task_templates; DELETE FROM profile_audit_events; DELETE FROM project_profile_versions; DELETE FROM project_profiles;");
+      this.database.exec("DELETE FROM unresolved_agent_processes; DELETE FROM provider_compatibility_snapshots; DELETE FROM provider_compatibility_acknowledgements; DELETE FROM cleanup_audit_events; DELETE FROM retention_policy; DELETE FROM backup_metadata; DELETE FROM operations; DELETE FROM credential_audit_events; DELETE FROM outbound_audit_events; DELETE FROM notification_deliveries; DELETE FROM outbound_channel_settings; DELETE FROM notification_audit_events; DELETE FROM notifications; DELETE FROM watch_rule_state; DELETE FROM notification_preferences; DELETE FROM finding_events; DELETE FROM findings; DELETE FROM approval_events; DELETE FROM diff_versions; DELETE FROM step_versions; DELETE FROM task_events; DELETE FROM flow_steps; DELETE FROM tasks; DELETE FROM template_audit_events; DELETE FROM task_template_versions; DELETE FROM repo_template_settings; DELETE FROM task_templates; DELETE FROM profile_audit_events; DELETE FROM project_profile_versions; DELETE FROM project_profiles;");
       this.createAppendOnlyTriggers();
     });
   }
@@ -778,8 +788,40 @@ export class StateStore {
     return row ? rowToOperation(row) : undefined;
   }
 
+  loadCleanupOperations(type: Extract<OperationType, "cleanup_node_modules">, taskId: string): DurableOperation[] {
+    requireUuid(taskId, "Operation relation");
+    return (this.database.prepare("SELECT * FROM operations WHERE operation_type = ? AND task_id = ? ORDER BY updated_at DESC, operation_id DESC").all(type, taskId) as TaskRow[]).map(rowToOperation);
+  }
+
   loadUnfinishedOperations(): DurableOperation[] {
     return (this.database.prepare("SELECT * FROM operations WHERE state NOT IN ('persisted','failed') ORDER BY created_at, operation_id").all() as TaskRow[]).map(rowToOperation);
+  }
+
+  saveUnresolvedAgentProcess(input: UnresolvedAgentProcess) {
+    requireUuid(input.executionId, "Unresolved execution ID");
+    if (!( ["codex", "cursor", "claude"] as string[]).includes(input.provider) || !Number.isSafeInteger(input.pid) || input.pid < 2 || !Number.isSafeInteger(input.pgid) || input.pgid < 2 || !/^\d{1,30}$/.test(input.leaderStartTicks)) throw new Error("Unresolved agent process identity is invalid");
+    if (input.runtimeBindingPath && (input.runtimeBindingPath.length > 1_000 || input.runtimeBindingPath.includes("\0"))) throw new Error("Unresolved runtime binding path is invalid");
+    if (!(["UNCONFIRMED", "PROCESS_GONE_CLEANUP_PENDING", "PROCESS_GONE_CLEANED"] as string[]).includes(input.phase)) throw new Error("Unresolved agent process phase is invalid");
+    this.database.prepare(`INSERT INTO unresolved_agent_processes
+      (execution_id, provider, pid, pgid, leader_start_ticks, runtime_binding_path, created_at, phase)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(input.executionId, input.provider, input.pid, input.pgid, input.leaderStartTicks, input.runtimeBindingPath ?? null, input.createdAt, input.phase);
+  }
+
+  loadUnresolvedAgentProcesses(): UnresolvedAgentProcess[] {
+    return (this.database.prepare("SELECT * FROM unresolved_agent_processes ORDER BY created_at, execution_id").all() as TaskRow[]).map((row) => ({
+      executionId: String(row.execution_id), provider: String(row.provider) as UnresolvedAgentProcess["provider"], pid: Number(row.pid), pgid: Number(row.pgid), leaderStartTicks: String(row.leader_start_ticks), runtimeBindingPath: optionalString(row.runtime_binding_path), createdAt: String(row.created_at), phase: String(row.phase) as UnresolvedAgentProcess["phase"],
+    }));
+  }
+
+  updateUnresolvedAgentProcessPhase(executionId: string, phase: UnresolvedAgentProcess["phase"]) {
+    requireUuid(executionId, "Unresolved execution ID");
+    this.database.prepare("UPDATE unresolved_agent_processes SET phase = ? WHERE execution_id = ?").run(phase, executionId);
+  }
+
+  deleteUnresolvedAgentProcess(executionId: string) {
+    requireUuid(executionId, "Unresolved execution ID");
+    this.database.prepare("DELETE FROM unresolved_agent_processes WHERE execution_id = ?").run(executionId);
   }
 
   saveBackupMetadata(metadata: BackupMetadata) {
@@ -1636,6 +1678,29 @@ export class StateStore {
         CREATE INDEX provider_compatibility_provider_checked_idx ON provider_compatibility_snapshots(provider, snapshot_id DESC);
       `);
       this.database.prepare("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)").run(13, new Date().toISOString());
+    });
+    if (version < 13) version = 13;
+    if (version < 14) this.transaction(() => {
+      this.database.exec(`
+        CREATE TABLE IF NOT EXISTS unresolved_agent_processes (
+          execution_id TEXT PRIMARY KEY,
+          provider TEXT NOT NULL CHECK(provider IN ('codex','cursor','claude')),
+          pid INTEGER NOT NULL CHECK(pid > 1),
+          pgid INTEGER NOT NULL CHECK(pgid > 1),
+          leader_start_ticks TEXT NOT NULL,
+          runtime_binding_path TEXT,
+          created_at TEXT NOT NULL
+        );
+      `);
+      this.database.prepare("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)").run(14, new Date().toISOString());
+    });
+    if (version < 15) this.transaction(() => {
+      // Some compatibility fixtures retain a table from a newer schema while
+      // replaying an older schema_version chain. Make this migration
+      // idempotent without weakening the on-disk phase contract.
+      const hasPhase = (this.database.prepare("PRAGMA table_info(unresolved_agent_processes)").all() as TaskRow[]).some((column) => String(column.name) === "phase");
+      if (!hasPhase) this.database.exec("ALTER TABLE unresolved_agent_processes ADD COLUMN phase TEXT NOT NULL DEFAULT 'UNCONFIRMED' CHECK(phase IN ('UNCONFIRMED','PROCESS_GONE_CLEANUP_PENDING','PROCESS_GONE_CLEANED'));");
+      this.database.prepare("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)").run(15, new Date().toISOString());
     });
     this.createAppendOnlyTriggers();
   }

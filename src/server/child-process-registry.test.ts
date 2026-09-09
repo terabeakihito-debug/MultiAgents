@@ -8,6 +8,7 @@ import { activeChildProcesses, registerChildProcess, resetChildProcessRegistryFo
 import { StateStore, replaceStateStoreForTests } from "./state-store";
 import { configureShutdownRuntime, finalizeServerShutdown, gracefulDrainOperations } from "./server-lifecycle";
 import { createOperationRegistryState } from "./operation-registry";
+import { quarantineUnconfirmedAgentExecution } from "./agent-execution-guard";
 
 function fakeChild(pid = 42) {
   const child = new EventEmitter() as EventEmitter & Partial<ChildProcess>;
@@ -189,5 +190,20 @@ describe("shutdown child process registry", () => {
     await terminateRegisteredChildren({ graceMs: 500 });
     expect(activeChildProcesses()).toEqual([]);
     expect(() => process.kill(descendantPid, 0)).toThrow();
+  });
+
+  it("does not report clean shutdown while an agent process remains quarantined", async () => {
+    const quarantine = quarantineUnconfirmedAgentExecution({ reconcile: () => undefined });
+    const coordinator = (globalThis as typeof globalThis & Record<symbol, { shutdown?: unknown; shutdownId?: unknown; runtime?: unknown }>)[Symbol.for("multiagents.lifecycle-coordinator.v1")]!;
+    try {
+      coordinator.shutdown = undefined; coordinator.shutdownId = undefined; coordinator.runtime = undefined;
+      configureShutdownRuntime({ stopAcceptingHttp: () => undefined, closeHttp: () => undefined, closeNext: () => undefined });
+      const result = await finalizeServerShutdown(100);
+      expect(result.success).toBe(false);
+      expect(result.errors.map((error) => error.message)).toContain("unconfirmed_agent_processes_remaining");
+    } finally {
+      quarantine.release();
+      coordinator.shutdown = undefined; coordinator.shutdownId = undefined; coordinator.runtime = undefined;
+    }
   });
 });

@@ -25,6 +25,7 @@ const events = load("server-ownership-events");
 const lifecycle = load("server-lifecycle", {
   "./operation-registry": registry,
   "./child-process-registry": { CHILD_PROCESS_GRACE_MS: 1, terminateRegisteredChildren: async () => ({ operationIds: [] }) },
+  "./agent-execution-guard": { hasUnconfirmedAgentExecution: () => false, reconcileUnconfirmedAgentExecutions: async () => undefined },
   "./state-store": {},
   "./server-instance-lock": lock,
   "./server-ownership-events": events,
@@ -36,6 +37,7 @@ const startup = load("operational-startup", {
   "./server-lifecycle": lifecycle,
   "./operation-registry": registry,
   "./tasks": { initializeTaskRecovery: async () => undefined },
+  "./agent-execution-guard": { restoreDurableUnconfirmedAgentExecutions: async () => undefined },
   "./server-ownership-events": events,
 });
 
@@ -74,6 +76,7 @@ assert.throws(() => reloadedRegistry.beginRegisteredOperation("reloaded-after-lo
 const reloadedLifecycle = load("server-lifecycle", {
   "./operation-registry": registry,
   "./child-process-registry": { CHILD_PROCESS_GRACE_MS: 1, terminateRegisteredChildren: async () => ({ operationIds: [] }) },
+  "./agent-execution-guard": { hasUnconfirmedAgentExecution: () => false, reconcileUnconfirmedAgentExecutions: async () => undefined },
   "./state-store": {},
   "./server-instance-lock": lock,
   "./server-ownership-events": events,

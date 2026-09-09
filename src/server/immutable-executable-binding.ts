@@ -7,6 +7,18 @@ import { securePrivateDirectory } from "./state-path";
 
 const RUNTIME_BINDING_ROOT = join(homedir(), ".multiagents", "runtime", "provider-bindings");
 
+/** The only durable cleanup target accepted after an unconfirmed child dies. */
+export async function cleanupDeferredRuntimeBinding(directory: string) {
+  if (!isAbsoluteBindingDirectory(directory)) throw new Error("Deferred runtime binding path is unsafe");
+  await rm(directory, { recursive: true, force: true });
+}
+
+export function runtimeBindingDirectory(input: { codexRuntime?: { stagedExecutable: string }; cursorRuntime?: { stagedRuntimeRoot: string }; claudeRuntime?: { stagedExecutable: string } } | undefined) {
+  if (input?.cursorRuntime) return input.cursorRuntime.stagedRuntimeRoot;
+  const executable = input?.codexRuntime?.stagedExecutable ?? input?.claudeRuntime?.stagedExecutable;
+  return executable ? join(executable, "..") : undefined;
+}
+
 export type ExecutableContentIdentity = {
   digest: string;
   dev: number;
@@ -109,6 +121,12 @@ function secureBindingRoot() {
   securePrivateDirectory(join(homedir(), ".multiagents"));
   securePrivateDirectory(join(homedir(), ".multiagents", "runtime"));
   securePrivateDirectory(RUNTIME_BINDING_ROOT);
+}
+
+function isAbsoluteBindingDirectory(directory: string) {
+  if (!directory.startsWith(`${RUNTIME_BINDING_ROOT}/`) || directory.includes("\0")) return false;
+  const name = directory.slice(RUNTIME_BINDING_ROOT.length + 1);
+  return /^[0-9a-f-]{36}$/.test(name);
 }
 
 async function openSource(path: string) {
