@@ -1,7 +1,7 @@
-import { chmod, mkdtemp, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import { aggregateRuntimeArtifactIdentity, executableContentIdentity, prepareImmutableExecutableBinding, prepareImmutableRuntimeBinding } from "./immutable-executable-binding";
@@ -68,6 +68,22 @@ describe("immutable Codex executable binding", () => {
 });
 
 describe("immutable Cursor and Claude runtime bindings", () => {
+  it.skipIf(process.env.MULTIAGENTS_LIVE_CURSOR_STAGING !== "1")("runs the installed Cursor version probe entirely from its staged runtime", async () => {
+    const launcher = join(homedir(), ".local", "bin", "agent");
+    const runtimeRoot = dirname(await realpath(launcher));
+    const manifest = await cursorRuntimeManifestForTests(runtimeRoot);
+    const staged = await prepareImmutableRuntimeBinding(manifest.artifacts.map((artifact) => ({ ...artifact, sourcePath: join(runtimeRoot, artifact.name) })));
+    try {
+      const command = buildSandboxCommand({ profile: "agent_read_only", provider: "cursor", cwd: process.cwd(), command: { binary: "agent", args: ["--version"] }, pseudoTty: true, cursorRuntime: { stagedRuntimeRoot: staged.directory, aggregateDigest: staged.aggregateDigest } });
+      const result = await execute(command.binary, command.args, { cwd: command.cwd, env: command.env }).catch((error: { stdout?: string; stderr?: string }) => {
+        throw new Error(`staged Cursor probe failed: ${error.stdout ?? ""}\n${error.stderr ?? ""}`);
+      });
+      expect(result.stdout).toContain("2026.09.02-c22c1a3");
+      expect(command.args).toContain(staged.directory);
+      expect(command.args).not.toContain(runtimeRoot);
+    } finally { await staged.cleanup(); }
+  }, 15_000);
+
   it("pins Cursor's wrapper, node, and index chain after source replacement and deletion", async () => {
     const root = await mkdtemp(join(tmpdir(), "multiagents-immutable-cursor-"));
     const put = async (name: string, content: string, mode: number) => { const path = join(root, name); await writeFile(path, content); await chmod(path, mode); return path; };
@@ -91,23 +107,31 @@ describe("immutable Cursor and Claude runtime bindings", () => {
     try {
       await put("cursor-agent", "#!/bin/sh\nexec \"$(dirname \"$0\")/node\" \"$(dirname \"$0\")/index.js\" \"$@\"\n", 0o755);
       await put("node", "#!/bin/sh\nexec /bin/sh \"$1\"\n", 0o755);
-      await put("index.js", "# __webpack_require__.u=e=>e+'.index.js'; require('./'+__webpack_require__.u(t)); cursorsandbox\ntest -f \"$(dirname \"$0\")/2.index.js\" || exit 91\nprintf 'A\\n'\n", 0o644);
+      await put("index.js", "# __webpack_require__.u=e=>e+'.index.js'; require('./'+__webpack_require__.u(t)); cursorsandbox getRipgrepBinaryPath\ntest -f \"$(dirname \"$0\")/2.index.js\" || exit 91\nprintf 'A\\n'\n", 0o644);
       await put("cursorsandbox", "#!/bin/sh\nexit 0\n", 0o755);
+      await put("rg", "#!/bin/sh\nexit 0\n", 0o755);
       await put("10.index.js", "# chunk 10\n", 0o644); await put("2.index.js", "# chunk 2\n", 0o644);
+      await mkdir(join(root, "node_modules", "tree-sitter"), { recursive: true });
+      await writeFile(join(root, "node_modules", "tree-sitter", "index.js"), "module.exports = {};\n");
+      await chmod(join(root, "node_modules", "tree-sitter", "index.js"), 0o644);
+      await put("merkle-tree-napi.linux-x64-gnu.node", "native-addon", 0o755);
       await put("unrelated.js", "not a runtime chunk\n", 0o644);
       const manifest = await cursorRuntimeManifestForTests(root);
-      expect(manifest.artifacts.map((artifact) => artifact.name)).toEqual(["cursor-agent", "node", "index.js", "cursorsandbox", "10.index.js", "2.index.js"]);
+      expect(manifest.artifacts.map((artifact) => artifact.name)).toEqual(["cursor-agent", "node", "index.js", "cursorsandbox", "rg", "10.index.js", "2.index.js", "merkle-tree-napi.linux-x64-gnu.node", "node_modules/tree-sitter/index.js"]);
       await writeFile(join(root, "unrelated.js"), "changed but not in the runtime closure\n");
       expect((await cursorRuntimeManifestForTests(root)).aggregateDigest).toBe(manifest.aggregateDigest);
       const staged = await prepareImmutableRuntimeBinding(manifest.artifacts.map((artifact) => ({ ...artifact, sourcePath: join(root, artifact.name) })));
       expect(staged.aggregateDigest).toBe(manifest.aggregateDigest);
       expect(staged.aggregateDigest).toBe(aggregateRuntimeArtifactIdentity(manifest.artifacts));
-      expect(Object.keys(staged.paths).sort()).toEqual(["10.index.js", "2.index.js", "cursor-agent", "cursorsandbox", "index.js", "node"]);
+      expect(Object.keys(staged.paths).sort()).toEqual(["10.index.js", "2.index.js", "cursor-agent", "cursorsandbox", "index.js", "merkle-tree-napi.linux-x64-gnu.node", "node", "node_modules/tree-sitter/index.js", "rg"]);
+      expect((await stat(join(staged.directory, "node_modules", "tree-sitter", "index.js"))).mode & 0o777).toBe(0o400);
       const command = buildSandboxCommand({ profile: "agent_read_only", provider: "cursor", cwd: root, command: { binary: "agent", args: [] }, cursorRuntime: { stagedRuntimeRoot: staged.directory, aggregateDigest: staged.aggregateDigest } });
       expect((await execute(command.binary, command.args, { cwd: command.cwd, env: command.env })).stdout.trim()).toBe("A");
       expect(command.args).toContain(staged.directory);
       for (const artifact of manifest.artifacts) expect(command.args).not.toContain(join(root, artifact.name));
       await writeFile(join(root, "2.index.js"), "# changed chunk\n");
+      expect((await cursorRuntimeManifestForTests(root)).aggregateDigest).not.toBe(manifest.aggregateDigest);
+      await writeFile(join(root, "node_modules", "tree-sitter", "index.js"), "module.exports = { changed: true };\n");
       expect((await cursorRuntimeManifestForTests(root)).aggregateDigest).not.toBe(manifest.aggregateDigest);
       await staged.cleanup();
     } finally { await rm(root, { recursive: true, force: true }); }

@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { closeSync, constants, fsyncSync, openSync } from "node:fs";
 import { chmod, lstat, mkdir, open, realpath, rm } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { securePrivateDirectory } from "./state-path";
 
 const RUNTIME_BINDING_ROOT = join(homedir(), ".multiagents", "runtime", "provider-bindings");
@@ -77,15 +77,18 @@ export async function prepareImmutableExecutableBinding(sourcePath: string, appr
 
 /** Stages a minimal, deterministic runtime view from approved file objects. */
 export async function prepareImmutableRuntimeBinding(artifacts: readonly RuntimeArtifact[]): Promise<ImmutableRuntimeBinding> {
-  if (!artifacts.length || new Set(artifacts.map((artifact) => artifact.name)).size !== artifacts.length || artifacts.some((artifact) => !/^[A-Za-z0-9._-]{1,80}$/.test(artifact.name))) throw new Error("Provider runtime artifact layout is invalid");
+  if (!artifacts.length || new Set(artifacts.map((artifact) => artifact.name)).size !== artifacts.length || artifacts.some((artifact) => !isSafeRuntimeArtifactName(artifact.name))) throw new Error("Provider runtime artifact layout is invalid");
   secureBindingRoot();
   const directory = join(RUNTIME_BINDING_ROOT, randomUUID());
+  const stagedDirectories = new Set<string>();
   try {
     await mkdir(directory, { mode: 0o700 });
     const paths: Record<string, string> = {};
     const stagedArtifacts: RuntimeArtifact[] = [];
     for (const artifact of [...artifacts].sort((a, b) => a.name.localeCompare(b.name))) {
       const targetPath = join(directory, artifact.name);
+      const parent = dirname(targetPath);
+      if (parent !== directory) { await mkdir(parent, { recursive: true, mode: 0o700 }); stagedDirectories.add(parent); }
       const source = await openSource(artifact.sourcePath);
       try {
         const before = await checkedFileStat(source, artifact.executable !== false);
@@ -108,13 +111,30 @@ export async function prepareImmutableRuntimeBinding(artifacts: readonly Runtime
         } finally { await target.close(); }
       } finally { await source.close(); }
     }
+    // Parents must remain writable while their descendants are being staged,
+    // then become traversal-only before the immutable directory is exposed.
+    await Promise.all([...stagedDirectories].sort((a, b) => b.length - a.length).map((path) => chmod(path, 0o500)));
     await fsyncDirectory(directory);
     const aggregateDigest = aggregateRuntimeArtifactIdentity(stagedArtifacts);
-    return { directory, paths, aggregateDigest, cleanup: async () => { await rm(directory, { recursive: true, force: true }); } };
+    return {
+      directory, paths, aggregateDigest,
+      cleanup: async () => {
+        await Promise.all([...stagedDirectories].map((path) => chmod(path, 0o700).catch(() => undefined)));
+        await rm(directory, { recursive: true, force: true });
+      },
+    };
   } catch (error) {
+    await Promise.all([...stagedDirectories].map((path) => chmod(path, 0o700).catch(() => undefined)));
     await rm(directory, { recursive: true, force: true }).catch(() => undefined);
     throw error;
   }
+}
+
+/** Nested paths preserve a bundled runtime's module-resolution layout. */
+function isSafeRuntimeArtifactName(name: string) {
+  if (!name || name.length > 512 || name.includes("\\0") || name.startsWith("/")) return false;
+  const parts = name.split("/");
+  return parts.every((part) => part !== "." && part !== ".." && /^[A-Za-z0-9@._-]{1,80}$/.test(part));
 }
 
 function secureBindingRoot() {

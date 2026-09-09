@@ -13,7 +13,7 @@ import { getStateStore } from "./state-store";
 import { runHardenedProcess } from "./pull-request";
 
 const DIAGNOSTIC_TTL_MS = 24 * 60 * 60 * 1_000;
-const PARSER_AND_SANDBOX_POLICY_VERSION = "provider-parser-sandbox-21c8-cursor-runtime-manifest";
+const PARSER_AND_SANDBOX_POLICY_VERSION = "provider-parser-sandbox-21c8-cursor-runtime-manifest-nested-deps";
 const CODEX_RUNTIME_RESOLVER = join(process.cwd(), "src", "server", "codex-runtime-resolver.mjs");
 const CODEX_RUNTIME_RESOLUTION_TIMEOUT_MS = 2_000;
 export const PROVIDER_COMPATIBILITY_POLICY_VERSION = createHash("sha256")
@@ -164,6 +164,9 @@ async function captureProviderExecutionIdentity(provider: AgentId, context = cur
 const CURSOR_CHUNK_NAME = /^\d+\.index\.js$/;
 const MAX_CURSOR_RUNTIME_CHUNKS = 512;
 const MAX_CURSOR_RUNTIME_CHUNK_BYTES = 128 * 1024 * 1024;
+const CURSOR_NATIVE_ADDON_NAME = /^[A-Za-z0-9._-]+\.node$/;
+const MAX_CURSOR_RUNTIME_DEPENDENCY_FILES = 512;
+const MAX_CURSOR_RUNTIME_DEPENDENCY_BYTES = 192 * 1024 * 1024;
 
 /**
  * Cursor's supported bundled layout uses webpack's deterministic numeric
@@ -190,6 +193,11 @@ async function discoverCursorRuntimeManifest(runtimeRoot: string): Promise<Curso
   if (/\bcursorsandbox\b/.test(indexSource)) {
     artifacts.push({ name: "cursorsandbox", identity: await executableContentIdentity(join(runtimeRoot, "cursorsandbox")) });
   }
+  // Cursor's startup path configures its bundled ripgrep before it prints
+  // version metadata. It deliberately does not use an arbitrary PATH entry.
+  if (/\bgetRipgrepBinaryPath\b|\bripgrep\b/.test(indexSource)) {
+    artifacts.push({ name: "rg", identity: await executableContentIdentity(join(runtimeRoot, "rg")) });
+  }
   // The current supported Cursor bundle uses this webpack mapping for every
   // lazily loaded numbered chunk.  A different loader is an unsupported
   // runtime layout rather than permission to mount the whole install tree.
@@ -206,6 +214,18 @@ async function discoverCursorRuntimeManifest(runtimeRoot: string): Promise<Curso
       artifacts.push({ name, identity, executable: false });
     }
   }
+  // Cursor's bundled entrypoint also retains a deliberately small external
+  // node_modules tree for native modules such as tree-sitter. Preserve that
+  // relative layout rather than granting the sandbox access to the mutable
+  // installation directory. The root-level addons are webpack externals.
+  const entries = await readdir(runtimeRoot, { withFileTypes: true });
+  for (const entry of entries.filter((entry) => entry.isFile() && CURSOR_NATIVE_ADDON_NAME.test(entry.name)).sort((a, b) => a.name.localeCompare(b.name))) {
+    artifacts.push({ name: entry.name, identity: await executableContentIdentity(join(runtimeRoot, entry.name), false), executable: false });
+  }
+  if (entries.some((entry) => entry.name === "node_modules" && entry.isDirectory())) {
+    const dependencies = await cursorRuntimeDependencyArtifacts(join(runtimeRoot, "node_modules"));
+    artifacts.push(...dependencies);
+  }
   for (const artifact of artifacts) assertCursorRuntimeArtifactSecurity(artifact);
   return {
     runtimeRoot,
@@ -213,6 +233,27 @@ async function discoverCursorRuntimeManifest(runtimeRoot: string): Promise<Curso
     aggregateDigest: aggregateRuntimeArtifactIdentity(artifacts),
     sourceSecurityDigest: createHash("sha256").update(JSON.stringify([...artifacts].sort((a, b) => a.name.localeCompare(b.name)).map(({ name, executable, identity }) => ({ name, executable: executable !== false, ...identity })))).digest("hex"),
   };
+}
+
+async function cursorRuntimeDependencyArtifacts(directory: string, prefix = "node_modules"): Promise<CursorRuntimeManifestArtifact[]> {
+  const artifacts: CursorRuntimeManifestArtifact[] = [];
+  let totalBytes = 0;
+  const visit = async (path: string, relativePath: string): Promise<void> => {
+    const entries = await readdir(path, { withFileTypes: true });
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      const name = `${relativePath}/${entry.name}`;
+      const sourcePath = join(path, entry.name);
+      if (entry.isDirectory()) { await visit(sourcePath, name); continue; }
+      if (!entry.isFile()) throw new Error("Cursor runtime has an unsupported dependency layout");
+      const identity = await executableContentIdentity(sourcePath, false);
+      totalBytes += identity.size;
+      if (++dependencyFileCount > MAX_CURSOR_RUNTIME_DEPENDENCY_FILES || totalBytes > MAX_CURSOR_RUNTIME_DEPENDENCY_BYTES) throw new Error("Cursor runtime dependencies exceed the supported size limit");
+      artifacts.push({ name, identity, executable: false });
+    }
+  };
+  let dependencyFileCount = 0;
+  await visit(directory, prefix);
+  return artifacts;
 }
 
 function assertCursorRuntimeArtifactSecurity(artifact: CursorRuntimeManifestArtifact) {
