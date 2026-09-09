@@ -1,10 +1,12 @@
 import { databaseReadiness } from "./operational-health";
 import { providerDiagnostics } from "./provider-diagnostics";
 import { abortServerStartup, assertActiveServerOwnership, hasActiveServerOwnershipLease, installServerLifecycle } from "./server-lifecycle";
+import type { ServerInstanceLease } from "./server-instance-lock";
 import { initializeTaskRecovery } from "./tasks";
 import { onServerOwnershipLost } from "./server-ownership-events";
+import { hasMutationOwnershipPredicate, lifecycleState, ownershipLostEver } from "./operation-registry";
 
-type StartupState = { state: "UNINITIALIZED" | "STARTING" | "RUNNING" | "FAILED"; promise?: Promise<void>; attemptId?: string };
+type StartupState = { state: "UNINITIALIZED" | "STARTING" | "RUNNING" | "FAILED"; promise?: Promise<void>; attemptId?: string; lease?: ServerInstanceLease };
 // Startup state is module-private.  Ownership is revalidated before RUNNING,
 // and the process-global ownership latch in lifecycle rejects any post-loss
 // restart after a module reload.
@@ -20,15 +22,37 @@ export function initializeOperationalStartup() {
   if (startup.state === "STARTING" && startup.promise) return startup.promise;
   startup.state = "STARTING"; startup.attemptId = crypto.randomUUID();
   const attemptId = startup.attemptId;
-  let lease: Awaited<ReturnType<typeof installServerLifecycle>> | undefined;
   startup.promise = (async () => {
-    lease = await installServerLifecycle();
+    startup.lease = await installServerLifecycle();
     databaseReadiness();
     await initializeTaskRecovery();
+    assertCurrentAttempt(attemptId);
     await providerDiagnostics();
-    if (startup.attemptId !== attemptId) throw new Error("Operational startup attempt was invalidated");
-    assertActiveServerOwnership(lease);
+    assertCurrentAttempt(attemptId);
+    assertOperationalStartupReady(startup.lease);
     startup.state = "RUNNING";
-  })().catch(async (error) => { if (startup.attemptId === attemptId) { await abortServerStartup(lease); startup.state = "FAILED"; startup.promise = undefined; } throw error; });
+  })().catch(async (error) => { if (startup.attemptId === attemptId) { await abortServerStartup(startup.lease); startup.lease = undefined; startup.state = "FAILED"; startup.promise = undefined; } throw error; });
   return startup.promise;
+}
+
+/** Explicit readiness gate shared by the custom launcher and instrumentation. */
+export function assertOperationalStartupReady(lease?: ServerInstanceLease): asserts lease is ServerInstanceLease {
+  if (!lease || lifecycleState() !== "RUNNING" || ownershipLostEver() || !hasMutationOwnershipPredicate()) {
+    throw new Error("Operational startup readiness assertion failed");
+  }
+  assertActiveServerOwnership(lease);
+}
+
+/** Cancels an in-flight initializer before it can start further reconciliation. */
+export async function abortOperationalStartup() {
+  if (startup.state !== "STARTING") return;
+  startup.attemptId = undefined;
+  await abortServerStartup(startup.lease);
+  startup.lease = undefined;
+  startup.state = "FAILED";
+  startup.promise = undefined;
+}
+
+function assertCurrentAttempt(attemptId: string) {
+  if (startup.attemptId !== attemptId) throw new Error("Operational startup attempt was invalidated");
 }

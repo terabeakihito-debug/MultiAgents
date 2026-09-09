@@ -41,4 +41,25 @@ describe("operational startup ownership invariant", () => {
     lost();
     await expect(startup.initializeOperationalStartup()).rejects.toThrow("restart required");
   });
+
+  it("joins one in-flight operational initializer", async () => {
+    let continueRecovery!: () => void;
+    const recovery = new Promise<void>((resolve) => { continueRecovery = resolve; });
+    const install = vi.fn(async () => ({ instanceId: "lease-c", isActive: () => true }));
+    vi.doMock("./server-lifecycle", () => ({
+      installServerLifecycle: install, abortServerStartup: vi.fn(), hasActiveServerOwnershipLease: () => true,
+      assertActiveServerOwnership: vi.fn(),
+    }));
+    vi.doMock("./operation-registry", () => ({ lifecycleState: () => "RUNNING", ownershipLostEver: () => false, hasMutationOwnershipPredicate: () => true }));
+    vi.doMock("./operational-health", () => ({ databaseReadiness: vi.fn() }));
+    vi.doMock("./tasks", () => ({ initializeTaskRecovery: () => recovery }));
+    vi.doMock("./provider-diagnostics", () => ({ providerDiagnostics: vi.fn(async () => undefined) }));
+    const startup = await import("./operational-startup");
+    const first = startup.initializeOperationalStartup();
+    const second = startup.initializeOperationalStartup();
+    expect(second).toBe(first);
+    continueRecovery();
+    await first;
+    expect(install).toHaveBeenCalledTimes(1);
+  });
 });

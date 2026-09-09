@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { activeChildProcesses, registerChildProcess, resetChildProcessRegistryForTests, terminateRegisteredChildren } from "./child-process-registry";
 import { StateStore, replaceStateStoreForTests } from "./state-store";
-import { finalizeServerShutdown, gracefulDrainOperations } from "./server-lifecycle";
+import { configureShutdownRuntime, finalizeServerShutdown, gracefulDrainOperations } from "./server-lifecycle";
 import { createOperationRegistryState } from "./operation-registry";
 
 function fakeChild(pid = 42) {
@@ -108,10 +108,72 @@ describe("shutdown child process registry", () => {
     registry.leaveMaintenanceMode();
   });
 
+  it("fails closed when acquired required resources have no shutdown callback", async () => {
+    const store = new StateStore(":memory:"); replaceStateStoreForTests(store);
+    const events: Array<Record<string, unknown>> = [];
+    const info = vi.spyOn(console, "info").mockImplementation((...args: unknown[]) => { if (args[0] === "shutdown_event" && typeof args[1] === "string") events.push(JSON.parse(args[1])); });
+    const coordinator = (globalThis as typeof globalThis & Record<symbol, { ownershipAcquired?: boolean }>)[Symbol.for("multiagents.lifecycle-coordinator.v1")]!;
+    coordinator.ownershipAcquired = true;
+    configureShutdownRuntime({ resources: { httpListening: true, nextPrepared: true }, stopAcceptingHttp: () => undefined });
+    const result = await finalizeServerShutdown(100);
+    expect(events.some((event) => event.phase === "http_close_failed")).toBe(true);
+    expect(events.some((event) => event.phase === "next_close_failed")).toBe(true);
+    expect(events.some((event) => event.phase === "ownership_release_failed")).toBe(true);
+    expect(events.some((event) => event.phase === "http_close_skipped")).toBe(false);
+    expect(result.success).toBe(false); expect(result.errors.length).toBeGreaterThanOrEqual(3);
+    info.mockRestore(); coordinator.ownershipAcquired = false;
+    const reset = coordinator as { shutdown?: unknown; shutdownId?: unknown; runtime?: unknown }; reset.shutdown = undefined; reset.shutdownId = undefined; reset.runtime = undefined;
+  });
+
+  it("reports a persisted unreconciled journal row and continues cleanup after an entry failure", async () => {
+    const root = await mkdtemp(join(tmpdir(), "multiagents-phase21e3-journal-")); const database = join(root, "state.db");
+    const store = new StateStore(database); replaceStateStoreForTests(store);
+    const first = store.createOperation({ type: "git_push", idempotencyKey: `git_push:${crypto.randomUUID()}` });
+    const second = store.createOperation({ type: "git_push", idempotencyKey: `git_push:${crypto.randomUUID()}` });
+    store.updateOperation(first.operationId, "executing"); store.updateOperation(second.operationId, "executing");
+    const update = store.updateOperation.bind(store); let failFirst = true;
+    vi.spyOn(store, "updateOperation").mockImplementation(((operationId: string, state: never, details?: never, errorCode?: never) => {
+      if (operationId === first.operationId && failFirst) { failFirst = false; throw new Error("fixture journal update failure"); }
+      return update(operationId, state, details, errorCode);
+    }) as typeof store.updateOperation);
+    const events: Array<Record<string, unknown>> = []; const release = vi.fn(async () => ({ status: "released" as const }));
+    const info = vi.spyOn(console, "info").mockImplementation((...args: unknown[]) => { if (args[0] === "shutdown_event" && typeof args[1] === "string") events.push(JSON.parse(args[1])); });
+    const coordinator = (globalThis as typeof globalThis & Record<symbol, { lease?: unknown }>)[Symbol.for("multiagents.lifecycle-coordinator.v1")]!;
+    coordinator.lease = { release };
+    configureShutdownRuntime({ stopAcceptingHttp: () => undefined, closeHttp: () => undefined, closeNext: () => undefined });
+    const result = await finalizeServerShutdown(100);
+    const verified = new StateStore(database).loadUnfinishedOperations();
+    const journal = events.find((event) => event.phase === "journal_reconcile_failed");
+    expect(journal).toMatchObject({ unfinishedOperationsBefore: 2, unfinishedOperationsAfter: 1, attempted: 2, succeeded: 1, failed: 1, remaining: 1 });
+    expect(events.some((event) => event.phase === "journal_reconcile_completed")).toBe(false);
+    expect(events.some((event) => event.phase === "state_close_completed")).toBe(true);
+    expect(events.some((event) => event.phase === "http_close_completed")).toBe(true);
+    expect(events.some((event) => event.phase === "next_close_completed")).toBe(true);
+    expect(events.some((event) => event.phase === "ownership_release_completed")).toBe(true);
+    expect(release).toHaveBeenCalledOnce(); expect(result.success).toBe(false); expect(result.errors).toHaveLength(1);
+    expect(verified.filter((operation) => operation.state !== "reconcile_required")).toHaveLength(1);
+    info.mockRestore(); coordinator.lease = undefined;
+    (coordinator as { shutdown?: unknown; shutdownId?: unknown; runtime?: unknown }).shutdown = undefined;
+    (coordinator as { shutdown?: unknown; shutdownId?: unknown; runtime?: unknown }).shutdownId = undefined;
+    (coordinator as { shutdown?: unknown; shutdownId?: unknown; runtime?: unknown }).runtime = undefined;
+  });
+
   it("flushes shutdown state by closing the database", async () => {
     const root = await mkdtemp(join(tmpdir(), "multiagents-phase196-lock-"));
     const store = new StateStore(join(root, "state.db")); replaceStateStoreForTests(store);
-    await finalizeServerShutdown(100);
+    const events: Array<Record<string, unknown>> = [];
+    const info = vi.spyOn(console, "info").mockImplementation((...args: unknown[]) => {
+      if (args[0] === "shutdown_event" && typeof args[1] === "string") events.push(JSON.parse(args[1]));
+    });
+    configureShutdownRuntime({ stopAcceptingHttp: () => undefined, cleanupRuntime: () => undefined, closeHttp: () => undefined, closeNext: () => undefined });
+    const result = await finalizeServerShutdown(100);
+    const phases = events.map((event) => String(event.phase));
+    const ordered = ["shutdown_started", "mutation_gate_closed", "child_drain_completed", "journal_reconcile_completed", "state_close_completed", "runtime_cleanup_completed", "http_close_completed", "next_close_completed", "ownership_release_started", "ownership_release_skipped", "shutdown_completed"];
+    for (let index = 1; index < ordered.length; index++) expect(phases.indexOf(ordered[index - 1]!)).toBeLessThan(phases.indexOf(ordered[index]!));
+    for (const phase of ["shutdown_started", "child_drain_started", "state_close_started", "ownership_release_started", "ownership_release_skipped", "shutdown_completed"]) expect(phases.filter((item) => item === phase)).toHaveLength(1);
+    expect(new Set(events.map((event) => event.shutdownId))).toEqual(new Set([result.shutdownId]));
+    expect(result.success).toBe(true);
+    info.mockRestore();
     expect(() => store.schemaVersion()).toThrow();
   });
 

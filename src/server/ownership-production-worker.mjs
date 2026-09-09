@@ -34,6 +34,7 @@ const startup = load("operational-startup", {
   "./operational-health": { databaseReadiness: () => undefined },
   "./provider-diagnostics": { providerDiagnostics: async () => undefined },
   "./server-lifecycle": lifecycle,
+  "./operation-registry": registry,
   "./tasks": { initializeTaskRecovery: async () => undefined },
   "./server-ownership-events": events,
 });

@@ -3,9 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev -H 127.0.0.1",
+    "dev": "node server.mjs --dev",
     "build": "next build",
-    "start": "next start -H 127.0.0.1",
+    "start": "NODE_ENV=production node server.mjs",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
