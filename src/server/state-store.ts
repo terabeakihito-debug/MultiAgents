@@ -3,6 +3,7 @@ import { chmodSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { CURRENT_SCHEMA_VERSION } from "./schema-compatibility";
 import type { FlowStep } from "../agents/types";
 import type { ProviderCompatibilitySnapshot } from "../health/types";
 import type { CredentialCapability, CredentialStatus } from "../credentials/types";
@@ -46,8 +47,8 @@ import {
 
 export const STATE_DIRECTORY = join(homedir(), ".multiagents");
 export const STATE_DATABASE = join(STATE_DIRECTORY, "state.db");
-export const APP_STATE_COMPAT = Object.freeze({ minSchema: 9, maxSchema: 13 });
-export const SCHEMA_VERSION = APP_STATE_COMPAT.maxSchema;
+export { APP_STATE_COMPAT } from "./schema-compatibility";
+export const SCHEMA_VERSION = CURRENT_SCHEMA_VERSION;
 const MAX_STORED_PROMPT_CHARS = 20_000;
 const MAX_STORED_OUTPUT_CHARS = 1_000_000;
 

@@ -27,6 +27,11 @@ export function isTaskLocked(taskId: string) {
   return locks.has(taskId);
 }
 
+/** True only while this exact lease is the current owner for the task. */
+export function holdsTaskLock(taskId: string, lease: symbol) {
+  return releases.get(taskId)?.lease === lease;
+}
+
 export function clearTaskLocksForTests() {
   locks.clear();
   for (const { release } of releases.values()) release();

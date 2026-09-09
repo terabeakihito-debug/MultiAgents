@@ -5,6 +5,9 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import net from "node:net";
 import { getServerOwnershipSocketName } from "../src/server/server-ownership-socket.mjs";
+import { readFileSync } from "node:fs";
+
+const schemaPolicy = JSON.parse(readFileSync(new URL("../src/server/state-schema-compatibility.json", import.meta.url), "utf8"));
 
 const backupId = process.argv[2];
 if (!backupId || !/^[0-9a-f-]{36}$/i.test(backupId)) fail("Usage: npm run state:restore -- <backup-id>");
@@ -42,9 +45,11 @@ async function validate(path) {
     const integrity = db.prepare("PRAGMA integrity_check").get();
     if (integrity.integrity_check !== "ok") fail("Backup integrity check failed");
     const schema = Number(db.prepare("SELECT MAX(version) AS version FROM schema_version").get().version ?? 0);
-    if (schema < 9 || schema > 13) fail("Backup schema is incompatible with this application");
+    if (schema < schemaPolicy.minMigratableSchemaVersion) fail("Backup schema is too old to migrate");
+    if (schema > schemaPolicy.maxSupportedSchemaVersion) fail("Backup schema is newer than supported");
+    for (let next = schema + 1; next <= schemaPolicy.currentSchemaVersion; next++) if (!schemaPolicy.migrationSteps.includes(next)) fail("Backup migration path is incomplete");
     const tables = new Set(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((row) => row.name));
-    for (const name of ["tasks", "task_events", "findings", "notifications", "operations", "backup_metadata", "provider_compatibility_snapshots", "provider_compatibility_acknowledgements"]) if (!tables.has(name)) fail(`Backup is missing required table ${name}`);
+    for (const name of schemaPolicy.requiredTables[String(schema)] ?? []) if (!tables.has(name)) fail(`Backup is missing required table ${name}`);
   } finally { db.close(); }
 }
 

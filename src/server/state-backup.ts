@@ -3,11 +3,11 @@ import { access, chmod, open, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { backup, DatabaseSync } from "node:sqlite";
 import type { BackupMetadata } from "../operations/types";
-import { APP_STATE_COMPAT, getStateStore, STATE_DIRECTORY, type StateStore } from "./state-store";
+import { getStateStore, STATE_DIRECTORY, type StateStore } from "./state-store";
+import { requiredTablesForSchema, schemaCompatibility } from "./schema-compatibility";
 import { securePrivateDirectory, validateSecureRegularFile } from "./state-path";
 
 export const BACKUP_DIRECTORY = join(STATE_DIRECTORY, "backups");
-const EXPECTED_TABLES = ["schema_version", "tasks", "task_events", "findings", "notifications", "operations", "backup_metadata", "provider_compatibility_snapshots", "provider_compatibility_acknowledgements"] as const;
 
 export async function createStateBackup(options: { store?: StateStore; directory?: string; now?: Date; backupId?: string } = {}) {
   const store = options.store ?? getStateStore();
@@ -79,10 +79,13 @@ export function validateBackupFile(path: string) {
     if (String(integrity.integrity_check) !== "ok") throw new BackupValidationError("Backup integrity check failed");
     const row = database.prepare("SELECT MAX(version) AS version FROM schema_version").get() as { version: number | null };
     const schemaVersion = Number(row.version ?? 0);
-    if (schemaVersion < APP_STATE_COMPAT.minSchema || schemaVersion > APP_STATE_COMPAT.maxSchema) throw new BackupValidationError("Backup schema is not supported by this application");
+    const compatibility = schemaCompatibility(schemaVersion);
+    if (compatibility === "too_old") throw new BackupValidationError("Backup schema is too old to migrate");
+    if (compatibility === "future") throw new BackupValidationError("Backup schema is newer than supported");
+    if (compatibility === "incomplete_migration") throw new BackupValidationError("Backup migration path is incomplete");
     const names = new Set((database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map((item) => item.name));
-    if (EXPECTED_TABLES.some((table) => !names.has(table))) throw new BackupValidationError("Backup is missing required state tables");
-    return { integrity: "ok" as const, schemaVersion, sizeBytes: info.size };
+    if (requiredTablesForSchema(schemaVersion).some((table) => !names.has(table))) throw new BackupValidationError("Backup is missing required state tables");
+    return { integrity: "ok" as const, schemaVersion, compatibility: compatibility === "current" ? "valid_current" as const : "valid_migratable" as const, sizeBytes: info.size };
   } catch (error) {
     if (error instanceof BackupValidationError) throw error;
     throw new BackupValidationError("Backup validation failed");

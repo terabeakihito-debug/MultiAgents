@@ -16,7 +16,7 @@ import { redactKnownSecrets, redactKnownSecretsInValue } from "./credential-reso
 import type { RuntimePolicy, RuntimeViolation, RuntimeViolationRecord } from "../runtime/types";
 import { runtimeViolationMessage } from "./runtime-policy";
 import type { OsSandboxAudit } from "./os-sandbox";
-import { acquireTaskLock, releaseTaskLock } from "./task-lock";
+import { acquireTaskLock, holdsTaskLock, releaseTaskLock } from "./task-lock";
 import { beginRegisteredOperation } from "./operation-registry";
 
 export const WORKTREE_ROOT = join(homedir(), "code", ".multiagents-worktrees");
@@ -535,8 +535,10 @@ export async function getTaskDiff(task: RepoTask): Promise<TaskDiff> {
   }
 }
 
-export async function deleteTask(id: string, input: { confirmedPrCleanup?: boolean } = {}) {
-  const taskLock = acquireTaskLock(id); if (!taskLock) throw new Error("Task cleanup is blocked while another operation is running");
+export async function deleteTask(id: string, input: { confirmedPrCleanup?: boolean; taskLease?: symbol } = {}) {
+  const suppliedLease = input.taskLease;
+  if (suppliedLease && !holdsTaskLock(id, suppliedLease)) throw new Error("Task cleanup lease is not the active owner");
+  const taskLock = suppliedLease ?? acquireTaskLock(id); if (!taskLock) throw new Error("Task cleanup is blocked while another operation is running");
   try {
   const task = getTask(id);
   if (!task) throw new Error("Task not found");
@@ -566,7 +568,7 @@ export async function deleteTask(id: string, input: { confirmedPrCleanup?: boole
   } finally {
     // The transaction above may throw while persisting; ownership cleanup is
     // intentionally independent of that outcome.
-    releaseTaskLock(id, taskLock);
+    if (!suppliedLease) releaseTaskLock(id, taskLock);
   }
 }
 

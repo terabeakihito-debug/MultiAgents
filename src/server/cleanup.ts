@@ -6,6 +6,7 @@ import { BACKUP_DIRECTORY, deleteStateBackup, validateStateBackup } from "./stat
 import { getStateStore, type StateStore } from "./state-store";
 import { deleteTask, listTasks, type RepoTask } from "./tasks";
 import { runGit } from "./git";
+import { acquireTaskLock, releaseTaskLock } from "./task-lock";
 
 const DAY = 86_400_000;
 const KEEP_VERIFIED_BACKUPS = 3;
@@ -160,10 +161,15 @@ export async function executeCleanup(candidateIds: string[], options: Evaluation
   for (const item of selected) {
     const operation = store.createOperation({ type: operationType(item.type), taskId: item.taskId, notificationId: notificationId(item), idempotencyKey: `cleanup:${item.candidateId}`, safeMetadata: { candidateType: item.type, estimatedBytes: item.estimatedBytes } });
     if (operation.state === "persisted") { completed.push(item.candidateId); continue; }
-    const end = beginRegisteredOperation(operation.operationId, operation.type, item.taskId);
+    // A worktree cleanup owns the task lease for its entire delete/persist sequence.
+    // Do not register a second task operation: deleteTask receives this exact lease.
+    const acquiredTaskLease = item.type === "worktree" && item.taskId ? acquireTaskLock(item.taskId) : undefined;
+    if (item.type === "worktree" && !acquiredTaskLease) throw new CleanupBlockedError("Task cleanup is blocked while another operation is running");
+    const taskLease = acquiredTaskLease || undefined;
+    const end = taskLease ? undefined : beginRegisteredOperation(operation.operationId, operation.type, item.taskId);
     try {
       store.updateOperation(operation.operationId, "executing");
-      await deleteCandidate(item, store, options.backupDirectory);
+      await deleteCandidate(item, store, options.backupDirectory, taskLease);
       store.updateOperation(operation.operationId, "external_succeeded");
       store.updateOperation(operation.operationId, "persisted");
       completed.push(item.candidateId);
@@ -171,7 +177,7 @@ export async function executeCleanup(candidateIds: string[], options: Evaluation
       store.updateOperation(operation.operationId, "reconcile_required", undefined, "cleanup_outcome_unknown");
       store.appendCleanupAudit("cleanup_reconcile_required", { count: 1 });
       throw error;
-    } finally { end(); }
+    } finally { end?.(); if (taskLease && item.taskId) releaseTaskLock(item.taskId, taskLease); }
   }
   store.appendCleanupAudit("cleanup_completed", { count: completed.length });
   return { completed, estimatedBytes: selected.reduce((sum, item) => sum + item.estimatedBytes, 0) };
@@ -186,8 +192,8 @@ function select(summary: CleanupSummary, candidateIds: string[]) {
 }
 function notificationId(item: CleanupCandidate) { return item.type === "notification" || item.type === "outbound_delivery" ? item.candidateId.split(":")[1] : undefined; }
 function operationType(type: CleanupCandidateType) { return type === "worktree" ? "cleanup_worktree" : type === "worktree_node_modules" ? "cleanup_node_modules" : type === "backup" ? "cleanup_backup" : "cleanup_notifications" as const; }
-async function deleteCandidate(item: CleanupCandidate, store: StateStore, backupDirectory?: string) {
-  if (item.type === "worktree") { if (!item.taskId) throw new CleanupBlockedError("Worktree identity is invalid."); await deleteTask(item.taskId, { confirmedPrCleanup: true }); return; }
+async function deleteCandidate(item: CleanupCandidate, store: StateStore, backupDirectory?: string, taskLease?: symbol) {
+  if (item.type === "worktree") { if (!item.taskId || !taskLease) throw new CleanupBlockedError("Worktree identity is invalid."); await deleteTask(item.taskId, { confirmedPrCleanup: true, taskLease }); return; }
   if (item.type === "worktree_node_modules") { const task = listTasks().find((value) => value.id === item.taskId); if (!task) throw new CleanupBlockedError("Task is missing."); const inspected = await inspectWorktree(task); if (inspected.reasons.length || !inspected.root) throw new CleanupBlockedError("node_modules path is no longer safe."); const target = join(inspected.root, "node_modules"); const info = await lstat(target); if (!info.isDirectory() || info.isSymbolicLink() || (await realpath(target)) !== target) throw new CleanupBlockedError("node_modules path is no longer safe."); await rm(target, { recursive: true, force: false }); return; }
   if (item.type === "backup") { await deleteStateBackup(item.candidateId.split(":")[1], { store, directory: backupDirectory }); return; }
   const id = notificationId(item)!; if (item.type === "notification") store.deleteNotificationForRetention(id); else store.deleteDeliveredOutboundForRetention(id);

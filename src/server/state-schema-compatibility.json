@@ -1,0 +1,13 @@
+{
+  "currentSchemaVersion": 13,
+  "minMigratableSchemaVersion": 9,
+  "maxSupportedSchemaVersion": 13,
+  "migrationSteps": [10, 11, 12, 13],
+  "requiredTables": {
+    "9": ["schema_version", "tasks", "task_events", "findings", "notifications"],
+    "10": ["schema_version", "tasks", "task_events", "findings", "notifications", "operations", "backup_metadata"],
+    "11": ["schema_version", "tasks", "task_events", "findings", "notifications", "operations", "backup_metadata", "retention_policy", "cleanup_audit_events"],
+    "12": ["schema_version", "tasks", "task_events", "findings", "notifications", "operations", "backup_metadata", "retention_policy", "cleanup_audit_events", "provider_compatibility_snapshots", "provider_compatibility_acknowledgements"],
+    "13": ["schema_version", "tasks", "task_events", "findings", "notifications", "operations", "backup_metadata", "retention_policy", "cleanup_audit_events", "provider_compatibility_snapshots", "provider_compatibility_acknowledgements"]
+  }
+}

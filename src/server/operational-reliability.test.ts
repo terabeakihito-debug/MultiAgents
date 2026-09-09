@@ -200,6 +200,19 @@ describe("Phase 19 backup, compatibility, diagnostics, disk and drain", () => {
     expect(validateBackupFile(join(directory, `${backup.backupId}.db`))).toMatchObject({ integrity: "ok", schemaVersion: APP_STATE_COMPAT.maxSchema });
   });
 
+  it("accepts a v9 migration source and applies every migration through v13", async () => {
+    const path = join(fixtureRoot, "v9-source.db");
+    const current = new StateStore(path); current.close();
+    const raw = new DatabaseSync(path);
+    raw.exec("DROP TABLE provider_compatibility_acknowledgements; DROP TABLE provider_compatibility_snapshots; DROP TABLE cleanup_audit_events; DROP TABLE retention_policy; DROP TABLE backup_metadata; DELETE FROM schema_version WHERE version > 9;");
+    raw.close();
+    expect(validateBackupFile(path)).toMatchObject({ schemaVersion: 9, compatibility: "valid_migratable" });
+    const migrated = new StateStore(path);
+    expect(migrated.schemaVersion()).toBe(APP_STATE_COMPAT.maxSchema);
+    expect(migrated.integrityCheck()).toBe("ok");
+    migrated.close();
+  });
+
   it("restores a verified backup only while the server is offline", async () => {
     const restoreHome = join(fixtureRoot, "restore-home");
     const restoreStateDirectory = join(restoreHome, ".multiagents");
@@ -235,7 +248,7 @@ describe("Phase 19 backup, compatibility, diagnostics, disk and drain", () => {
     await copyFile(join(directory, `${backup.backupId}.db`), newer);
     await chmod(newer, 0o600);
     const raw = new DatabaseSync(newer); raw.prepare("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)").run(99, new Date().toISOString()); raw.close();
-    expect(() => validateBackupFile(newer)).toThrow("schema is not supported");
+    expect(() => validateBackupFile(newer)).toThrow("schema is newer than supported");
 
     const newerState = join(fixtureRoot, "newer-state.db");
     const newerStore = new StateStore(newerState); newerStore.close();
