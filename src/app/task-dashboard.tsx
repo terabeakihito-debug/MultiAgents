@@ -63,6 +63,7 @@ function TaskDashboardContent({ repos, busy, refreshToken, onResume, onHistory, 
   const [loading, setLoading] = useState(true);
   const [refreshSequence, setRefreshSequence] = useState(0);
   const [cleanupTask, setCleanupTask] = useState<DashboardTask | null>(null);
+  const [reassociation, setReassociation] = useState<{ task: DashboardTask; preview: { oldPath: string; candidatePath: string; branch: string; head: string; prNumber?: number; fingerprint: string } } | null>(null);
   const [actionTaskId, setActionTaskId] = useState("");
 
   useEffect(() => {
@@ -114,6 +115,25 @@ function TaskDashboardContent({ repos, busy, refreshToken, onResume, onHistory, 
     } catch (error) { onError(error instanceof Error ? error.message : "Cleanup failed"); }
     finally { setActionTaskId(""); }
   }
+  async function previewReassociation(task: DashboardTask) {
+    setActionTaskId(task.id);
+    try {
+      const response = await humanMutationFetch(`/api/tasks/${task.id}/reassociate/preview`, "task-reassociation-preview", { method: "POST" });
+      const data = await response.json() as { preview?: { oldPath: string; candidatePath: string; branch: string; head: string; prNumber?: number; fingerprint: string }; error?: string };
+      if (!response.ok || !data.preview) throw new Error(data.error || "No safe reassociation candidate was found");
+      setReassociation({ task, preview: data.preview });
+    } catch (error) { onError(error instanceof Error ? error.message : "Reassociation preview failed"); }
+    finally { setActionTaskId(""); }
+  }
+  async function confirmReassociation() {
+    if (!reassociation) return; setActionTaskId(reassociation.task.id);
+    try {
+      const response = await humanMutationFetch(`/api/tasks/${reassociation.task.id}/reassociate`, "task-reassociation-confirm", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmed: true, fingerprint: reassociation.preview.fingerprint }) });
+      const data = await response.json() as { error?: string }; if (!response.ok) throw new Error(data.error || "Reassociation failed");
+      setReassociation(null); setRefreshSequence((value) => value + 1);
+    } catch (error) { onError(error instanceof Error ? error.message : "Reassociation failed"); }
+    finally { setActionTaskId(""); }
+  }
 
   const attentionTasks = tasks.filter((task) => task.bucket === "needs_attention" || task.bucket === "ready_for_approval").slice(0, 5);
   const recentTasks = tasks.slice(0, 5);
@@ -122,7 +142,7 @@ function TaskDashboardContent({ repos, busy, refreshToken, onResume, onHistory, 
   return <section className="dashboard" aria-labelledby="dashboard-title">
     <div className="tasksPageTitle"><div><span className="eyebrow">Workspace</span><h2 id="dashboard-title">Tasks</h2><p>Start work, review changes, and follow up safely.</p></div><button type="button" className="refreshButton" onClick={() => setRefreshSequence((value) => value + 1)}>Refresh</button></div>
     {startTask}
-    {!loading && attentionTasks.length > 0 ? <section className="taskSection attentionSection" aria-labelledby="attention-title"><div className="sectionHeading"><div><h2 id="attention-title">Needs your attention</h2><p>Only tasks waiting for a human decision or recovery.</p></div>{counts.needs_attention + counts.ready_for_approval > 5 ? <button type="button" className="secondary" onClick={() => setAllTasks(true)}>View all attention tasks</button> : null}</div><div className="attentionCards">{attentionTasks.map((task) => <TaskCard key={task.id} task={task} busy={busy || actionTaskId === task.id} onResume={onResume} onHistory={onHistory} onRefreshPr={refreshPr} onCleanup={setCleanupTask} attention />)}</div></section> : null}
+    {!loading && attentionTasks.length > 0 ? <section className="taskSection attentionSection" aria-labelledby="attention-title"><div className="sectionHeading"><div><h2 id="attention-title">Needs your attention</h2><p>Only tasks waiting for a human decision or recovery.</p></div>{counts.needs_attention + counts.ready_for_approval > 5 ? <button type="button" className="secondary" onClick={() => setAllTasks(true)}>View all attention tasks</button> : null}</div><div className="attentionCards">{attentionTasks.map((task) => <TaskCard key={task.id} task={task} busy={busy || actionTaskId === task.id} onResume={onResume} onHistory={onHistory} onRefreshPr={refreshPr} onCleanup={setCleanupTask} onReassociate={previewReassociation} attention />)}</div></section> : null}
     <section className="taskSection recentSection" aria-labelledby="recent-title"><div className="sectionHeading"><div><h2 id="recent-title">Recent tasks</h2><p>{loading ? "Loading tasks…" : "Your five most recently updated tasks."}</p></div><button type="button" className="secondary" onClick={() => setAllTasks((value) => !value)}>{allTasks ? "Show recent" : "View all tasks"}</button></div>
     {!allTasks ? (loading ? null : recentTasks.length ? <div className="recentList">{recentTasks.map((task) => <RecentTaskRow key={task.id} task={task} onOpen={onResume} />)}</div> : <section className="readyToStart"><h3>Ready to start</h3><p>Create a task above when you are ready.</p></section>) : <><details className="dashboardFilters" open><summary>Search and filter all tasks</summary><div className="dashboardFiltersInner">
       <label>Repository<select value={repo} onChange={(event) => setRepo(event.target.value)}><option value="">All repositories</option>{repos.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
@@ -134,15 +154,16 @@ function TaskDashboardContent({ repos, busy, refreshToken, onResume, onHistory, 
       <label className="archiveToggle"><input type="checkbox" checked={includeArchived} onChange={(event) => { setIncludeArchived(event.target.checked); if (!event.target.checked && bucket === "archived") setBucket(""); }} /> Include archived</label>
     </div></details>{loading ? <p className="muted">Loading tasks…</p> : <div className="allTasksList">{tasks.map((task) => <RecentTaskRow key={task.id} task={task} onOpen={onResume} />)}</div>}</>}</section>
     {cleanupTask ? <div className="dialogBackdrop" role="presentation"><section className="cleanupDialog" role="dialog" aria-modal="true" aria-labelledby="cleanup-title"><span className="eyebrow">Safe cleanup</span><h2 id="cleanup-title">Delete managed task worktree?</h2><dl><div><dt>Repository</dt><dd>{cleanupTask.repoName}</dd></div><div><dt>Branch</dt><dd><code>{cleanupTask.branch}</code></dd></div></dl><p>{cleanupTask.cleanup.warning || "The task history will be retained locally."}</p><p>This will not delete the GitHub branch or PR.</p><div className="dialogActions"><button type="button" className="secondary" disabled={Boolean(actionTaskId)} onClick={() => setCleanupTask(null)}>Cancel</button><button type="button" className="danger" disabled={!cleanupTask.cleanup.allowed || Boolean(actionTaskId)} onClick={() => void cleanup(cleanupTask)}>{actionTaskId ? "Deleting…" : "Delete worktree"}</button></div></section></div> : null}
+    {reassociation ? <div className="dialogBackdrop" role="presentation"><section className="cleanupDialog" role="dialog" aria-modal="true" aria-labelledby="reassociate-title"><span className="eyebrow">Human-confirmed recovery</span><h2 id="reassociate-title">Reassociate managed worktree?</h2><dl><div><dt>Logical repository</dt><dd>{reassociation.task.repoName}</dd></div><div><dt>Old path</dt><dd><code>{reassociation.preview.oldPath}</code></dd></div><div><dt>Candidate</dt><dd><code>{reassociation.preview.candidatePath}</code></dd></div><div><dt>Branch / head</dt><dd><code>{reassociation.preview.branch}</code> · <code>{reassociation.preview.head}</code></dd></div><div><dt>PR</dt><dd>#{reassociation.preview.prNumber}</dd></div></dl><p>This changes only the verified local clone/worktree association. It does not modify the pull request, branch, or commit.</p><div className="dialogActions"><button type="button" className="secondary" disabled={Boolean(actionTaskId)} onClick={() => setReassociation(null)}>Cancel</button><button type="button" disabled={Boolean(actionTaskId)} onClick={() => void confirmReassociation()}>Confirm reassociation</button></div></section></div> : null}
   </section>;
 }
 
-function TaskCard({ task, busy, onResume, onHistory, onRefreshPr, onCleanup, attention = false }: { task: DashboardTask; busy: boolean; onResume: Props["onResume"]; onHistory: Props["onHistory"]; onRefreshPr: (task: DashboardTask) => void; onCleanup: (task: DashboardTask) => void; attention?: boolean }) {
+function TaskCard({ task, busy, onResume, onHistory, onRefreshPr, onCleanup, onReassociate, attention = false }: { task: DashboardTask; busy: boolean; onResume: Props["onResume"]; onHistory: Props["onHistory"]; onRefreshPr: (task: DashboardTask) => void; onCleanup: (task: DashboardTask) => void; onReassociate: (task: DashboardTask) => void; attention?: boolean }) {
   return <article className={`dashboardCard bucket-${task.bucket}`}>
     <div className="taskCardTop"><div><h3>{task.summary}</h3><p className="taskCardMeta">{task.repoName} · {task.templateName}</p></div></div>
     <div className="taskState"><span className={`status ${task.status}`}>{task.nextActionLabel || task.status.replaceAll("_", " ")}</span></div>
     <p className="nextActionExplanation">{actionExplanation(task)}</p>
-    {attention ? <div className="taskCardActions"><button type="button" disabled={busy || !task.canResume} onClick={() => onResume(task.id)}>{task.nextActionLabel || "Open task"}</button></div> : null}
+    {attention ? <div className="taskCardActions"><button type="button" disabled={busy || !task.canResume} onClick={() => onResume(task.id)}>{task.nextActionLabel || "Open task"}</button>{task.worktreeStatus === "missing" ? <button type="button" className="secondary" disabled={busy} onClick={() => onReassociate(task)}>Review reassociation candidate</button> : null}</div> : null}
     <details className="cardDetails"><summary>Details</summary><div>{task.attentionReason ? <p>{task.attentionReason}</p> : null}<button type="button" className="secondary" disabled={busy} onClick={() => onHistory(task.id, `${task.repoName} — ${task.summary}`)}>History</button>{task.prUrl ? <a className="buttonLink" href={task.prUrl} target="_blank" rel="noreferrer">Open PR</a> : null}{task.canRefreshPr ? <button type="button" className="secondary" disabled={busy} onClick={() => void onRefreshPr(task)}>Refresh PR status</button> : null}<p>Branch: <code>{task.branch}</code> · Profile: {task.profileName} v{task.profileVersion}</p><button type="button" className="cleanupButton" disabled={busy || !task.cleanup.allowed} title={task.cleanup.blockedReason} onClick={() => onCleanup(task)}>Cleanup worktree</button></div></details>
     {task.cleanup.blockedReason ? <small className="cleanupBlocked">{task.cleanup.blockedReason}</small> : null}
   </article>;

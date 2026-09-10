@@ -58,6 +58,7 @@ export const taskEventTypes = [
   "validation_started", "validation_passed", "validation_failed", "diff_generated", "commit_created", "branch_pushed",
   "pr_created", "pr_review_fetched", "rework_started", "rework_completed", "ready_for_human_merge", "task_archived",
   "task_resumed", "worktree_cleanup_requested", "worktree_removed", "pr_status_refreshed",
+  "worktree_reassociation_previewed", "worktree_reassociated",
   "profile_snapshot_created", "template_snapshot_created",
   "finding_created", "finding_status_changed", "finding_converted", "implementation_task_created",
   "runtime_policy_created", "runtime_execution_started", "runtime_execution_completed", "runtime_violation_detected",
@@ -335,6 +336,7 @@ export class StateStore {
       ciMessage: task.ciMessage,
       error: task.error,
       runtimeViolation: task.runtimeViolation,
+      localClonePath: task.localClonePath,
       baseState: task.baseState,
       baseAheadCount: task.baseAheadCount,
       profileSnapshot: profile,
@@ -1207,6 +1209,7 @@ export class StateStore {
       sourceFindingId: optionalString(row.source_finding_id),
       sourceTaskId: optionalString(row.source_task_id),
       runtimeViolation: objectOrUndefined(payload.runtimeViolation) as RepoTask["runtimeViolation"],
+      localClonePath: optionalString(payload.localClonePath),
       baseState: optionalString(payload.baseState) as RepoTask["baseState"],
       baseAheadCount: optionalNumber(payload.baseAheadCount),
     } as RepoTask;

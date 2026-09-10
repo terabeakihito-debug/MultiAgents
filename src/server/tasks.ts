@@ -1,7 +1,7 @@
-import { randomUUID } from "node:crypto";
-import { lstat, mkdir, realpath } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { lstat, mkdir, readdir, realpath, readlink } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, relative, sep } from "node:path";
+import { basename, join, relative, sep } from "node:path";
 import { runGit } from "./git";
 import { ALLOWED_ROOT, validateRepository } from "./repositories";
 import { getStateStore, type ApprovalEvent, type TaskEventActor, type TaskEventMetadata, type TaskEventType, type TaskHistory } from "./state-store";
@@ -16,7 +16,7 @@ import { redactKnownSecrets, redactKnownSecretsInValue } from "./credential-reso
 import type { RuntimePolicy, RuntimeViolation, RuntimeViolationRecord } from "../runtime/types";
 import { runtimeViolationMessage } from "./runtime-policy";
 import type { OsSandboxAudit } from "./os-sandbox";
-import { acquireTaskLock, holdsTaskLock, releaseTaskLock } from "./task-lock";
+import { acquireTaskLock, holdsTaskLock, isTaskLocked, releaseTaskLock } from "./task-lock";
 import { beginRegisteredOperation } from "./operation-registry";
 
 export const WORKTREE_ROOT = join(homedir(), "code", ".multiagents-worktrees");
@@ -66,6 +66,8 @@ export type RepoTask = {
   repoId: string;
   repoName: string;
   repoPath: string;
+  /** A human-approved alternate local clone. repoId remains the logical repository identity. */
+  localClonePath?: string;
   allowedRoot: string;
   branch: string;
   baseBranch: string;
@@ -113,6 +115,18 @@ export type RepoTask = {
   sourceTaskId?: string;
   runtimeViolation?: RuntimeViolationRecord;
 };
+
+export type WorktreeReassociationPreview = {
+  taskId: string;
+  oldPath: string;
+  candidatePath: string;
+  localClonePath: string;
+  branch: string;
+  head: string;
+  prNumber?: number;
+  fingerprint: string;
+};
+type ReassociationOptions = { allowedRoot?: string; worktreeRoot?: string; internalLease?: boolean };
 
 export type TaskDiff = {
   trackedFiles: string[];
@@ -572,6 +586,103 @@ export async function deleteTask(id: string, input: { confirmedPrCleanup?: boole
   }
 }
 
+/** Server-discovered, human-confirmed reassociation. It never accepts a path from a client. */
+export async function previewManagedWorktreeReassociation(id: string, options: ReassociationOptions = {}): Promise<WorktreeReassociationPreview> {
+  loadPersistedTasks();
+  const task = getTask(id);
+  if (!task) throw new Error("Task not found");
+  if (!options.internalLease && isTaskLocked(id)) throw new Error("Task reassociation is blocked while another operation is running");
+  if (task.worktreeAvailable && task.worktreeStatus === "available") throw new Error("A healthy managed worktree cannot be reassociated");
+  const candidates = await discoverReassociationCandidates(task, options);
+  if (candidates.length !== 1) throw new Error(candidates.length ? "More than one safe reassociation candidate was found" : "No safe reassociation candidate was found");
+  return candidates[0];
+}
+
+export async function reassociateManagedWorktree(id: string, fingerprint: string, options: ReassociationOptions = {}): Promise<RepoTask> {
+  if (!/^[a-f0-9]{64}$/.test(fingerprint)) throw new Error("Reassociation preview is invalid");
+  const lease = acquireTaskLock(id); if (!lease) throw new Error("Task reassociation is blocked while another operation is running");
+  try {
+    const task = getTask(id); if (!task) throw new Error("Task not found");
+    if (task.worktreeAvailable && task.worktreeStatus === "available") throw new Error("A healthy managed worktree cannot be reassociated");
+    const preview = await previewManagedWorktreeReassociation(id, { ...options, internalLease: true });
+    if (preview.fingerprint !== fingerprint) throw new Error("Reassociation preview is stale; review the candidate again");
+    // Execute-time validation above is intentionally repeated after acquiring the task lock.
+    const store = getStateStore();
+    const prior = { localClonePath: task.localClonePath, worktreePath: task.worktreePath, worktreeAvailable: task.worktreeAvailable, worktreeStatus: task.worktreeStatus, recoveryStatus: task.recoveryStatus, recoveryMessage: task.recoveryMessage, originalTaskAvailable: task.originalTaskAvailable, error: task.error };
+    try {
+      store.transaction(() => {
+        task.localClonePath = preview.localClonePath;
+        task.worktreePath = preview.candidatePath;
+        task.worktreeAvailable = true;
+        task.worktreeStatus = "available";
+        // A fully validated reassociation restores the local worktree; whether the
+        // original task context exists still depends on its persisted prompt.
+        // Any remaining recovery blocker is derived below by the canonical path.
+        task.originalTaskAvailable = Boolean(task.prompt.trim());
+        if (task.error === "Task worktree is unavailable. Review intake is read-only; rework is disabled.") task.error = undefined;
+        task.recoveryStatus = "recoverable";
+        task.recoveryMessage = undefined;
+        persistTask(task);
+        store.appendTaskEvent(task.id, { type: "worktree_reassociated", actor: "user", status: "available", metadata: { commitSha: preview.head, prNumber: preview.prNumber } });
+      });
+    } catch (error) { Object.assign(task, prior); throw error; }
+    // Reuse startup/resume validation so reassociation cannot leave recovery-only
+    // payload fields describing the former missing worktree. The association above
+    // is intentionally durable before this step: a recovery persistence failure is
+    // retriable and must never lose the verified path association.
+    await recoverTask(task, options.allowedRoot ?? ALLOWED_ROOT, options.worktreeRoot ?? WORKTREE_ROOT);
+    return task;
+  } finally { releaseTaskLock(id, lease); }
+}
+
+async function discoverReassociationCandidates(task: RepoTask, options: ReassociationOptions): Promise<WorktreeReassociationPreview[]> {
+  if (!task.originUrl || !task.commitSha || !task.prNumber || task.prReview?.headSha && task.prReview.headSha !== task.commitSha) return [];
+  const root = await realpath(task.worktreeRoot);
+  const expectedRoot = await realpath(options.worktreeRoot ?? WORKTREE_ROOT);
+  if (root !== expectedRoot || await realpath(task.allowedRoot) !== await realpath(options.allowedRoot ?? ALLOWED_ROOT)) return [];
+  const entries = await readdir(root, { withFileTypes: true });
+  const candidates: WorktreeReassociationPreview[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name === task.repoId || !/^[A-Za-z0-9._-]+$/.test(entry.name)) continue;
+    const candidatePath = join(root, entry.name, task.id);
+    try {
+      const clone = await validateRepository(entry.name, options.allowedRoot ?? task.allowedRoot);
+      if (clone.dirty || !sameGitHubIdentity(await runGit(clone.path, ["remote", "get-url", "origin"]), task.originUrl)) continue;
+      const candidate = await validateReassociationCandidate(task, clone.path, candidatePath, root);
+      candidates.push(candidate);
+    } catch { /* Candidate discovery is fail-closed and intentionally silent. */ }
+  }
+  return candidates;
+}
+
+async function validateReassociationCandidate(task: RepoTask, clonePath: string, candidatePath: string, root: string): Promise<WorktreeReassociationPreview> {
+  const origin = task.originUrl; if (!origin) throw new Error("Task logical repository origin is missing");
+  const candidate = await realpath(candidatePath);
+  if (!within(root, candidate) || candidate !== join(root, basename(clonePath), task.id)) throw new Error("Candidate path is not server-discovered");
+  const info = await lstat(candidate); if (!info.isDirectory() || info.isSymbolicLink() || (typeof process.getuid === "function" && info.uid !== process.getuid())) throw new Error("Candidate worktree ownership is invalid");
+  if (await realpath(await runGit(candidate, ["rev-parse", "--show-toplevel"])) !== candidate) throw new Error("Candidate worktree root is invalid");
+  const dotGit = await lstat(join(candidate, ".git")); if (!dotGit.isFile() || dotGit.isSymbolicLink()) throw new Error("Candidate linked Git metadata is invalid");
+  const common = await realpath(resolveGitPath(candidate, await runGit(candidate, ["rev-parse", "--git-common-dir"])));
+  if (common !== await realpath(join(clonePath, ".git"))) throw new Error("Candidate is registered to a different local clone");
+  const listing = await runGit(clonePath, ["worktree", "list", "--porcelain"]);
+  if (!listing.split("\n").some((line) => line === `worktree ${candidate}`)) throw new Error("Candidate is not registered with its local clone");
+  if (await runGit(candidate, ["branch", "--show-current"]) !== task.branch) throw new Error("Candidate branch does not match the task");
+  const head = await runGit(candidate, ["rev-parse", "HEAD"]); if (head !== task.commitSha) throw new Error("Candidate HEAD does not match the persisted PR head");
+  if (!sameGitHubIdentity(await runGit(candidate, ["remote", "get-url", "origin"]), origin)) throw new Error("Candidate origin does not match the logical repository");
+  if (await runGit(candidate, ["status", "--porcelain"])) throw new Error("Candidate worktree is not clean");
+  if (await runGit(candidate, ["ls-files", "--others", "--exclude-standard"])) throw new Error("Candidate worktree has untracked files");
+  if (await hasNestedRepository(candidate) || await worktreeInUse(candidate)) throw new Error("Candidate worktree has an unsafe nested repository or is in use");
+  if (listTasks().some((other) => other.id !== task.id && other.worktreePath === candidate)) throw new Error("Candidate worktree is already owned by another task");
+  const fingerprint = createHash("sha256").update(JSON.stringify([task.id, task.updatedAt, task.status, task.worktreeStatus, task.worktreeAvailable, task.worktreePath, candidate, clonePath, task.branch, head, task.prNumber, task.prReview?.headSha ?? task.commitSha, origin, listing])).digest("hex");
+  return { taskId: task.id, oldPath: task.worktreePath, candidatePath: candidate, localClonePath: clonePath, branch: task.branch, head, prNumber: task.prNumber, fingerprint };
+}
+
+function sameGitHubIdentity(left: string, right: string) { const a = githubCoordinates(left); const b = githubCoordinates(right); return a.owner.toLowerCase() === b.owner.toLowerCase() && a.repo.toLowerCase() === b.repo.toLowerCase(); }
+function within(root: string, path: string) { const rel = relative(root, path); return Boolean(rel) && !rel.startsWith(`..${sep}`) && rel !== ".."; }
+function resolveGitPath(worktree: string, value: string) { return value.startsWith("/") ? value : join(worktree, value); }
+async function hasNestedRepository(root: string): Promise<boolean> { const visit = async (path: string): Promise<boolean> => { for (const item of await readdir(path, { withFileTypes: true })) { if (item.name === ".git" && path !== root) return true; if (item.isDirectory() && !item.isSymbolicLink() && item.name !== "node_modules" && await visit(join(path, item.name))) return true; } return false; }; return visit(root); }
+async function worktreeInUse(path: string): Promise<boolean> { try { for (const item of await readdir("/proc")) { if (!/^\d+$/.test(item)) continue; try { const cwd = await readlink(`/proc/${item}/cwd`); if (cwd === path || cwd.startsWith(`${path}/`)) return true; } catch { /* unreadable process */ } } } catch { return true; } return false; }
+
 export async function initializeTaskRecovery(options: { allowedRoot?: string; worktreeRoot?: string } = {}) {
   loadPersistedTasks();
   if (!recoveryPromise) recoveryPromise = (async () => {
@@ -600,6 +711,7 @@ async function recoverAllTasks(allowedRoot: string, worktreeRoot: string) {
 }
 
 async function recoverTask(task: RepoTask, allowedRoot: string, worktreeRoot: string) {
+  let validatedWorktree = false;
   let template: TaskTemplateSnapshot;
   try { requireTaskProfile(task); template = requireTaskTemplate(task); }
   catch (error) {
@@ -679,14 +791,21 @@ async function recoverTask(task: RepoTask, allowedRoot: string, worktreeRoot: st
       persistTask(task);
       return;
     }
-    const expectedPath = await realpath(join(expectedWorktreeRoot, task.repoId, task.id));
-    if (worktreePath !== expectedPath) throw new Error("Saved worktree path is not the server-managed task path");
-    const registered = (await runGit(repo.path, ["worktree", "list", "--porcelain"]))
+    const localClonePath = task.localClonePath ? await realpath(task.localClonePath) : repo.path;
+    if (task.localClonePath) {
+      const localClone = await validateRepository(basename(localClonePath), allowedRoot);
+      if (localClone.path !== localClonePath || localClone.dirty || !sameGitHubIdentity(await runGit(localClonePath, ["remote", "get-url", "origin"]), currentOrigin)) throw new Error("Persisted alternate local clone is no longer valid");
+      await validateReassociationCandidate(task, localClonePath, worktreePath, expectedWorktreeRoot);
+    }
+    const expectedPath = task.localClonePath ? worktreePath : await realpath(join(expectedWorktreeRoot, task.repoId, task.id));
+    if (worktreePath !== expectedPath || !within(expectedWorktreeRoot, worktreePath)) throw new Error("Saved worktree path is not the server-managed task path");
+    const registered = (await runGit(localClonePath, ["worktree", "list", "--porcelain"]))
       .split("\n").some((line) => line === `worktree ${worktreePath}`);
     if (!registered) throw new Error("Task worktree is not registered with Git");
     if (await runGit(worktreePath, ["branch", "--show-current"]) !== task.branch) throw new Error("Task branch does not match the worktree");
     if (await realpath(await runGit(worktreePath, ["rev-parse", "--show-toplevel"])) !== worktreePath) throw new Error("Invalid task worktree root");
-    if (await runGit(worktreePath, ["remote", "get-url", "origin"]) !== currentOrigin) throw new Error("Task worktree origin does not match the base repository");
+    const worktreeOrigin = await runGit(worktreePath, ["remote", "get-url", "origin"]);
+    if (task.localClonePath ? !sameGitHubIdentity(worktreeOrigin, currentOrigin) : worktreeOrigin !== currentOrigin) throw new Error("Task worktree origin does not match the base repository");
     const dotGit = await lstat(join(worktreePath, ".git"));
     if (!dotGit.isFile() || dotGit.isSymbolicLink()) throw new Error("Unexpected .git entry in task worktree");
     if (!TASK_BRANCH_PATTERN.test(task.branch) || task.branch !== `multiagents/${task.id}`) throw new Error("Invalid task branch");
@@ -705,23 +824,35 @@ async function recoverTask(task: RepoTask, allowedRoot: string, worktreeRoot: st
     }
     task.worktreeAvailable = true;
     task.worktreeStatus = "available";
+    if (task.error === "Task worktree is unavailable. Review intake is read-only; rework is disabled.") task.error = undefined;
+    // A worktree alone is insufficient for rework: preserve the distinct
+    // original-context constraint for PRs recovered without their prompt.
+    task.originalTaskAvailable = Boolean(task.prompt.trim());
     const approvalWasInvalidated = invalidateApprovalForRestart(task)
       || (task.approvalState === "invalidated" && ["approval_invalidated", "commit_failed"].includes(task.status));
-    task.recoveryStatus = base.state === "base_diverged" || task.runtimeViolation || approvalWasInvalidated || Boolean(task.prNumber) || ["ci_pending", "checking_ci", "fetching_review"].includes(task.status)
+    const prRefreshRequired = Boolean(task.prNumber && !task.prReview);
+    task.recoveryStatus = base.state === "base_diverged" || task.runtimeViolation || approvalWasInvalidated || !task.originalTaskAvailable || prRefreshRequired || ["ci_pending", "checking_ci", "fetching_review"].includes(task.status)
       ? "needs_attention" : "recoverable";
     task.recoveryMessage = base.state === "base_diverged"
       ? "Base branch diverged from the original task base. No automatic merge or rebase was attempted."
       : task.runtimeViolation?.message ?? (approvalWasInvalidated
       ? "Approval was invalidated after restart. Review the current diff and run validation again."
-      : task.prNumber ? "PR and CI state must be refreshed from GitHub."
+      : !task.originalTaskAvailable ? "Original task context is unavailable; PR review can be inspected but rework remains disabled."
+      : prRefreshRequired ? "PR and CI state must be refreshed from GitHub."
         : base.state === "base_advanced" ? `Base advanced by ${base.aheadCount} commit${base.aheadCount === 1 ? "" : "s"}.` : undefined);
+    validatedWorktree = true;
     persistTask(task);
   } catch (error) {
-    task.worktreeAvailable = false;
-    task.worktreeStatus = "invalid";
-    task.recoveryStatus = "invalid";
-    task.recoveryMessage = error instanceof Error ? error.message : "Task recovery validation failed";
-    invalidateApprovalForRestart(task);
+    if (validatedWorktree) {
+      task.recoveryStatus = "needs_attention";
+      task.recoveryMessage = "Recovery validation succeeded, but its state could not be persisted. Retry recovery reconciliation.";
+    } else {
+      task.worktreeAvailable = false;
+      task.worktreeStatus = "invalid";
+      task.recoveryStatus = "invalid";
+      task.recoveryMessage = error instanceof Error ? error.message : "Task recovery validation failed";
+      invalidateApprovalForRestart(task);
+    }
     persistTask(task);
   }
 }
