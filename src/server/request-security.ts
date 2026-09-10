@@ -111,6 +111,10 @@ export function rejectNonHumanTemplateMutation(request: Request): Response | und
   return requireHumanMutation(request, "template-save", { label: "Task template" });
 }
 
+export function rejectNonHumanRepositoryMutation(request: Request, action: "repository-clone" | "repository-create" | "repository-initialize"): Response | undefined {
+  return requireHumanMutation(request, action, { label: "Project" });
+}
+
 export function rejectNonHumanFindingMutation(request: Request, action: Extract<HumanMutationAction, `finding-${string}`>): Response | undefined {
   return requireHumanMutation(request, action, { label: "Finding" });
 }

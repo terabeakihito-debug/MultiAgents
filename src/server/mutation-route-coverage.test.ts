@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 const API_ROOT = join(process.cwd(), "src", "app", "api");
-const HUMAN_GUARDS = /(?:requireHumanMutation|rejectNonHuman(?:Profile|Template|Finding|Notification|Outbound)Mutation)\(request/;
+const HUMAN_GUARDS = /(?:requireHumanMutation|rejectNonHuman(?:Profile|Template|Finding|Notification|Outbound|Repository)Mutation)\(request/;
 
 describe("Phase 17.6 mutation route coverage", () => {
   it("places every POST/PUT/PATCH/DELETE route behind the common human gate", async () => {
