@@ -101,13 +101,18 @@ describe("Phase 8 SQLite state and audit history", () => {
       terminationMethod: "term_only" as const, terminationReason: "agent_deadline_exceeded" as const,
     };
     recordAgentLifecycle(task, "cursor", telemetry, "cursor_review");
+    recordAgentLifecycle(task, "cursor", { ...telemetry, terminationReason: "step_budget_exhausted" }, "cursor_review");
     const event = getTaskHistory(task.id).events.at(-1)!;
-    expect(event).toMatchObject({ type: "agent_lifecycle_recorded", actor: "cursor", stepId: "cursor_review", metadata: { lifecycle: telemetry } });
+    expect(event).toMatchObject({ type: "agent_lifecycle_recorded", actor: "cursor", stepId: "cursor_review", metadata: { lifecycle: { ...telemetry, terminationReason: "step_budget_exhausted" } } });
     expect(JSON.stringify(event.metadata)).not.toContain("prompt");
     expect(() => store.appendTaskEvent(task.id, {
       type: "agent_lifecycle_recorded", actor: "cursor",
       metadata: { lifecycle: { ...telemetry, stdoutText: "repository-derived text" } } as never,
     })).toThrow("forbidden");
+    expect(() => store.appendTaskEvent(task.id, {
+      type: "agent_lifecycle_recorded", actor: "cursor",
+      metadata: { lifecycle: { ...telemetry, terminationReason: "unknown_reason" } } as never,
+    })).toThrow("invalid");
   });
 
   it("increments step versions on rerun and preserves the old output", async () => {

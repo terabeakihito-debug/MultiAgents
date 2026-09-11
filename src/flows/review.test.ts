@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { AgentAdapter, AgentId, AgentResult, AgentRunOptions, FlowEvent } from "../agents/types";
-import { cursorPrompt, runReviewFlow, truncateForHandoff } from "./review";
-import { isReviewFlowTimeoutAbortReason } from "../agents/abort-origin";
+import { cursorPrompt, reviewStepActualBudgetMs, runReviewFlow, STEP_WORK_CEILING_MS, truncateForHandoff } from "./review";
+import { isReviewFlowTimeoutAbortReason, reviewFlowTimeoutAbortReason } from "../agents/abort-origin";
 import { buildGenericRuntimePolicy } from "../server/runtime-policy";
 
 function setup(results: Partial<Record<AgentId, AgentResult[]>>) {
@@ -21,6 +21,21 @@ const ok = (agent: AgentId, output: string): AgentResult => ({ agent, status: "c
 const fail = (agent: AgentId, error = "failed"): AgentResult => ({ agent, status: "error", output: "", error });
 
 describe("runReviewFlow", () => {
+  it("plans the initial draft budget while reserving every downstream step", () => {
+    const deadline = 300_000;
+    expect(reviewStepActualBudgetMs("codex_draft", deadline, 0)).toBe(90_000);
+    expect(reviewStepActualBudgetMs("cursor_review", deadline, 100_000)).toBeGreaterThanOrEqual(45_000);
+    expect(reviewStepActualBudgetMs("claude_review", deadline, 155_000)).toBeGreaterThanOrEqual(45_000);
+    expect(reviewStepActualBudgetMs("codex_final", deadline, 210_000)).toBeGreaterThanOrEqual(60_000);
+  });
+
+  it("reuses unused cleanup reserve and never exceeds the work ceiling", () => {
+    const deadline = 300_000;
+    expect(reviewStepActualBudgetMs("cursor_review", deadline, 90_000)).toBe(55_000);
+    expect(reviewStepActualBudgetMs("cursor_review", deadline, 0)).toBe(STEP_WORK_CEILING_MS);
+    expect(reviewStepActualBudgetMs("codex_final", deadline, 271_000)).toBeLessThanOrEqual(0);
+  });
+
   it("runs all four steps in fixed order", async () => {
     const { adapters, calls } = setup({ codex: [ok("codex", "draft"), ok("codex", "final")], cursor: [ok("cursor", "review-one")], claude: [ok("claude", "review-two")] });
     const result = await runReviewFlow("request", { agents: adapters, flowId: "flow-test" });
@@ -143,24 +158,67 @@ describe("runReviewFlow", () => {
 
   it("stops at the overall timeout", async () => {
     vi.useFakeTimers();
+    let initialClockRead = true;
+    const now = () => initialClockRead ? (initialClockRead = false, 0) : -300_000;
     const { adapters } = setup({ codex: [ok("codex", "draft")] });
     adapters.cursor.run = vi.fn((_prompt: string, options?: AgentRunOptions) => new Promise<AgentResult>((resolve) => options?.signal?.addEventListener("abort", () => resolve(fail("cursor", "Request was aborted")), { once: true })));
-    const promise = runReviewFlow("request", { agents: adapters, maxFlowMs: 10 });
+    const promise = runReviewFlow("request", { agents: adapters, maxFlowMs: 10, now });
     await vi.advanceTimersByTimeAsync(10);
     const result = await promise;
     expect(result.status).toBe("timed_out"); expect(result.steps.map((step) => step.status)).toEqual(["completed", "error", "skipped", "skipped"]);
     vi.useRealTimers();
   });
 
+  it("does not spawn an agent when its reserved work budget is exhausted", async () => {
+    const { adapters, calls } = setup({});
+    const result = await runReviewFlow("request", { agents: adapters, maxFlowMs: 30_000 });
+    expect(calls.codex).toHaveLength(0);
+    expect(result.steps[0]).toMatchObject({ status: "error", terminationReason: "step_budget_exhausted" });
+    expect(result.steps.slice(1).every((step) => step.status === "skipped")).toBe(true);
+  });
+
+  it("records structural step-budget provenance when an active step is aborted", async () => {
+    vi.useFakeTimers();
+    const { adapters } = setup({});
+    adapters.codex.run = vi.fn((_prompt: string, options?: AgentRunOptions) => new Promise<AgentResult>((resolve) => options?.signal?.addEventListener("abort", () => resolve(fail("codex", "Request was aborted")), { once: true })));
+    const pending = runReviewFlow("request", { agents: adapters });
+    await vi.advanceTimersByTimeAsync(90_000);
+    const result = await pending;
+    expect(result.steps[0]).toMatchObject({ status: "error", terminationReason: "step_budget_exhausted", error: "Review step budget exhausted." });
+    vi.useRealTimers();
+  });
+
+  it("keeps a parent review-flow abort distinct from a step budget", async () => {
+    const controller = new AbortController();
+    const { adapters } = setup({});
+    adapters.codex.run = vi.fn((_prompt: string, options?: AgentRunOptions) => new Promise<AgentResult>((resolve) => options?.signal?.addEventListener("abort", () => resolve(fail("codex", "Request was aborted")), { once: true })));
+    const pending = runReviewFlow("request", { agents: adapters, signal: controller.signal });
+    controller.abort(reviewFlowTimeoutAbortReason());
+    const result = await pending;
+    expect(result.steps[0].terminationReason).toBe("flow_aborted");
+  });
+
+  it("keeps an external abort request-originated when it has the step-budget text", async () => {
+    const controller = new AbortController();
+    const { adapters } = setup({});
+    adapters.codex.run = vi.fn((_prompt: string, options?: AgentRunOptions) => new Promise<AgentResult>((resolve) => options?.signal?.addEventListener("abort", () => resolve(fail("codex", "Request was aborted")), { once: true })));
+    const pending = runReviewFlow("request", { agents: adapters, signal: controller.signal });
+    controller.abort(new Error("Review step budget exhausted"));
+    const result = await pending;
+    expect(result.steps[0].terminationReason).toBe("request_aborted");
+  });
+
   it("uses a typed timeout reason when the review-flow deadline aborts a running agent", async () => {
     vi.useFakeTimers();
+    let initialClockRead = true;
+    const now = () => initialClockRead ? (initialClockRead = false, 0) : -300_000;
     const { adapters } = setup({ codex: [ok("codex", "draft")] });
     let receivedReason: unknown;
     adapters.cursor.run = vi.fn((_prompt: string, options?: AgentRunOptions) => new Promise<AgentResult>((resolve) => options?.signal?.addEventListener("abort", () => {
       receivedReason = options.signal?.reason;
       resolve(fail("cursor", "Request was aborted"));
     }, { once: true })));
-    const pending = runReviewFlow("request", { agents: adapters, maxFlowMs: 10 });
+    const pending = runReviewFlow("request", { agents: adapters, maxFlowMs: 10, now });
     await vi.advanceTimersByTimeAsync(10);
     await pending;
     expect(isReviewFlowTimeoutAbortReason(receivedReason)).toBe(true);
@@ -169,10 +227,12 @@ describe("runReviewFlow", () => {
 
   it("emits flow_timed_out at the overall timeout", async () => {
     vi.useFakeTimers();
+    let initialClockRead = true;
+    const now = () => initialClockRead ? (initialClockRead = false, 0) : -300_000;
     const { adapters } = setup({ codex: [ok("codex", "draft")] });
     adapters.cursor.run = vi.fn((_prompt: string, options?: AgentRunOptions) => new Promise<AgentResult>((resolve) => options?.signal?.addEventListener("abort", () => resolve(fail("cursor", "Request was aborted")), { once: true })));
     const events: FlowEvent[] = [];
-    const promise = runReviewFlow("request", { agents: adapters, maxFlowMs: 10, onEvent: (event) => events.push(event) });
+    const promise = runReviewFlow("request", { agents: adapters, maxFlowMs: 10, now, onEvent: (event) => events.push(event) });
     await vi.advanceTimersByTimeAsync(10);
     await promise;
     expect(events.at(-1)?.type).toBe("flow_timed_out");

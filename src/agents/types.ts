@@ -24,7 +24,7 @@ export type AgentLifecycleTelemetry = {
   terminationReason?: AgentTerminationReason;
 };
 
-export type AgentTerminationReason = "agent_deadline_exceeded" | "request_aborted" | "flow_aborted";
+export type AgentTerminationReason = "agent_deadline_exceeded" | "request_aborted" | "flow_aborted" | "step_budget_exhausted";
 
 export type AgentResult = {
   agent: AgentId;

@@ -5,7 +5,7 @@ import { codexArgs } from "./codex";
 import { cursorArgs } from "./cursor";
 import { claudeArgs } from "./claude";
 import { createAgentAdapter } from "./runner";
-import { reviewFlowTimeoutAbortReason } from "./abort-origin";
+import { reviewFlowTimeoutAbortReason, reviewStepBudgetAbortReason } from "./abort-origin";
 import { buildGenericRuntimePolicy } from "../server/runtime-policy";
 import { isAgentExecutionActive } from "../server/agent-execution-guard";
 import { activeChildProcesses } from "../server/child-process-registry";
@@ -558,6 +558,40 @@ describe("createAgentAdapter", () => {
     controller.abort(reviewFlowTimeoutAbortReason());
     child.emit("close", null, "SIGTERM");
     await expect(pending).resolves.toMatchObject({ error: "Request was aborted", terminationReason: "flow_aborted" });
+  });
+
+  it("classifies a step-budget abort structurally and completes registered TERM-to-KILL cleanup", async () => {
+    vi.useFakeTimers();
+    const child = fakeChild(); Object.defineProperty(child, "pid", { value: 987_656 });
+    const controller = new AbortController();
+    const received: import("./types").AgentLifecycleTelemetry[] = [];
+    const kill = vi.spyOn(process, "kill").mockImplementation((() => true) as typeof process.kill);
+    const adapter = createAgentAdapter(
+      { id: "cursor", name: "Cursor", binary: "agent", args: (prompt) => ["-p", prompt] },
+      { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
+    );
+    const pending = adapter.run("review", { signal: controller.signal, onLifecycleTelemetry: (telemetry) => { received.push(telemetry); } });
+    controller.abort(reviewStepBudgetAbortReason());
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(kill).toHaveBeenCalledWith(-987_656, "SIGTERM");
+    expect(kill).toHaveBeenCalledWith(-987_656, "SIGKILL");
+    child.emit("close", null, "SIGKILL");
+    await expect(pending).resolves.toMatchObject({ terminationReason: "step_budget_exhausted" });
+    expect(received[0]).toMatchObject({ terminationReason: "step_budget_exhausted", terminationMethod: "kill_required" });
+    expect(activeChildProcesses()).toEqual([]);
+    vi.useRealTimers();
+  });
+
+  it("does not depend on step-budget diagnostic text", async () => {
+    const child = fakeChild(); const controller = new AbortController();
+    const adapter = createAgentAdapter(
+      { id: "cursor", name: "Cursor", binary: "agent", args: (prompt) => ["-p", prompt] },
+      { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
+    );
+    const pending = adapter.run("review", { signal: controller.signal });
+    controller.abort(reviewStepBudgetAbortReason("A future step budget display message"));
+    child.emit("close", null, "SIGTERM");
+    await expect(pending).resolves.toMatchObject({ terminationReason: "step_budget_exhausted" });
   });
 
   it("classifies an external abort with the old timeout text as request-originated", async () => {
