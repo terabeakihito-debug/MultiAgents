@@ -6,6 +6,13 @@ import { classifyProviderVersion, parseProviderVersion } from "../providers/comp
 import { assertProviderExecutionIdentity, diagnoseProvider, prepareCodexImmutableBinding, providerDiagnostics, providerExecutionIdentityForTests, PROVIDER_COMPATIBILITY_POLICY_VERSION, ProviderDiagnosticTimeoutError, readCodexRuntimeResolverOutputForTests, resolveCodexRuntimeFresh } from "./provider-diagnostics";
 import { StateStore } from "./state-store";
 import { buildSandboxCommand } from "./os-sandbox";
+import { withRuntimeBindingRootForTests } from "./immutable-executable-binding";
+
+async function withBindingRoot<T>(run: (root: string) => Promise<T>) {
+  const root = await mkdtemp(join(tmpdir(), "multiagents-runtime-binding-"));
+  try { return await withRuntimeBindingRootForTests(root, () => run(root)); }
+  finally { await rm(root, { recursive: true, force: true }); }
+}
 
 describe("provider compatibility", () => {
   it("strictly parses the three fixed version formats and rejects malformed values", () => {
@@ -97,10 +104,11 @@ describe("provider compatibility", () => {
   });
 
   it("observes fresh package exports resolution and binds the selected runtime through launch", async () => {
-    const root = await mkdtemp(join(tmpdir(), "multiagents-fresh-codex-"));
-    const home = join(root, "home"); const nodeRoot = join(root, "node"); const nodePath = join(nodeRoot, "bin", "node"); const codex = join(nodeRoot, "lib", "node_modules", "@openai", "codex"); const optional = join(codex, "node_modules", "@openai", "codex-linux-x64"); const triple = "x86_64-unknown-linux-musl";
-    const runtime = (name: string) => join(optional, name); const native = (name: string) => join(runtime(name), "vendor", triple, "bin", "codex"); const companion = (name: string) => join(runtime(name), "vendor", triple, "bin", "codex-code-mode-host");
-    try {
+    await withBindingRoot(async (bindingRoot) => {
+      const root = await mkdtemp(join(tmpdir(), "multiagents-fresh-codex-"));
+      const home = join(root, "home"); const nodeRoot = join(root, "node"); const nodePath = join(nodeRoot, "bin", "node"); const codex = join(nodeRoot, "lib", "node_modules", "@openai", "codex"); const optional = join(codex, "node_modules", "@openai", "codex-linux-x64"); const triple = "x86_64-unknown-linux-musl";
+      const runtime = (name: string) => join(optional, name); const native = (name: string) => join(runtime(name), "vendor", triple, "bin", "codex"); const companion = (name: string) => join(runtime(name), "vendor", triple, "bin", "codex-code-mode-host");
+      try {
       await Promise.all([mkdir(join(home, ".codex"), { recursive: true }), mkdir(join(codex, "bin"), { recursive: true }), mkdir(join(codex, "vendor", triple, "bin"), { recursive: true }), mkdir(join(nodeRoot, "bin"), { recursive: true }), mkdir(join(runtime("a"), "vendor", triple, "bin"), { recursive: true }), mkdir(join(runtime("b"), "vendor", triple, "bin"), { recursive: true })]);
       await Promise.all([writeFile(nodePath, "node"), writeFile(join(home, ".codex", "auth.json"), "metadata"), writeFile(join(codex, "bin", "codex.js"), "entry"), writeFile(join(codex, "package.json"), "{}"), writeFile(join(codex, "vendor", triple, "bin", "codex"), "vendor"), writeFile(join(codex, "vendor", triple, "bin", "codex-code-mode-host"), "vendor-host"), writeFile(join(runtime("a"), "package.json"), "{}"), writeFile(join(runtime("b"), "package.json"), "{}"), writeFile(native("a"), "runtime-a"), writeFile(native("b"), "runtime-b"), writeFile(companion("a"), "host-a"), writeFile(companion("b"), "host-b")]);
       await Promise.all([chmod(nodePath, 0o700), chmod(join(home, ".codex", "auth.json"), 0o600), chmod(join(codex, "bin", "codex.js"), 0o700), chmod(join(codex, "vendor", triple, "bin", "codex"), 0o700), chmod(join(codex, "vendor", triple, "bin", "codex-code-mode-host"), 0o700), chmod(native("a"), 0o700), chmod(native("b"), 0o700), chmod(companion("a"), 0o700), chmod(companion("b"), 0o700)]);
@@ -115,6 +123,7 @@ describe("provider compatibility", () => {
       const binding = await assertProviderExecutionIdentity("codex", { provider: "codex", status: "supported", flagsCompatible: true, credentialStatus: "available", sandboxCompatible: true, launchCompatible: true, checkedAt: new Date().toISOString(), versionChanged: false, identityChanged: false, identity: identityB }, context);
       expect(binding.codexRuntime?.nativeExecutable).toBe(native("b"));
       const immutable = await prepareCodexImmutableBinding(binding.codexRuntime!);
+      expect(immutable.binding.stagedRuntimeRoot.startsWith(`${bindingRoot}/`)).toBe(true);
       const pinnedCommand = buildSandboxCommand({ profile: "agent_read_only", provider: "codex", cwd: root, codexRuntime: immutable.binding, command: { binary: "codex", args: ["--version"] } });
       const pinnedArgs = pinnedCommand.args.join("\0");
       expect(pinnedArgs).toContain(`${immutable.binding.stagedRuntimeRoot}\0/opt/multiagents/codex`);
@@ -125,7 +134,8 @@ describe("provider compatibility", () => {
       await writeFile(native("a"), "unselected-runtime-changed"); expect(await providerExecutionIdentityForTests("codex", context)).toBe(identityB);
       await writeFile(companion("b"), "selected-host-changed"); expect(await providerExecutionIdentityForTests("codex", context)).not.toBe(identityB);
       await writeFile(native("b"), "selected-runtime-changed"); expect(await providerExecutionIdentityForTests("codex", context)).not.toBe(identityB);
-    } finally { await rm(root, { recursive: true, force: true }); }
+      } finally { await rm(root, { recursive: true, force: true }); }
+    });
   });
 
   it("fails closed for malformed, unsafe, timed-out, and flooded resolver results", async () => {

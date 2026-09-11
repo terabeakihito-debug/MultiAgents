@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { closeSync, constants, fsyncSync, openSync } from "node:fs";
 import { chmod, lstat, mkdir, open, realpath, rm } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -6,6 +7,22 @@ import { dirname, join } from "node:path";
 import { securePrivateDirectory } from "./state-path";
 
 const RUNTIME_BINDING_ROOT = join(homedir(), ".multiagents", "runtime", "provider-bindings");
+const runtimeBindingRootOverride = new AsyncLocalStorage<string>();
+
+/** Test-only scope for isolated immutable runtime staging. */
+export async function withRuntimeBindingRootForTests<T>(root: string, run: () => Promise<T> | T): Promise<T> {
+  if (process.env.NODE_ENV !== "test") throw new Error("Runtime binding root override is test-only");
+  if (!root.startsWith("/") || root.includes("\0")) throw new Error("Runtime binding root override is unsafe");
+  return runtimeBindingRootOverride.run(root, run);
+}
+
+/** Exposes the resolved root only to assert test fixture isolation. */
+export function runtimeBindingRootForTests() {
+  if (process.env.NODE_ENV !== "test") throw new Error("Runtime binding root inspection is test-only");
+  return runtimeBindingRootOverride.getStore() ?? RUNTIME_BINDING_ROOT;
+}
+
+function runtimeBindingRoot() { return runtimeBindingRootOverride.getStore() ?? RUNTIME_BINDING_ROOT; }
 
 /** The only durable cleanup target accepted after an unconfirmed child dies. */
 export async function cleanupDeferredRuntimeBinding(directory: string) {
@@ -80,7 +97,7 @@ export async function prepareImmutableExecutableBinding(sourcePath: string, appr
 export async function prepareImmutableRuntimeBinding(artifacts: readonly RuntimeArtifact[]): Promise<ImmutableRuntimeBinding> {
   if (!artifacts.length || new Set(artifacts.map((artifact) => artifact.name)).size !== artifacts.length || artifacts.some((artifact) => !isSafeRuntimeArtifactName(artifact.name))) throw new Error("Provider runtime artifact layout is invalid");
   secureBindingRoot();
-  const directory = join(RUNTIME_BINDING_ROOT, randomUUID());
+  const directory = join(runtimeBindingRoot(), randomUUID());
   const stagedDirectories = new Set<string>();
   try {
     await mkdir(directory, { mode: 0o700 });
@@ -139,14 +156,20 @@ function isSafeRuntimeArtifactName(name: string) {
 }
 
 function secureBindingRoot() {
+  const root = runtimeBindingRoot();
+  if (root !== RUNTIME_BINDING_ROOT) {
+    securePrivateDirectory(root);
+    return;
+  }
   securePrivateDirectory(join(homedir(), ".multiagents"));
   securePrivateDirectory(join(homedir(), ".multiagents", "runtime"));
   securePrivateDirectory(RUNTIME_BINDING_ROOT);
 }
 
 function isAbsoluteBindingDirectory(directory: string) {
-  if (!directory.startsWith(`${RUNTIME_BINDING_ROOT}/`) || directory.includes("\0")) return false;
-  const name = directory.slice(RUNTIME_BINDING_ROOT.length + 1);
+  const root = runtimeBindingRoot();
+  if (!directory.startsWith(`${root}/`) || directory.includes("\0")) return false;
+  const name = directory.slice(root.length + 1);
   return /^[0-9a-f-]{36}$/.test(name);
 }
 

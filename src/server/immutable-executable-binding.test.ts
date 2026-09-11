@@ -4,11 +4,17 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
-import { aggregateRuntimeArtifactIdentity, executableContentIdentity, prepareImmutableExecutableBinding, prepareImmutableRuntimeBinding } from "./immutable-executable-binding";
+import { aggregateRuntimeArtifactIdentity, executableContentIdentity, prepareImmutableExecutableBinding, prepareImmutableRuntimeBinding, runtimeBindingRootForTests, withRuntimeBindingRootForTests } from "./immutable-executable-binding";
 import { cursorRuntimeManifestForTests } from "./provider-diagnostics";
 import { buildSandboxCommand } from "./os-sandbox";
 
 const execute = promisify(execFile);
+
+async function withBindingRoot<T>(run: (root: string) => Promise<T>) {
+  const root = await mkdtemp(join(tmpdir(), "multiagents-runtime-binding-"));
+  try { return await withRuntimeBindingRootForTests(root, () => run(root)); }
+  finally { await rm(root, { recursive: true, force: true }); }
+}
 
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "multiagents-immutable-codex-"));
@@ -20,9 +26,48 @@ async function fixture() {
 }
 
 describe("immutable Codex executable binding", () => {
-  it("executes approved staged bytes after source metadata and alternate paths change", async () => {
+  it("uses the production default only outside a test binding-root scope", () => {
+    expect(runtimeBindingRootForTests()).toBe(join(homedir(), ".multiagents", "runtime", "provider-bindings"));
+  });
+
+  it("isolates concurrent test binding-root scopes and restores the default", async () => {
+    const [first, second] = await Promise.all([
+      withBindingRoot(async (root) => runtimeBindingRootForTests() === root ? root : "wrong-root"),
+      withBindingRoot(async (root) => runtimeBindingRootForTests() === root ? root : "wrong-root"),
+    ]);
+    expect(first).not.toBe(second);
+    expect(runtimeBindingRootForTests()).toBe(join(homedir(), ".multiagents", "runtime", "provider-bindings"));
+  });
+
+  it("rejects binding-root overrides outside test mode", async () => {
+    const environment = process.env as Record<string, string | undefined>;
+    const previous = process.env.NODE_ENV;
+    environment.NODE_ENV = "production";
+    try { await expect(withRuntimeBindingRootForTests("/tmp/not-used", async () => undefined)).rejects.toThrow("test-only"); }
+    finally {
+      if (previous === undefined) delete environment.NODE_ENV;
+      else environment.NODE_ENV = previous;
+    }
+  });
+
+  it("surfaces filesystem errors from an injected binding root", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "multiagents-runtime-binding-error-"));
+    const root = join(parent, "not-a-directory");
     const value = await fixture();
     try {
+      await writeFile(root, "not a directory");
+      const identity = await executableContentIdentity(value.source);
+      await expect(withRuntimeBindingRootForTests(root, () => prepareImmutableExecutableBinding(value.source, identity))).rejects.toThrow();
+    } finally {
+      await rm(value.root, { recursive: true, force: true });
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("executes approved staged bytes after source metadata and alternate paths change", async () => {
+    await withBindingRoot(async (bindingRoot) => {
+      const value = await fixture();
+      try {
       const approved = await executableContentIdentity(value.source);
       const companionApproved = await executableContentIdentity(value.companion);
       const staged = await prepareImmutableRuntimeBinding([{ name: "codex", sourcePath: value.source, identity: approved }, { name: "codex-code-mode-host", sourcePath: value.companion, identity: companionApproved }]);
@@ -41,18 +86,21 @@ describe("immutable Codex executable binding", () => {
       });
       const result = await execute(command.binary, command.args, { cwd: command.cwd, env: command.env });
       expect(result.stdout.trim()).toBe("A");
+      expect(staged.directory.startsWith(`${bindingRoot}/`)).toBe(true);
       expect(command.args).toContain(staged.directory);
       expect(command.args).not.toContain(value.source);
       await rm(value.source);
       expect((await execute(command.binary, command.args, { cwd: command.cwd, env: command.env })).stdout.trim()).toBe("A");
       await staged.cleanup();
       await expect(stat(staged.paths.codex)).rejects.toMatchObject({ code: "ENOENT" });
-    } finally { await rm(value.root, { recursive: true, force: true }); }
+      } finally { await rm(value.root, { recursive: true, force: true }); }
+    });
   });
 
   it("rejects same-size content replacement even when mtime is restored", async () => {
-    const value = await fixture();
-    try {
+    await withBindingRoot(async () => {
+      const value = await fixture();
+      try {
       const approved = await executableContentIdentity(value.source);
       const sourceStat = await stat(value.source);
       await value.put(value.source, "B"); await utimes(value.source, sourceStat.atime, sourceStat.mtime);
@@ -61,23 +109,27 @@ describe("immutable Codex executable binding", () => {
       const companionStat = await stat(value.companion);
       await value.put(value.companion, "GOST"); await utimes(value.companion, companionStat.atime, companionStat.mtime);
       await expect(prepareImmutableRuntimeBinding([{ name: "codex-code-mode-host", sourcePath: value.companion, identity: companionApproved }])).rejects.toThrow("changed");
-    } finally { await rm(value.root, { recursive: true, force: true }); }
+      } finally { await rm(value.root, { recursive: true, force: true }); }
+    });
   });
 
   it("rejects a symlink source and cleans a failed binding", async () => {
-    const value = await fixture();
-    try {
+    await withBindingRoot(async () => {
+      const value = await fixture();
+      try {
       const approved = await executableContentIdentity(value.source);
       await rm(value.source); await symlink("/bin/sh", value.source);
       await expect(prepareImmutableExecutableBinding(value.source, approved)).rejects.toThrow("non-symlink");
       await chmod(value.companion, 0o600);
       await expect(executableContentIdentity(value.companion)).rejects.toThrow("regular required file");
-    } finally { await rm(value.root, { recursive: true, force: true }); }
+      } finally { await rm(value.root, { recursive: true, force: true }); }
+    });
   });
 
   it("stages both Codex executables into one read-only outer sandbox directory", async () => {
-    const value = await fixture();
-    try {
+    await withBindingRoot(async () => {
+      const value = await fixture();
+      try {
       const staged = await prepareImmutableRuntimeBinding([
         { name: "codex", sourcePath: value.source, identity: await executableContentIdentity(value.source) },
         { name: "codex-code-mode-host", sourcePath: value.companion, identity: await executableContentIdentity(value.companion) },
@@ -90,17 +142,19 @@ describe("immutable Codex executable binding", () => {
       const args = [...command.args]; const separator = args.lastIndexOf("--"); args.splice(separator + 1, args.length, "/bin/sh", "-c", "test -x /opt/multiagents/codex/codex && test -x /opt/multiagents/codex/codex-code-mode-host && test ! -w /opt/multiagents/codex/codex-code-mode-host && printf HOST_OK");
       expect((await execute(command.binary, args, { cwd: command.cwd, env: command.env })).stdout.trim()).toBe("HOST_OK");
       await staged.cleanup();
-    } finally { await rm(value.root, { recursive: true, force: true }); }
+      } finally { await rm(value.root, { recursive: true, force: true }); }
+    });
   });
 });
 
 describe("immutable Cursor and Claude runtime bindings", () => {
   it.skipIf(process.env.MULTIAGENTS_LIVE_CURSOR_STAGING !== "1")("runs the installed Cursor version probe entirely from its staged runtime", async () => {
-    const launcher = join(homedir(), ".local", "bin", "agent");
-    const runtimeRoot = dirname(await realpath(launcher));
-    const manifest = await cursorRuntimeManifestForTests(runtimeRoot);
-    const staged = await prepareImmutableRuntimeBinding(manifest.artifacts.map((artifact) => ({ ...artifact, sourcePath: join(runtimeRoot, artifact.name) })));
-    try {
+    await withBindingRoot(async () => {
+      const launcher = join(homedir(), ".local", "bin", "agent");
+      const runtimeRoot = dirname(await realpath(launcher));
+      const manifest = await cursorRuntimeManifestForTests(runtimeRoot);
+      const staged = await prepareImmutableRuntimeBinding(manifest.artifacts.map((artifact) => ({ ...artifact, sourcePath: join(runtimeRoot, artifact.name) })));
+      try {
       const command = buildSandboxCommand({ profile: "agent_read_only", provider: "cursor", cwd: process.cwd(), command: { binary: "agent", args: ["--version"] }, pseudoTty: true, cursorRuntime: { stagedRuntimeRoot: staged.directory, aggregateDigest: staged.aggregateDigest } });
       const result = await execute(command.binary, command.args, { cwd: command.cwd, env: command.env }).catch((error: { stdout?: string; stderr?: string }) => {
         throw new Error(`staged Cursor probe failed: ${error.stdout ?? ""}\n${error.stderr ?? ""}`);
@@ -108,13 +162,15 @@ describe("immutable Cursor and Claude runtime bindings", () => {
       expect(result.stdout).toContain("2026.09.02-c22c1a3");
       expect(command.args).toContain(staged.directory);
       expect(command.args).not.toContain(runtimeRoot);
-    } finally { await staged.cleanup(); }
+      } finally { await staged.cleanup(); }
+    });
   }, 15_000);
 
   it("pins Cursor's wrapper, node, and index chain after source replacement and deletion", async () => {
-    const root = await mkdtemp(join(tmpdir(), "multiagents-immutable-cursor-"));
-    const put = async (name: string, content: string, mode: number) => { const path = join(root, name); await writeFile(path, content); await chmod(path, mode); return path; };
-    try {
+    await withBindingRoot(async () => {
+      const root = await mkdtemp(join(tmpdir(), "multiagents-immutable-cursor-"));
+      const put = async (name: string, content: string, mode: number) => { const path = join(root, name); await writeFile(path, content); await chmod(path, mode); return path; };
+      try {
       const wrapper = await put("cursor-agent", "#!/bin/sh\nexec \"$(dirname \"$0\")/node\" \"$(dirname \"$0\")/index.js\" \"$@\"\n", 0o700);
       const node = await put("node", "#!/bin/sh\nexec /bin/sh \"$1\"\n", 0o700);
       const index = await put("index.js", "printf 'A\\n'\n", 0o600);
@@ -125,13 +181,15 @@ describe("immutable Cursor and Claude runtime bindings", () => {
       expect((await execute(command.binary, command.args, { cwd: command.cwd, env: command.env })).stdout.trim()).toBe("A");
       for (const source of [wrapper, node, index]) expect(command.args).not.toContain(source);
       await staged.cleanup();
-    } finally { await rm(root, { recursive: true, force: true }); }
+      } finally { await rm(root, { recursive: true, force: true }); }
+    });
   });
 
   it("uses one canonical aggregate mode model and stages Cursor's complete numbered chunk closure", async () => {
-    const root = await mkdtemp(join(tmpdir(), "multiagents-cursor-manifest-"));
-    const put = async (name: string, content: string, mode: number) => { const path = join(root, name); await writeFile(path, content); await chmod(path, mode); return path; };
-    try {
+    await withBindingRoot(async () => {
+      const root = await mkdtemp(join(tmpdir(), "multiagents-cursor-manifest-"));
+      const put = async (name: string, content: string, mode: number) => { const path = join(root, name); await writeFile(path, content); await chmod(path, mode); return path; };
+      try {
       await put("cursor-agent", "#!/bin/sh\nexec \"$(dirname \"$0\")/node\" \"$(dirname \"$0\")/index.js\" \"$@\"\n", 0o755);
       await put("node", "#!/bin/sh\nexec /bin/sh \"$1\"\n", 0o755);
       await put("index.js", "# __webpack_require__.u=e=>e+'.index.js'; require('./'+__webpack_require__.u(t)); cursorsandbox getRipgrepBinaryPath\ntest -f \"$(dirname \"$0\")/2.index.js\" || exit 91\nprintf 'A\\n'\n", 0o644);
@@ -161,7 +219,8 @@ describe("immutable Cursor and Claude runtime bindings", () => {
       await writeFile(join(root, "node_modules", "tree-sitter", "index.js"), "module.exports = { changed: true };\n");
       expect((await cursorRuntimeManifestForTests(root)).aggregateDigest).not.toBe(manifest.aggregateDigest);
       await staged.cleanup();
-    } finally { await rm(root, { recursive: true, force: true }); }
+      } finally { await rm(root, { recursive: true, force: true }); }
+    });
   });
 
   it("rejects a missing or symlinked required Cursor runtime chunk", async () => {
@@ -179,8 +238,9 @@ describe("immutable Cursor and Claude runtime bindings", () => {
   });
 
   it("pins Claude's staged launcher through same-size mutation and source deletion", async () => {
-    const value = await fixture();
-    try {
+    await withBindingRoot(async () => {
+      const value = await fixture();
+      try {
       const approved = await executableContentIdentity(value.source);
       const staged = await prepareImmutableExecutableBinding(value.source, approved);
       const sourceStat = await stat(value.source); await value.put(value.source, "B"); await utimes(value.source, sourceStat.atime, sourceStat.mtime);
@@ -190,6 +250,7 @@ describe("immutable Cursor and Claude runtime bindings", () => {
       expect((await execute(command.binary, command.args, { cwd: command.cwd, env: command.env })).stdout.trim()).toBe("A");
       expect(command.args).toContain(staged.path);
       await staged.cleanup();
-    } finally { await rm(value.root, { recursive: true, force: true }); }
+      } finally { await rm(value.root, { recursive: true, force: true }); }
+    });
   });
 });
