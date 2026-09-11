@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, mkdir, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -61,6 +61,17 @@ describe("repository discovery and isolated worktrees", () => {
     expect(await runGit(join(allowed, "clean"), ["status", "--porcelain"])).toBe("");
     await expect(deleteTask(task.id)).rejects.toThrow("uncommitted changes");
     await runGit(task.worktreePath, ["restore", "README.md"]); await deleteTask(task.id);
+  });
+  it("fails closed and retains the worktree when the authoritative status check fails", async () => {
+    const allowed = await root(); await repo(allowed, "status-failure");
+    const task = await createTask("status-failure", { allowedRoot: allowed, worktreeRoot: join(await root(), "worktrees") });
+    // Make the status invocation fail before it can reach worktree removal.
+    await runGit(task.repoPath, ["config", "extensions.worktreeConfig", "true"]);
+    await runGit(task.worktreePath, ["config", "--worktree", "filter.evil.clean", "/tmp/evil-filter"]);
+
+    await expect(deleteTask(task.id)).rejects.toThrow("Git config is not allowed");
+    await expect(lstat(task.worktreePath)).resolves.toBeDefined();
+    expect(task.worktreeStatus).toBe("available");
   });
   it("shows every untracked approval entry, identifies binary, and renders a symlink target without reading its target", async () => {
     const allowed = await root(); await repo(allowed, "files");

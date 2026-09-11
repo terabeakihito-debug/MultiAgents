@@ -1,8 +1,11 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PullRequestReview } from "./pr-review-types";
 import { DashboardQueryError, getDashboard, nextActionFor, parseDashboardQuery, summarizeTaskPrompt, validatedDashboardPrUrl } from "./dashboard";
 import { StateStore, replaceStateStoreForTests, type DashboardQuery } from "./state-store";
 import type { RepoTask, TaskStatus } from "./tasks";
+import { runGit } from "./git";
+
+vi.mock("./git", () => ({ runGit: vi.fn() }));
 
 let store: StateStore;
 
@@ -33,11 +36,47 @@ function task(id: string, status: TaskStatus, overrides: Partial<RepoTask> = {})
 beforeEach(() => {
   store = new StateStore(":memory:");
   replaceStateStoreForTests(store);
+  vi.mocked(runGit).mockReset();
 });
 
 afterEach(() => { replaceStateStoreForTests(new StateStore(":memory:")); });
 
 describe("Phase 9 dashboard query", () => {
+  it("does not run Git status on the Dashboard GET construction path", async () => {
+    const item = task("10111111-1111-4111-8111-111111111111", "draft");
+    store.saveTask(item);
+    const now = new Date("2027-01-01T00:00:00.000Z");
+    const result = await getDashboard(query(), now);
+
+    expect(runGit).not.toHaveBeenCalled();
+    expect(result.tasks[0]).toMatchObject({ cleanup: { allowed: true } });
+    expect(result.tasks[0]).not.toHaveProperty("worktreeDirty");
+    expect(result.tasks[0].worktreeAgeHours).toBe(Math.max(0, (now.getTime() - Date.parse(result.tasks[0].updatedAt)) / 3_600_000));
+  });
+
+  it("keeps cheap worktree age but omits Operations-only filesystem inventory metadata", async () => {
+    const item = task("12111111-1111-4111-8111-111111111111", "draft", { updatedAt: "2026-01-01T00:00:00.000Z" });
+    store.saveTask(item);
+    const now = new Date("2027-01-01T02:30:00.000Z");
+    const result = await getDashboard(query(), now);
+
+    expect(result.tasks[0].worktreeAgeHours).toBe(Math.max(0, (now.getTime() - Date.parse(result.tasks[0].updatedAt)) / 3_600_000));
+    expect(result.tasks[0]).not.toHaveProperty("worktreeSizeBytes");
+    expect(result.tasks[0]).not.toHaveProperty("worktreeInventoryStatus");
+    expect(result.tasks[0]).not.toHaveProperty("cleanupCandidate");
+  });
+
+  it("does not treat Dashboard cleanup eligibility as a cleanliness verdict", async () => {
+    store.saveTask(task("10111111-1111-4111-8111-111111111111", "draft"));
+
+    const result = await getDashboard(query(), new Date("2026-01-01T00:00:01.000Z"));
+
+    expect(runGit).not.toHaveBeenCalled();
+    expect(result.tasks[0]).toMatchObject({
+      cleanup: { allowed: true, warning: "The worktree is rechecked immediately before deletion." },
+    });
+  });
+
   it("displays the immutable task profile name and version", async () => {
     const item = task("10111111-1111-4111-8111-111111111111", "draft", { worktreeAvailable: false, worktreeStatus: "missing" });
     store.saveTask(item);

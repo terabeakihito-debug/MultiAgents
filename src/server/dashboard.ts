@@ -1,12 +1,9 @@
 import type { DashboardResponse, DashboardTask, NextAction, PrFilter, TaskBucket } from "../dashboard/types";
 import { taskBuckets } from "../dashboard/types";
-import { runGit } from "./git";
 import { getStateStore, type DashboardQuery, type DashboardRow } from "./state-store";
 import { getTask, type RepoTask, type TaskStatus } from "./tasks";
 import { evaluateInactiveTasks } from "./notifications";
 import { redactKnownSecrets } from "./credential-resolver";
-import { inspectTaskWorktrees } from "./operational-health";
-import type { WorktreeUsage } from "../health/types";
 
 const MAX_DASHBOARD_LIMIT = 100;
 const DEFAULT_DASHBOARD_LIMIT = 50;
@@ -67,9 +64,9 @@ export function parseDashboardQuery(url: URL): DashboardQuery {
 export async function getDashboard(query: DashboardQuery, now = new Date()): Promise<DashboardResponse> {
   evaluateInactiveTasks(now);
   const result = getStateStore().queryDashboard(query);
-  const dashboardTasks = result.rows.map((row) => getTask(row.taskId)).filter((task): task is RepoTask => Boolean(task));
-  const usage = new Map((await inspectTaskWorktrees(dashboardTasks)).filter((item) => item.taskId).map((item) => [item.taskId!, item]));
-  const tasks = await Promise.all(result.rows.map((row) => dashboardTask(row, now, usage.get(row.taskId))));
+  // Worktree inventory and cleanliness are authoritative mutation-time checks.
+  // Neither belongs on this read hot path.
+  const tasks = await Promise.all(result.rows.map((row) => dashboardTask(row, now)));
   return { tasks, counts: result.counts, limit: query.limit };
 }
 
@@ -127,27 +124,20 @@ export function validatedDashboardPrUrl(task: RepoTask | undefined, row: Pick<Da
   return row.prUrl === expected ? expected : undefined;
 }
 
-async function dashboardTask(row: DashboardRow, now: Date, usage?: WorktreeUsage): Promise<DashboardTask> {
+async function dashboardTask(row: DashboardRow, now: Date): Promise<DashboardTask> {
   const task = getTask(row.taskId);
   const sourceFinding = row.sourceFindingId ? getStateStore().loadFinding(row.sourceFindingId) : undefined;
   const profile = object(row.payload.profileSnapshot);
   const template = object(row.payload.templateSnapshot);
-  let dirty = false;
-  let cleanupCheckFailed = false;
-  if (task?.worktreeAvailable && row.worktreeStatus === "available") {
-    try { dirty = Boolean(await runGit(task.worktreePath, ["status", "--porcelain"])); }
-    catch { cleanupCheckFailed = true; }
-  }
   const prUrl = validatedDashboardPrUrl(task, row);
   const nextAction = nextActionFor(row);
   const hasPr = Boolean(row.prNumber);
   const cleanupBlocked = row.worktreeStatus !== "available" || !row.worktreeAvailable
-    ? "The managed worktree is unavailable."
-    : cleanupCheckFailed ? "Worktree cleanliness could not be verified."
-      : dirty ? "Dirty worktrees cannot be deleted. Commit, stash, or discard changes manually first." : undefined;
+    ? "The managed worktree is unavailable." : undefined;
   const warning = row.bucket === "ready_for_human_merge"
     ? "This task is ready for human merge. Removing its worktree is irreversible locally."
-    : hasPr ? "This will not delete the GitHub branch or pull request." : undefined;
+    : hasPr ? "This will not delete the GitHub branch or pull request."
+      : "The worktree is rechecked immediately before deletion.";
   const review = object(row.payload.prReview);
   return {
     id: row.taskId, repoId: row.repoId, repoName: row.repoName, summary: summarizeTaskPrompt(row.originalPrompt),
@@ -158,8 +148,9 @@ async function dashboardTask(row: DashboardRow, now: Date, usage?: WorktreeUsage
     createdAt: row.createdAt, updatedAt: row.updatedAt,
     inactive: now.getTime() - Date.parse(row.updatedAt) >= INACTIVE_AFTER_MS,
     recoveryStatus: row.recoveryStatus, recoveryMessage: row.recoveryMessage, worktreeStatus: row.worktreeStatus,
-    worktreeAgeHours: usage?.ageHours, worktreeSizeBytes: usage?.sizeBytes, worktreeDirty: usage?.dirty,
-    worktreeInventoryStatus: usage?.inventoryStatus, cleanupCandidate: usage?.cleanupCandidate,
+    // This is task metadata, not a filesystem measurement, so it remains safe
+    // for the hot path. Detailed inventory fields belong to Operations.
+    worktreeAgeHours: worktreeAgeHours(row.worktreeStatus, row.updatedAt, now),
     profileName: typeof profile.name === "string" ? profile.name : "invalid profile",
     profileVersion: typeof profile.version === "number" ? profile.version : row.profileVersion ?? 0,
     templateName: typeof template.name === "string" ? template.name : "invalid template",
@@ -167,9 +158,18 @@ async function dashboardTask(row: DashboardRow, now: Date, usage?: WorktreeUsage
     nextAction, nextActionLabel: NEXT_ACTION_LABELS[nextAction], attentionReason: row.bucket === "needs_attention" ? attentionReasonFor(row) : undefined,
     canResume: row.bucket !== "archived" && row.recoveryStatus !== "invalid" && !["base_diverged", "base_missing"].includes(String(row.payload.baseState)), canViewDiff: row.worktreeAvailable && row.worktreeStatus === "available",
     canRefreshPr: Boolean(row.prNumber && prUrl),
+    // `allowed` only permits requesting cleanup from the UI.  It is not a
+    // cleanliness verdict: deleteTask performs that check immediately before
+    // it removes a worktree.
     cleanup: { allowed: !cleanupBlocked, requiresConfirmation: hasPr, warning, blockedReason: cleanupBlocked },
     source: sourceFinding && row.sourceTaskId ? { findingId: sourceFinding.findingId, sourceTaskId: row.sourceTaskId, severity: sourceFinding.severity, title: sourceFinding.title } : undefined,
   };
+}
+
+function worktreeAgeHours(status: string, updatedAt: string, now: Date): number | undefined {
+  if (status === "not_required" || status === "removed") return undefined;
+  const updated = Date.parse(updatedAt);
+  return Number.isFinite(updated) ? Math.max(0, (now.getTime() - updated) / 3_600_000) : undefined;
 }
 
 function object(value: unknown): Record<string, unknown> {

@@ -47,11 +47,9 @@ export type DashboardTask = {
   recoveryStatus: string;
   recoveryMessage?: string;
   worktreeStatus: string;
+  /** Cheap task-metadata age; detailed filesystem inventory is Operations-only. */
   worktreeAgeHours?: number;
-  worktreeSizeBytes?: number;
   worktreeDirty?: boolean;
-  worktreeInventoryStatus?: string;
-  cleanupCandidate?: boolean;
   profileName: string;
   profileVersion: number;
   templateName: string;
@@ -63,6 +61,7 @@ export type DashboardTask = {
   canViewDiff: boolean;
   canRefreshPr: boolean;
   cleanup: {
+    /** Allows submitting a cleanup request; deletion re-verifies cleanliness. */
     allowed: boolean;
     requiresConfirmation: boolean;
     warning?: string;
