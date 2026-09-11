@@ -188,6 +188,31 @@ describe("runReviewFlow", () => {
     vi.useRealTimers();
   });
 
+  it("stops the work budget at child close while post-close finalization is still pending", async () => {
+    vi.useFakeTimers();
+    const { adapters } = setup({});
+    let releaseFinalization!: () => void;
+    const finalization = new Promise<void>((resolve) => { releaseFinalization = resolve; });
+    let codexRuns = 0;
+    adapters.codex.run = vi.fn(async (_prompt: string, options?: AgentRunOptions) => {
+      if (codexRuns++ === 0) {
+        options?.onChildClose?.();
+        await finalization;
+        return ok("codex", "draft");
+      }
+      return ok("codex", "final");
+    });
+    const pending = runReviewFlow("request", { agents: adapters });
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(90_000);
+    releaseFinalization();
+    const result = await pending;
+    expect(result.status).toBe("completed");
+    expect(result.steps[0]).toMatchObject({ status: "completed", output: "draft" });
+    expect(result.steps[0].terminationReason).toBeUndefined();
+    vi.useRealTimers();
+  });
+
   it("keeps a parent review-flow abort distinct from a step budget", async () => {
     const controller = new AbortController();
     const { adapters } = setup({});

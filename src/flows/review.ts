@@ -28,7 +28,7 @@ type FlowOptions = {
   roles?: RolePolicy;
   repositoryReadOnly?: boolean;
   runtimePolicies?: Record<AgentId, RuntimePolicy>;
-  executeAgent?: (agent: AgentId, prompt: string, signal: AbortSignal, stepId: FlowStepId) => Promise<import("../agents/types").AgentResult>;
+  executeAgent?: (agent: AgentId, prompt: string, signal: AbortSignal, stepId: FlowStepId, onChildClose?: () => void) => Promise<import("../agents/types").AgentResult>;
 };
 type FlowLogEntry = { flowId: string; stepId: FlowStepId; agent: AgentId; status: FlowStep["status"]; durationMs?: number };
 
@@ -153,10 +153,16 @@ async function executeStep(step: FlowStep, input: string, adapters: AgentSet, si
   if (signal.aborted) abortFromParent();
   const budgetTimer = setTimeout(() => stepController.abort(reviewStepBudgetAbortReason()), budgetMs);
   budgetTimer.unref();
+  let childClosed = false;
+  const stopWorkBudgetAtChildClose = () => {
+    if (childClosed) return;
+    childClosed = true;
+    clearTimeout(budgetTimer);
+  };
   try {
     const run = options.executeAgent
-      ? await options.executeAgent(step.agent, input, stepController.signal, step.id)
-      : await adapters[step.agent].run(input, { signal: stepController.signal, policy });
+      ? await options.executeAgent(step.agent, input, stepController.signal, step.id, stopWorkBudgetAtChildClose)
+      : await adapters[step.agent].run(input, { signal: stepController.signal, policy, onChildClose: stopWorkBudgetAtChildClose });
     step.status = run.status;
     step.output = run.output;
     step.error = run.error;

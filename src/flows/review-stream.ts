@@ -5,7 +5,7 @@ import type { RuntimePolicy } from "../runtime/types";
 import { runReviewFlow } from "./review";
 import { createEventStream } from "./event-stream";
 
-type StreamOptions = { cwd?: string; getDiff?: () => Promise<string>; fingerprint?: () => Promise<string>; roles?: RolePolicy; repositoryReadOnly?: boolean; runtimePolicies?: Record<AgentId, RuntimePolicy>; executeAgent?: (agent: AgentId, prompt: string, signal: AbortSignal, stepId: FlowStepId) => Promise<AgentResult>; onComplete?: (result: ReviewFlowResult) => void; onEvent?: (event: FlowEvent) => void };
+type StreamOptions = { cwd?: string; getDiff?: () => Promise<string>; fingerprint?: () => Promise<string>; roles?: RolePolicy; repositoryReadOnly?: boolean; runtimePolicies?: Record<AgentId, RuntimePolicy>; executeAgent?: (agent: AgentId, prompt: string, signal: AbortSignal, stepId: FlowStepId, onChildClose?: () => void) => Promise<AgentResult>; onComplete?: (result: ReviewFlowResult) => void; onEvent?: (event: FlowEvent) => void };
 type ReviewRunner = (prompt: string, options: { signal: AbortSignal; onEvent: (event: FlowEvent) => void; log: (entry: { flowId: string; stepId: string; agent: string; status: string; durationMs?: number }) => void; cwd?: string; getDiff?: () => Promise<string>; fingerprint?: () => Promise<string>; roles?: RolePolicy; repositoryReadOnly?: boolean; runtimePolicies?: Record<AgentId, RuntimePolicy>; executeAgent?: StreamOptions["executeAgent"] }) => Promise<ReviewFlowResult>;
 
 export function createReviewFlowStream(prompt: string, requestSignal: AbortSignal, runner: ReviewRunner = runReviewFlow, options: StreamOptions = {}) {

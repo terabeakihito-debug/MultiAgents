@@ -649,6 +649,22 @@ describe("createAgentAdapter", () => {
     expect(isAgentExecutionActive()).toBe(false);
   });
 
+  it("notifies the child-close boundary before post-close verification", async () => {
+    const child = fakeChild();
+    const adapter = createAgentAdapter(
+      { id: "cursor", name: "Cursor", binary: "agent", args: (prompt) => ["-p", prompt] },
+      { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
+    );
+    const events: string[] = [];
+    const pending = adapter.run("review", {
+      onChildClose: () => { events.push("child_closed"); },
+      afterClose: async (result) => { events.push("verification"); return result; },
+    });
+    child.emit("close", 0, null);
+    await expect(pending).resolves.toMatchObject({ status: "completed" });
+    expect(events).toEqual(["child_closed", "verification"]);
+  });
+
   it("releases the guard after a post-close verification failure", async () => {
     const child = fakeChild();
     const adapter = createAgentAdapter(

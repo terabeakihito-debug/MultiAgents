@@ -356,6 +356,11 @@ function runProcess(
         if (closeSignal) lifecycle.exitSignal = closeSignal;
         if (lifecycle.sigtermRequestedAt && !lifecycle.sigkillRequestedAt && lifecycle.terminationMethod !== "kill_required") lifecycle.terminationMethod = "term_only";
         if (forceKillTimer) clearTimeout(forceKillTimer);
+        // The ChildProcess close event (or its equally strict fallback) is the
+        // provider-work boundary. Notify the flow before any post-close
+        // verification, cleanup, telemetry, or result settlement begins.
+        try { runOptions?.onChildClose?.(); }
+        catch { /* lifecycle observers cannot alter process finalization */ }
         if (finalizationUnconfirmed) {
           // A real ChildProcess close event is the canonical lifecycle
           // boundary, including inherited stdio held by descendants.
