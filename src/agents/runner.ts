@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { AgentAdapter, AgentDefinition, AgentResult } from "./types";
-import { isReviewFlowTimeoutAbortReason } from "./abort-origin";
+import { isReviewFlowTimeoutAbortReason, isReviewStepBudgetAbortReason } from "./abort-origin";
 import { assertAgentExecutionAdmissible, beginAgentExecution, captureUnresolvedAgentExecution, durablyQuarantineCapturedUnresolvedAgentExecution, inspectUnresolvedAgentProcess, quarantineUnconfirmedAgentExecution } from "../server/agent-execution-guard";
 import { runtimeBindingDirectory } from "../server/immutable-executable-binding";
 import { assertProviderExecutionAllowed, assertProviderExecutionIdentity, prepareProviderImmutableBinding } from "../server/provider-diagnostics";
@@ -356,6 +356,11 @@ function runProcess(
         if (closeSignal) lifecycle.exitSignal = closeSignal;
         if (lifecycle.sigtermRequestedAt && !lifecycle.sigkillRequestedAt && lifecycle.terminationMethod !== "kill_required") lifecycle.terminationMethod = "term_only";
         if (forceKillTimer) clearTimeout(forceKillTimer);
+        // The ChildProcess close event (or its equally strict fallback) is the
+        // provider-work boundary. Notify the flow before any post-close
+        // verification, cleanup, telemetry, or result settlement begins.
+        try { runOptions?.onChildClose?.(); }
+        catch { /* lifecycle observers cannot alter process finalization */ }
         if (finalizationUnconfirmed) {
           // A real ChildProcess close event is the canonical lifecycle
           // boundary, including inherited stdio held by descendants.
@@ -564,7 +569,15 @@ function runProcess(
         registration = registerChildProcess({ child, purpose: "agent" });
         const createdAuditError = captureAuditFailure({ type: "os_sandbox_created", profile, provider: definition.id, capabilityClass: policy.policyClass });
         if (createdAuditError) requestTermination();
-        abort = () => requestFailure(new Error("Request was aborted"), true, isReviewFlowTimeoutAbortReason(signal?.reason) ? "flow_aborted" : "request_aborted");
+        abort = () => requestFailure(
+          new Error("Request was aborted"),
+          true,
+          isReviewFlowTimeoutAbortReason(signal?.reason)
+            ? "flow_aborted"
+            : isReviewStepBudgetAbortReason(signal?.reason)
+              ? "step_budget_exhausted"
+              : "request_aborted",
+        );
         signal?.addEventListener("abort", abort, { once: true });
         timer = setTimeout(() => {
           lifecycle.timeoutRequestedAt = new Date().toISOString();

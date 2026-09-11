@@ -124,6 +124,7 @@ export async function runTaskAgentWithPolicy(input: {
   onViolation: (policy: RuntimePolicy, violation: RuntimeViolation) => void;
   onSandboxAudit: (event: import("./os-sandbox").OsSandboxAudit) => void;
   onLifecycleTelemetry?: (telemetry: import("../agents/types").AgentLifecycleTelemetry) => void;
+  onChildClose?: () => void;
 }): Promise<AgentResult> {
   const { task, adapter, policy } = input;
   if (adapter.id !== policy.agent || policy.execution.length !== (policy.role === "disabled" ? 0 : 1)) {
@@ -180,6 +181,7 @@ export async function runTaskAgentWithPolicy(input: {
       policy,
       onSandboxAudit: input.onSandboxAudit,
       onLifecycleTelemetry: input.onLifecycleTelemetry,
+      onChildClose: input.onChildClose,
       // The adapter owns the active-agent gate, so verification belongs in its
       // post-close finalization callback rather than after adapter.run().
       afterClose: verifyAfterClose,

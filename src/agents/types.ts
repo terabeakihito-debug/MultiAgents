@@ -24,7 +24,7 @@ export type AgentLifecycleTelemetry = {
   terminationReason?: AgentTerminationReason;
 };
 
-export type AgentTerminationReason = "agent_deadline_exceeded" | "request_aborted" | "flow_aborted";
+export type AgentTerminationReason = "agent_deadline_exceeded" | "request_aborted" | "flow_aborted" | "step_budget_exhausted";
 
 export type AgentResult = {
   agent: AgentId;
@@ -51,6 +51,8 @@ export type AgentRunOptions = {
   signal?: AbortSignal;
   policy?: import("../runtime/types").RuntimePolicy;
   onSandboxAudit?: (event: import("../server/os-sandbox").OsSandboxAudit) => unknown;
+  /** Called synchronously at the authoritative spawned-child close boundary. */
+  onChildClose?: () => void;
   /** Runs after child close/unregister while the active-agent gate is held. */
   afterClose?: (result: AgentResult) => Promise<AgentResult> | AgentResult;
   /** Receives content-free process lifecycle facts after child close. */

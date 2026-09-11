@@ -1827,7 +1827,7 @@ function validateLifecycleTelemetry(value: unknown) {
     if (lifecycleIntegerKeys.has(key) && (typeof item !== "number" || !Number.isSafeInteger(item) || item < 0)) throw new Error("Task lifecycle count is invalid");
     if (key === "exitSignal" && (typeof item !== "string" || !lifecycleSignals.has(item))) throw new Error("Task lifecycle signal is invalid");
     if (key === "terminationMethod" && item !== "term_only" && item !== "kill_required") throw new Error("Task lifecycle termination method is invalid");
-    if (key === "terminationReason" && item !== "agent_deadline_exceeded" && item !== "request_aborted" && item !== "flow_aborted") throw new Error("Task lifecycle termination reason is invalid");
+    if (key === "terminationReason" && item !== "agent_deadline_exceeded" && item !== "request_aborted" && item !== "flow_aborted" && item !== "step_budget_exhausted") throw new Error("Task lifecycle termination reason is invalid");
   }
   if (typeof telemetry.spawnedAt !== "string" || typeof telemetry.stdoutBytes !== "number" || typeof telemetry.stderrBytes !== "number") throw new Error("Task lifecycle telemetry is incomplete");
 }
