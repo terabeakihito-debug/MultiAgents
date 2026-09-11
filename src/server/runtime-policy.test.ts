@@ -43,10 +43,10 @@ describe("Phase 17 runtime capability policy", () => {
     expect(Object.values(first).map((policy) => policy.policyHash)).toEqual(Object.values(second).map((policy) => policy.policyHash));
   });
 
-  it("does not launch disabled roles and gives them no execution capability", async () => {
+  it("gives Documentation Claude a review-only execution policy", async () => {
     const { task } = await fixture("documentation");
     const policies = await buildTaskRuntimePolicies(task);
-    expect(policies.claude).toMatchObject({ role: "disabled", policyClass: "disabled", execution: [], allowWrite: false });
+    expect(policies.claude).toMatchObject({ role: "review_only", allowWrite: false, filesystem: ["worktree_read"] });
   });
 
   it.each(["security_review", "investigation"])("makes %s fully read-only without a worktree", async (templateId) => {

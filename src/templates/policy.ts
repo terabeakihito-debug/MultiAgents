@@ -73,7 +73,7 @@ const BUILT_INS: Readonly<Record<TaskType, BuiltInDefinition>> = Object.freeze({
   documentation: {
     templateId: "documentation", name: "Documentation", taskType: "documentation", executionMode: "review_flow",
     description: "Make a documentation-only change with available lightweight validation and a required PR.",
-    roles: { codex: "implement", cursor: "review_only", claude: "disabled" }, validationPreset: DOCS,
+    roles: { codex: "implement", cursor: "review_only", claude: "review_only" }, validationPreset: DOCS,
     defaultPromptPrefix: "Limit changes to documentation and directly related examples.\nDo not change runtime behavior unless explicitly requested.",
     readOnly: false, requireWorktree: true, requireHumanApproval: true, requirePr: true,
   },

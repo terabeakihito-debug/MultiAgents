@@ -36,7 +36,7 @@ describe("Phase 11 built-in task templates", () => {
     const templates = builtInTemplates("project", "2026-01-01T00:00:00.000Z");
     expect(templates.map((template) => template.taskType)).toEqual(["bug_fix", "feature", "refactor", "security_review", "documentation", "investigation"]);
     for (const id of ["bug_fix", "feature", "refactor"] as const) expect(templates.find((template) => template.templateId === id)).toMatchObject({ executionMode: "review_flow", validationPreset: ["npm_test", "npm_lint", "npm_typecheck", "npm_build"], requireWorktree: true, requireHumanApproval: true, requirePr: true, roles: { codex: "implement", cursor: "review_only", claude: "review_only" } });
-    expect(templates.find((template) => template.templateId === "documentation")).toMatchObject({ validationPreset: ["npm_lint", "npm_typecheck", "npm_build"], requirePr: true, roles: { codex: "implement", cursor: "review_only", claude: "disabled" } });
+    expect(templates.find((template) => template.templateId === "documentation")).toMatchObject({ validationPreset: ["npm_lint", "npm_typecheck", "npm_build"], requirePr: true, roles: { codex: "implement", cursor: "review_only", claude: "review_only" } });
     for (const id of ["security_review", "investigation"] as const) expect(templates.find((template) => template.templateId === id)).toMatchObject({ readOnly: true, validationPreset: [], requireWorktree: false, requireHumanApproval: false, requirePr: false, roles: { codex: "review_only", cursor: "review_only", claude: "review_only" } });
   });
 
@@ -58,7 +58,7 @@ describe("Phase 11 built-in task templates", () => {
     expect(merged.validationPreset).toEqual([]);
     expect(merged).toMatchObject({ readOnly: true, requireWorktree: false, requirePr: false });
     const docs = mergeTemplateWithProfile(builtInTemplate("project", "documentation"), safeDefaultSnapshot("project"));
-    expect(docs.roles.claude).toBe("disabled");
+    expect(docs.roles).toEqual({ codex: "implement", cursor: "review_only", claude: "review_only" });
   });
 
   it("uses only the fixed server prompt prefix", () => {
