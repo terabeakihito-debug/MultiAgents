@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { runGit } from "./git";
-import { listRepositories, validateRepository } from "./repositories";
+import { createLocalProject, initializeLocalProject, listRepositories, validateRepository } from "./repositories";
 import { clearTasksForTests, createTask, deleteTask, getTaskDiff } from "./tasks";
 
 const roots: string[] = [];
@@ -28,9 +28,28 @@ describe("repository discovery and isolated worktrees", () => {
     await expect(validateRepository("/mnt/c/repo", allowed)).rejects.toThrow("Invalid repository id");
     await expect(createTask("evil;branch", { allowedRoot: allowed, worktreeRoot: join(await root(), "worktrees") })).rejects.toThrow("Invalid repository id");
   });
+  it("rejects a canonical alias into quarantined onboarding state for validation, listing, and tasks", async () => {
+    const allowed = await root(); const onboarding = join(allowed, ".multiagents-onboarding"); await mkdir(onboarding);
+    const failed = await repo(onboarding, "failed"); await symlink(failed, join(allowed, "Recovered"));
+    await expect(validateRepository("Recovered", allowed)).rejects.toThrow("reserved onboarding area");
+    expect((await listRepositories(allowed)).map((item) => item.id)).not.toContain("Recovered");
+    await expect(createTask("Recovered", { allowedRoot: allowed, worktreeRoot: join(await root(), "worktrees") })).rejects.toThrow("reserved onboarding area");
+  });
   it("rejects dirty source repositories", async () => {
     const allowed = await root(); const path = await repo(allowed, "dirty"); await writeFile(join(path, "README.md"), "changed\n");
     await expect(createTask("dirty", { allowedRoot: allowed, worktreeRoot: join(await root(), "worktrees") })).rejects.toThrow("uncommitted changes");
+  });
+  it("rejects task creation for an uninitialized project before worktree processing", async () => {
+    const allowed = await root(); const created = await createLocalProject("uninitialized", false, allowed);
+    expect((await validateRepository(created.id, allowed)).initializationRequired).toBe(true);
+    await expect(createTask(created.id, { allowedRoot: allowed, worktreeRoot: join(await root(), "worktrees") })).rejects.toThrow("Project must be initialized");
+  });
+  it("allows task creation from a freshly initialized starter project", async () => {
+    const allowed = await root(); const created = await createLocalProject("beginner", true, allowed);
+    await initializeLocalProject(created.id, allowed);
+    expect(await runGit(created.path, ["status", "--porcelain"])).toBe("");
+    const task = await createTask(created.id, { allowedRoot: allowed, worktreeRoot: join(await root(), "worktrees") });
+    await deleteTask(task.id);
   });
   it("creates a server-named branch, uses its worktree, and acquires diff", async () => {
     const allowed = await root(); await repo(allowed, "clean");

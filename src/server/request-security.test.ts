@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { beginAgentExecution } from "./agent-execution-guard";
-import { clearHumanMutationSessionsForTests, issueHumanMutationNonce, rejectNonLocalRequest, requireHumanMutation } from "./request-security";
+import { clearHumanMutationSessionsForTests, issueHumanMutationNonce, rejectNonHumanRepositoryMutation, rejectNonLocalRequest, requireHumanMutation } from "./request-security";
 
 const ORIGIN = "http://localhost:3000";
 
@@ -52,7 +52,7 @@ describe("requireHumanMutation", () => {
   it("rejects another localhost port and a non-loopback Origin", async () => {
     const { nonce, cookie } = await issuedNonce();
     expect(requireHumanMutation(mutation({ ...authorizedHeaders(nonce, cookie), origin: "http://localhost:9999" }), "task-create")?.status).toBe(403);
-    const issued = await issuedNonce();
+    const issued = await issuedNonce(Date.now());
     expect(requireHumanMutation(mutation({ ...authorizedHeaders(issued.nonce, issued.cookie), origin: "https://example.test" }), "task-create")?.status).toBe(403);
   });
 
@@ -106,5 +106,16 @@ describe("requireHumanMutation", () => {
     expect(requireHumanMutation(mutation(authorizedHeaders(issued.nonce, issued.cookie), "DELETE"), "task-create")?.status).toBe(405);
     const next = await issuedNonce();
     expect(requireHumanMutation(mutation(authorizedHeaders(next.nonce, next.cookie, "task-delete")), "task-create")?.status).toBe(403);
+  });
+});
+
+describe("repository mutation authorization", () => {
+  it("uses the same one-time same-origin action gate for repository mutations", async () => {
+    const issued = await issuedNonce(Date.now());
+    const request = mutation(authorizedHeaders(issued.nonce, issued.cookie, "repository-clone"), "POST", `${ORIGIN}/api/repos/clone`);
+    expect(rejectNonHumanRepositoryMutation(request, "repository-clone")).toBeUndefined();
+    expect(rejectNonHumanRepositoryMutation(request, "repository-clone")?.status).toBe(403);
+    const wrong = await issuedNonce(Date.now());
+    expect(rejectNonHumanRepositoryMutation(mutation(authorizedHeaders(wrong.nonce, wrong.cookie, "repository-create"), "POST", `${ORIGIN}/api/repos/clone`), "repository-clone")?.status).toBe(403);
   });
 });

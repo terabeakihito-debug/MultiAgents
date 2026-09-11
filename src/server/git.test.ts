@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { activeChildProcesses } from "./child-process-registry";
-import { lsRemoteTransport, pushCommitTransport, runGit, runGitBytes, setGitCommandTimeoutForTests, setGitTransportRootForTests } from "./git";
+import { lsRemoteTransport, pushCommitTransport, runGit, runGitBytes, runGitMktree, setGitCommandTimeoutForTests, setGitTransportRootForTests } from "./git";
 import { createDiffSnapshot, runServerGitMutation } from "./pull-request";
 import { clearTasksForTests, createTask, deleteTask } from "./tasks";
 
@@ -48,6 +48,13 @@ afterEach(async () => {
 });
 
 describe("Phase 21A safe Git execution", () => {
+  it("constructs a tree only from server-provided mktree input", async () => {
+    const { repo } = await fixture();
+    await writeFile(join(repo, "tree-fixture.txt"), "approved\n");
+    const blob = await runGit(repo, ["hash-object", "-w", "--", "tree-fixture.txt"]);
+    const tree = await runGitMktree(repo, Buffer.from(`100644 blob ${blob}\tREADME.md\n`, "utf8"));
+    expect(await runGit(repo, ["ls-tree", "-r", tree])).toBe(`100644 blob ${blob}\tREADME.md`);
+  });
   it("prevents fsmonitor and hooks from executing during discovery, status, worktree creation, and cleanup", async () => {
     const { root, allowed, repo, marker } = await fixture();
     const monitor = join(root, "monitor"); const hooks = join(root, "hooks");

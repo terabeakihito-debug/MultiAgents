@@ -181,6 +181,8 @@ export async function createTask(repoId: string, options: { allowedRoot?: string
   loadPersistedTasks();
   const allowedRoot = options.allowedRoot ?? ALLOWED_ROOT;
   const repo = await validateRepository(repoId, allowedRoot);
+  if (repo.initializationRequired) throw new Error("Project must be initialized before starting a task.");
+  if (repo.initializationRepairRequired) throw new Error("Project setup must be completed before starting a task. Retry Initialize project.");
   const profile = taskProfileSnapshot(await getOrCreateRepoProfile(repoId, allowedRoot));
   requireUsableTaskProfile(profile, repoId);
   const template = await selectTaskTemplate(repoId, options.templateId, profile, allowedRoot);

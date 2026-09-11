@@ -35,16 +35,35 @@ export async function runGit(cwd: string, args: readonly string[]): Promise<stri
   return redactKnownSecrets(output.toString("utf8")).trimEnd();
 }
 
+/** Metadata reads must not refresh a caller's ordinary Git index. */
+export async function runGitReadOnly(cwd: string, args: readonly string[]): Promise<string> {
+  const output = await runGitBytes(cwd, args, buildChildProcessEnv({ purpose: "git", overrides: { GIT_OPTIONAL_LOCKS: "0" } }));
+  return redactKnownSecrets(output.toString("utf8")).trimEnd();
+}
+
+/** Builds a single server-owned tree from fixed, internally generated input. */
+export async function runGitMktree(cwd: string, input: Buffer): Promise<string> {
+  const output = await runGitBytesWithInput(cwd, ["mktree"], input, buildServerGitMutationEnv());
+  return redactKnownSecrets(output.toString("utf8")).trimEnd();
+}
+
 export async function runGitBytes(cwd: string, args: readonly string[], env = buildChildProcessEnv({ purpose: "git" }), options: { allowServerIndexFile?: boolean } = {}): Promise<Buffer> {
   const context = await resolveGitContext(cwd);
   if (context) await rejectExecutableRepositoryConfig(cwd, context);
   return executeGit(cwd, args, env, options);
 }
 
-function executeGit(cwd: string, args: readonly string[], env: NodeJS.ProcessEnv, options: { allowServerIndexFile?: boolean; configEnumeration?: boolean; discoveryCeiling?: string }): Promise<Buffer> {
+async function runGitBytesWithInput(cwd: string, args: readonly string[], input: Buffer, env: NodeJS.ProcessEnv): Promise<Buffer> {
+  const context = await resolveGitContext(cwd);
+  if (context) await rejectExecutableRepositoryConfig(cwd, context);
+  return executeGit(cwd, args, env, {}, input);
+}
+
+function executeGit(cwd: string, args: readonly string[], env: NodeJS.ProcessEnv, options: { allowServerIndexFile?: boolean; configEnumeration?: boolean; discoveryCeiling?: string }, input?: Buffer): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const gitArgs = options.configEnumeration ? ["--no-pager", ...args] : safeGitArgs(args);
-    const child = spawn(GIT_BINARY, gitArgs, { cwd, env: safeGitEnv(env, options.allowServerIndexFile, options.discoveryCeiling), shell: false, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(GIT_BINARY, gitArgs, { cwd, env: safeGitEnv(env, options.allowServerIndexFile, options.discoveryCeiling), shell: false, detached: process.platform !== "win32", stdio: [input ? "pipe" : "ignore", "pipe", "pipe"] });
+    if (!child.stdout || !child.stderr || (input && !child.stdin)) { child.kill(); reject(new Error("git stdio could not be established")); return; }
     const registration = registerChildProcess({ child, purpose: "git" });
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
@@ -66,6 +85,7 @@ function executeGit(cwd: string, args: readonly string[], env: NodeJS.ProcessEnv
       const appended = appendBoundedOutput(stderr, stderrSize, chunk);
       stderrSize = appended.size; oversized ||= appended.truncated;
     });
+    if (input) child.stdin!.end(input);
     child.on("error", (error) => { clearTimeout(timeout); registration.unregister(); reject(error); });
     child.on("close", (code) => {
       clearTimeout(timeout);
