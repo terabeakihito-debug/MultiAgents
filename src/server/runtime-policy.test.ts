@@ -155,7 +155,7 @@ describe("Phase 17 runtime capability policy", () => {
         task,
         policy,
         prompt: "implement",
-        adapter: { id: "codex", name: "codex", run: async () => ({ agent: "codex", status: "completed", output: "実行環境のエラーによりファイル確認・編集できない" }) },
+        adapter: { id: "codex", name: "codex", run: async () => ({ agent: "codex", status: "completed", output: "実行環境のエラーにより、ファイルの確認・編集ができませんでした" }) },
         onAudit: () => undefined,
         onViolation: () => undefined,
         onSandboxAudit: () => undefined,

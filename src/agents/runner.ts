@@ -317,11 +317,14 @@ function runProcess(
           if (terminationConfirmed) void resolveUnconfirmedTermination({ terminationConfirmed: true }).catch((failure) => { lifecycleError ??= failure; });
           return;
         }
+        const diagnostic = stderr.value().trim();
+        // Retain non-empty Codex stderr even when it exits successfully. Do
+        // not log stdout: it is untrusted provider output and may include
+        // repository or prompt-derived data.
+        if (definition.id === "codex" && diagnostic) logCodexStderr(code, closeSignal, diagnostic);
         let fallback: AgentResult;
         if (code === 0) fallback = { agent: definition.id, status: "completed", output: output() };
         else {
-          const diagnostic = stderr.value().trim();
-          if (definition.id === "codex") logCodexFailureStderr(code, closeSignal, diagnostic);
           fallback = diagnostic.startsWith("bwrap:")
             ? error(new OsSandboxUnavailableError("sandbox_launch_failed"))
             : { agent: definition.id, status: "error", output: output(), error: diagnostic ? `Process exited with code ${code ?? "unknown"}${closeSignal ? ` (${closeSignal})` : ""}: ${redactKnownSecrets(diagnostic)}` : `Process exited with code ${code ?? "unknown"}${closeSignal ? ` (${closeSignal})` : ""}` };
@@ -534,7 +537,11 @@ function logCodexSandboxLaunch(command: SandboxCommand, innerArgs: readonly stri
   }));
 }
 
-function logCodexFailureStderr(code: number | null, closeSignal: NodeJS.Signals | null, stderr: string) {
+/**
+ * Captures CLI diagnostics independently of the process outcome. Codex can
+ * return zero after producing a tool/runtime warning on stderr.
+ */
+function logCodexStderr(code: number | null, closeSignal: NodeJS.Signals | null, stderr: string) {
   console.warn("codex_cli_stderr", JSON.stringify({
     exitCode: code,
     signal: closeSignal,

@@ -183,6 +183,25 @@ describe("createAgentAdapter", () => {
     }
   });
 
+  it("logs redacted Codex stderr even when the CLI exits successfully", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const child = fakeChild();
+      const adapter = createAgentAdapter(
+        { id: "codex", name: "Codex", binary: "codex", args: codexArgs },
+        { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
+      );
+      const pending = adapter.run("read only", { policy: policy("codex", "/isolated/task", true) });
+      child.stderr.write("tool warning");
+      child.emit("close", 0, null);
+      await expect(pending).resolves.toMatchObject({ status: "completed" });
+      expect(warn).toHaveBeenCalledWith("codex_cli_stderr", expect.stringContaining('"exitCode":0'));
+      expect(warn).toHaveBeenCalledWith("codex_cli_stderr", expect.stringContaining("tool warning"));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("forces a normal non-repository Codex run into read-only mode", async () => {
     const child = fakeChild();
     const spawnProcess = vi.fn(() => child);

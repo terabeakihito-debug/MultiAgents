@@ -194,7 +194,7 @@ function isCodexRepositoryAccessSelfReport(policy: RuntimePolicy, result: AgentR
   if (policy.agent !== "codex" || !policy.allowWrite || result.status !== "completed" || !after) return false;
   if (before.target.fingerprint !== after.target.fingerprint) return false;
   return /\brepository\s+access\s+(?:failed|is\s+(?:unavailable|denied)|cannot|could\s+not)\b/i.test(result.output)
-    || /(?:実行環境(?:のエラー)?|実行環境のエラー).{0,100}(?:アクセス|ファイル(?:確認|の確認)?|編集).{0,60}(?:できない|不可|失敗)/.test(result.output);
+    || /(?:実行環境(?:のエラー)?|実行環境のエラー).{0,100}(?:アクセス|ファイル(?:確認|の確認)?|編集).{0,60}でき(?:ない|ません(?:でした)?)/.test(result.output);
 }
 
 export function runtimeViolationMessage(violation: RuntimeViolation) {
