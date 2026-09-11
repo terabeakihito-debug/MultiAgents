@@ -1,11 +1,15 @@
 import { fork } from "node:child_process";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { probeAbstractUnixSocketCapability, reportUnavailableAbstractUnixSocketCapability } from "../../test/abstract-unix-socket-capability";
 
 const children: ReturnType<typeof fork>[] = [];
 afterEach(() => { for (const child of children.splice(0)) if (!child.killed) child.kill("SIGKILL"); });
+const capability = await probeAbstractUnixSocketCapability();
+reportUnavailableAbstractUnixSocketCapability(capability);
+const ownershipDescribe = capability.available ? describe : describe.skip;
 
-describe("production ownership reset isolation", () => {
+ownershipDescribe(capability.available ? "production ownership reset isolation" : `production ownership reset isolation [host capability unavailable: ${capability.reason}]`, () => {
   it("cannot obtain a reset API or reacquire after loss in a production-mode process", async () => {
     const child = fork(join(process.cwd(), "src/server/ownership-production-worker.mjs"), [], { env: { ...process.env, NODE_ENV: "production" }, stdio: ["ignore", "ignore", "ignore", "ipc"] });
     children.push(child);

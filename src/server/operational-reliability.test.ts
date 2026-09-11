@@ -13,6 +13,7 @@ import { createStateBackup, validateBackupFile, validateStateBackup } from "./st
 import { diagnoseProvider } from "./provider-diagnostics";
 import { assertWorktreeDiskCapacity, backupStatus, inspectTaskWorktrees, inspectWorktrees, MINIMUM_WORKTREE_FREE_BYTES } from "./operational-health";
 import { beginRegisteredOperation, drainOperations, lifecycleState } from "./operation-registry";
+import { probeAbstractUnixSocketCapability, reportUnavailableAbstractUnixSocketCapability } from "../../test/abstract-unix-socket-capability";
 
 let fixtureRoot: string;
 let allowedRoot: string;
@@ -21,6 +22,9 @@ let worktreeRoot: string;
 let remotePath: string;
 let store: StateStore;
 const execFile = promisify(execFileCallback);
+const abstractUnixSocketCapability = await probeAbstractUnixSocketCapability();
+reportUnavailableAbstractUnixSocketCapability(abstractUnixSocketCapability);
+const ownershipIntegrationIt = abstractUnixSocketCapability.available ? it : it.skip;
 
 beforeEach(async () => {
   fixtureRoot = await mkdtemp(join(tmpdir(), "multiagents-phase19-"));
@@ -213,7 +217,7 @@ describe("Phase 19 backup, compatibility, diagnostics, disk and drain", () => {
     migrated.close();
   });
 
-  it("restores a verified backup only while the server is offline", async () => {
+  ownershipIntegrationIt(abstractUnixSocketCapability.available ? "restores a verified backup only while the server is offline" : `restores a verified backup only while the server is offline [host capability unavailable: ${abstractUnixSocketCapability.reason}]`, async () => {
     const restoreHome = join(fixtureRoot, "restore-home");
     const restoreStateDirectory = join(restoreHome, ".multiagents");
     const restorePath = join(restoreStateDirectory, "state.db");
