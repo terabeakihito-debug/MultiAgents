@@ -7,6 +7,7 @@ vi.mock("./os-sandbox", () => ({ checkOsSandboxAvailability: async () => undefin
 vi.mock("./provider-diagnostics", () => ({ providerDiagnostics: async () => [] }));
 vi.mock("./state-backup", () => ({ latestVerifiedBackup: () => ({ ageHours: 0, schemaVersion: 13, sizeBytes: 1 }) }));
 vi.mock("./operation-registry", () => ({ lifecycleState: () => "OWNERSHIP_LOST", activeOperations: () => [], ownershipLostEver: () => true, hasMutationOwnershipPredicate: () => true }));
+vi.mock("./tasks", () => ({ listTasks: () => [], WORKTREE_ROOT: "/tmp/multiagents-ownership-health-empty-worktrees" }));
 
 describe("operational health terminal ownership invariant", () => {
   it("never reports ready after terminal ownership loss, even with an active lease", async () => {
