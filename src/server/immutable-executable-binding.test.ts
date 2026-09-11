@@ -4,11 +4,15 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
+import { probeBubblewrapNamespaceCapability, reportUnavailableBubblewrapNamespaceCapability } from "../../test/bubblewrap-namespace-capability";
 import { aggregateRuntimeArtifactIdentity, executableContentIdentity, prepareImmutableExecutableBinding, prepareImmutableRuntimeBinding, runtimeBindingRootForTests, withRuntimeBindingRootForTests } from "./immutable-executable-binding";
 import { cursorRuntimeManifestForTests } from "./provider-diagnostics";
 import { buildSandboxCommand } from "./os-sandbox";
 
 const execute = promisify(execFile);
+const bubblewrapCapability = await probeBubblewrapNamespaceCapability();
+reportUnavailableBubblewrapNamespaceCapability(bubblewrapCapability);
+const realBubblewrapIt = bubblewrapCapability.available ? it : it.skip;
 
 async function withBindingRoot<T>(run: (root: string) => Promise<T>) {
   const root = await mkdtemp(join(tmpdir(), "multiagents-runtime-binding-"));
@@ -64,7 +68,7 @@ describe("immutable Codex executable binding", () => {
     }
   });
 
-  it("executes approved staged bytes after source metadata and alternate paths change", async () => {
+  realBubblewrapIt(bubblewrapCapability.available ? "executes approved staged bytes after source metadata and alternate paths change" : `executes approved staged bytes after source metadata and alternate paths change [host capability unavailable: ${bubblewrapCapability.reason}]`, async () => {
     await withBindingRoot(async (bindingRoot) => {
       const value = await fixture();
       try {
@@ -126,7 +130,7 @@ describe("immutable Codex executable binding", () => {
     });
   });
 
-  it("stages both Codex executables into one read-only outer sandbox directory", async () => {
+  realBubblewrapIt(bubblewrapCapability.available ? "stages both Codex executables into one read-only outer sandbox directory" : `stages both Codex executables into one read-only outer sandbox directory [host capability unavailable: ${bubblewrapCapability.reason}]`, async () => {
     await withBindingRoot(async () => {
       const value = await fixture();
       try {
@@ -148,7 +152,7 @@ describe("immutable Codex executable binding", () => {
 });
 
 describe("immutable Cursor and Claude runtime bindings", () => {
-  it.skipIf(process.env.MULTIAGENTS_LIVE_CURSOR_STAGING !== "1")("runs the installed Cursor version probe entirely from its staged runtime", async () => {
+  (bubblewrapCapability.available ? it.skipIf(process.env.MULTIAGENTS_LIVE_CURSOR_STAGING !== "1") : it.skip)(bubblewrapCapability.available ? "runs the installed Cursor version probe entirely from its staged runtime" : `runs the installed Cursor version probe entirely from its staged runtime [host capability unavailable: ${bubblewrapCapability.reason}]`, async () => {
     await withBindingRoot(async () => {
       const launcher = join(homedir(), ".local", "bin", "agent");
       const runtimeRoot = dirname(await realpath(launcher));
@@ -166,7 +170,7 @@ describe("immutable Cursor and Claude runtime bindings", () => {
     });
   }, 15_000);
 
-  it("pins Cursor's wrapper, node, and index chain after source replacement and deletion", async () => {
+  realBubblewrapIt(bubblewrapCapability.available ? "pins Cursor's wrapper, node, and index chain after source replacement and deletion" : `pins Cursor's wrapper, node, and index chain after source replacement and deletion [host capability unavailable: ${bubblewrapCapability.reason}]`, async () => {
     await withBindingRoot(async () => {
       const root = await mkdtemp(join(tmpdir(), "multiagents-immutable-cursor-"));
       const put = async (name: string, content: string, mode: number) => { const path = join(root, name); await writeFile(path, content); await chmod(path, mode); return path; };
@@ -185,7 +189,7 @@ describe("immutable Cursor and Claude runtime bindings", () => {
     });
   });
 
-  it("uses one canonical aggregate mode model and stages Cursor's complete numbered chunk closure", async () => {
+  realBubblewrapIt(bubblewrapCapability.available ? "uses one canonical aggregate mode model and stages Cursor's complete numbered chunk closure" : `uses one canonical aggregate mode model and stages Cursor's complete numbered chunk closure [host capability unavailable: ${bubblewrapCapability.reason}]`, async () => {
     await withBindingRoot(async () => {
       const root = await mkdtemp(join(tmpdir(), "multiagents-cursor-manifest-"));
       const put = async (name: string, content: string, mode: number) => { const path = join(root, name); await writeFile(path, content); await chmod(path, mode); return path; };
@@ -237,7 +241,7 @@ describe("immutable Cursor and Claude runtime bindings", () => {
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 
-  it("pins Claude's staged launcher through same-size mutation and source deletion", async () => {
+  realBubblewrapIt(bubblewrapCapability.available ? "pins Claude's staged launcher through same-size mutation and source deletion" : `pins Claude's staged launcher through same-size mutation and source deletion [host capability unavailable: ${bubblewrapCapability.reason}]`, async () => {
     await withBindingRoot(async () => {
       const value = await fixture();
       try {

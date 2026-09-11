@@ -4,6 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createServer } from "node:http";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { probeBubblewrapNamespaceCapability, reportUnavailableBubblewrapNamespaceCapability } from "../../test/bubblewrap-namespace-capability";
 import {
   BWRAP_BINARY,
   OsSandboxUnavailableError,
@@ -37,6 +38,9 @@ const CODEX_RUNTIME_FIXTURE = {
 };
 const CURSOR_RUNTIME_FIXTURE = { stagedRuntimeRoot: dirname(process.execPath), aggregateDigest: "fixture" };
 const CLAUDE_RUNTIME_FIXTURE = { stagedExecutable: process.execPath, digest: "fixture" };
+const bubblewrapCapability = await probeBubblewrapNamespaceCapability();
+reportUnavailableBubblewrapNamespaceCapability(bubblewrapCapability);
+const bubblewrapDescribe = bubblewrapCapability.available ? describe : describe.skip;
 
 function shellCommand(command: ReturnType<typeof buildSandboxCommand>, script: string) {
   const args = [...command.args];
@@ -110,7 +114,7 @@ describe("Phase 18 OS sandbox command policy", () => {
   });
 });
 
-describe("Phase 18 real bubblewrap enforcement", () => {
+bubblewrapDescribe(bubblewrapCapability.available ? "Phase 18 real bubblewrap enforcement" : `Phase 18 real bubblewrap enforcement [host capability unavailable: ${bubblewrapCapability.reason}]`, () => {
   let project: string;
   let base: string;
   let sibling: string;
