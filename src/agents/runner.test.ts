@@ -127,7 +127,7 @@ describe("createAgentAdapter", () => {
     await promise;
     expect(spawnProcess).toHaveBeenCalledWith(
       "/usr/bin/bwrap",
-      ["--", "codex", "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--sandbox", "workspace-write", "--cd", "/project", "implement"],
+      ["--", "codex", "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--dangerously-bypass-approvals-and-sandbox", "--cd", "/project", "implement"],
       expect.objectContaining({ cwd: "/", shell: false }),
     );
   });
@@ -149,6 +149,12 @@ describe("createAgentAdapter", () => {
     );
   });
 
+  it("uses Codex's inner-sandbox bypass only for an outer-sandboxed implementation", () => {
+    expect(codexArgs("implement", "/project", true, true)).toContain("--dangerously-bypass-approvals-and-sandbox");
+    expect(codexArgs("review", "/project", true, false)).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+    expect(codexArgs("answer", "/project", false, false)).toEqual(["exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--sandbox", "read-only", "--cd", "/project", "answer"]);
+  });
+
   it("does not let prompt content select the Codex sandbox or cwd", async () => {
     const child = fakeChild();
     const spawnProcess = vi.fn(() => child);
@@ -162,7 +168,7 @@ describe("createAgentAdapter", () => {
     await promise;
     expect(spawnProcess).toHaveBeenCalledWith(
       "/usr/bin/bwrap",
-      ["--", "codex", "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--sandbox", "workspace-write", "--cd", "/project", prompt],
+      ["--", "codex", "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--dangerously-bypass-approvals-and-sandbox", "--cd", "/project", prompt],
       expect.objectContaining({ cwd: "/", shell: false }),
     );
     const invokedArgs = spawnProcess.mock.calls[0] as unknown as [string, string[]];

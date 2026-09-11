@@ -154,9 +154,9 @@ describe("Phase 18 real bubblewrap enforcement", () => {
     expect(await readFile(join(project, "allowed.txt"), "utf8")).toBe("");
   });
 
-  it("makes implement worktree writable, base read-only, sibling hidden, and review project read-only", async () => {
+  it("lets a Codex implementation read and write its task worktree while base and sibling writes remain denied", async () => {
     const implement = shellCommand(buildSandboxCommand({ profile: "agent_implement", cwd: project, writableRoot: project, baseRepoRoot: base, provider: "codex", codexRuntime: CODEX_RUNTIME_FIXTURE, command: { binary: "codex", args: [] } }), [
-      "set -eu", "touch /project/implement.txt", `! touch ${base}/forbidden`, `test ! -e ${sibling}`, "printf IMPLEMENT_OK",
+      "set -eu", "printf codex-input > /project/codex-input.txt", "test \"$(cat /project/codex-input.txt)\" = codex-input", "printf codex-output > /project/implement.txt", "test \"$(cat /project/implement.txt)\" = codex-output", `test \"$(cat ${base}/base.txt)\" = base`, `! touch ${base}/forbidden`, `test ! -e ${sibling}`, "printf IMPLEMENT_OK",
     ].join("\n"));
     expect(await run(implement)).toMatchObject({ code: 0, stdout: "IMPLEMENT_OK" });
 
