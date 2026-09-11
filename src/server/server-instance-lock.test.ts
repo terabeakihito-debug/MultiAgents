@@ -3,11 +3,15 @@ import { mkdtemp, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { probeAbstractUnixSocketCapability, reportUnavailableAbstractUnixSocketCapability } from "../../test/abstract-unix-socket-capability";
 import { getEffectiveUid, getServerOwnershipSocketName } from "./server-ownership-socket.mjs";
 import { acquireServerInstanceLock, SERVER_INSTANCE_SOCKET_NAME, ServerInstanceLockedError } from "./server-instance-lock";
 
 const children: ReturnType<typeof fork>[] = [], directories: string[] = [];
 const worker = join(process.cwd(), "src/server/server-instance-lock-worker.mjs");
+const capability = await probeAbstractUnixSocketCapability();
+reportUnavailableAbstractUnixSocketCapability(capability);
+const ownershipDescribe = capability.available ? describe : describe.skip;
 function contender(hold = false) {
   const child = fork(worker, [SERVER_INSTANCE_SOCKET_NAME.slice(1), hold ? "hold" : "once"], { stdio: ["ignore", "ignore", "ignore", "ipc"] }); children.push(child);
   return { child, result: new Promise<{ status: string }>((resolve, reject) => { child.once("message", (value) => resolve(value as { status: string })); child.once("error", reject); }) };
@@ -15,7 +19,7 @@ function contender(hold = false) {
 async function stop(child: ReturnType<typeof fork>) { child.send("release"); await new Promise<void>((resolve) => child.once("exit", () => resolve())); }
 afterEach(async () => { for (const child of children.splice(0)) if (!child.killed) child.kill("SIGKILL"); await Promise.all(directories.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
 
-describe("abstract Unix socket server ownership", () => {
+ownershipDescribe(capability.available ? "abstract Unix socket server ownership" : `abstract Unix socket server ownership [host capability unavailable: ${capability.reason}]`, () => {
   it("rejects a second owner and allows reacquisition after release", async () => {
     const first = await acquireServerInstanceLock(); await expect(acquireServerInstanceLock()).rejects.toBeInstanceOf(ServerInstanceLockedError);
     await first.release(); const replacement = await acquireServerInstanceLock(); await replacement.release();
@@ -45,10 +49,11 @@ describe("abstract Unix socket server ownership", () => {
     await expect(first.release()).resolves.toMatchObject({ status: expect.stringMatching(/released/) }); expect(first.server.listening).toBe(false);
     const replacement = await acquireServerInstanceLock(); await replacement.release();
   });
-  it("uses one effective-UID socket identity shared with offline restore", async () => {
-    const identity = { geteuid: () => 4242, getuid: () => 1 };
-    expect(getEffectiveUid(identity)).toBe(4242);
-    expect(getServerOwnershipSocketName(identity)).toBe("\0multiagents-server-v1-4242");
-    expect(SERVER_INSTANCE_SOCKET_NAME).toBe(getServerOwnershipSocketName());
-  });
+});
+
+it("uses one effective-UID socket identity shared with offline restore", async () => {
+  const identity = { geteuid: () => 4242, getuid: () => 1 };
+  expect(getEffectiveUid(identity)).toBe(4242);
+  expect(getServerOwnershipSocketName(identity)).toBe("\0multiagents-server-v1-4242");
+  expect(SERVER_INSTANCE_SOCKET_NAME).toBe(getServerOwnershipSocketName());
 });
