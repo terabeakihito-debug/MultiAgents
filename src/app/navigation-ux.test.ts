@@ -1,48 +1,79 @@
-import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { resolveStartTemplate, submitTaskStart, taskStartBlockReason, type StartRepository } from "./task-start";
 
-const page = readFileSync(new URL("./page.tsx", import.meta.url), "utf8");
-const dashboard = readFileSync(new URL("./task-dashboard.tsx", import.meta.url), "utf8");
+const templates = [
+  { templateId: "review", enabled: true, readOnly: true, requireWorktree: false, requireHumanApproval: false, requirePr: false },
+  { templateId: "write", enabled: true, readOnly: false, requireWorktree: true, requireHumanApproval: true, requirePr: true },
+  { templateId: "disabled", enabled: false, readOnly: false, requireWorktree: true, requireHumanApproval: true, requirePr: true },
+];
+const repo = (defaultTemplateId = "write", enabled = templates): StartRepository => ({ templates: enabled, settings: { defaultTemplateId } });
 
-describe("Phase 21UX workflow presentation", () => {
-  it("defaults to Tasks and exposes the four user-facing areas", () => {
-    expect(page).toContain('useState<"tasks" | "findings" | "operations" | "settings">("tasks")');
-    for (const label of ["Tasks", "Findings", "Operations", "Settings"]) expect(dashboard).toContain(`>${label}<`);
+describe("natural task start behavior", () => {
+  it("uses the enabled configured default without a manual template choice", () => {
+    expect(resolveStartTemplate(repo()).template?.templateId).toBe("write");
+    expect(resolveStartTemplate(repo()).source).toBe("default");
   });
 
-  it("places Start New Task before attention and task history", () => {
-    expect(dashboard.indexOf("startTask")).toBeLessThan(dashboard.indexOf("Needs your attention"));
-    expect(dashboard.indexOf("Needs your attention")).toBeLessThan(dashboard.indexOf("Recent tasks"));
-    expect(page).toContain("What would you like to work on?");
-    expect(page).toContain("Task description");
-    expect(page).toContain("Advanced settings");
+  it("falls back to the sole enabled template when the configured default is disabled or absent", () => {
+    expect(resolveStartTemplate(repo("disabled", [templates[0]])).template?.templateId).toBe("review");
+    expect(resolveStartTemplate(repo("missing", [templates[0]])).template?.templateId).toBe("review");
   });
 
-  it("caps attention and recent lists while putting complete history behind All Tasks", () => {
-    expect(dashboard).toContain('slice(0, 5)');
-    expect(dashboard).toContain("View all tasks");
-    expect(dashboard).toContain("Search and filter all tasks");
+  it("requires a choice when several enabled templates have no valid default", () => {
+    expect(resolveStartTemplate(repo("missing")).source).toBe("selection_required");
   });
 
-  it("uses one primary CTA on attention cards and hides internal metadata", () => {
-    expect(dashboard).toContain("attention ? <div className=\"taskCardActions\"");
-    expect(dashboard).toContain("Details");
-    expect(dashboard).not.toContain("approvalHash");
+  it("does not resolve or submit a disabled-only template set", () => {
+    expect(resolveStartTemplate(repo("disabled", [templates[2]])).source).toBe("none_enabled");
   });
 
-  it("keeps task detail state in tabs and technical data accessible", () => {
-    for (const label of ["Overview", "Changes", "History", "Technical", "Technical details"]) expect(page).toContain(`>${label}<`);
+  it("uses a valid explicit override and ignores one that becomes disabled", () => {
+    expect(resolveStartTemplate(repo(), "review")).toMatchObject({ source: "override", template: { templateId: "review" } });
+    expect(resolveStartTemplate(repo("write", [templates[1], templates[2]]), "review")).toMatchObject({ source: "default", template: { templateId: "write" } });
   });
 
-  it("makes read-only review behavior explicit without changing its safety gates", () => {
-    expect(page).toContain("No worktree, commit, or PR");
-    expect(page).toContain("Show findings");
-    expect(page).toContain("Approve & Create PR");
+  it("does not retain an override from a different repository", () => {
+    expect(resolveStartTemplate(repo("review"), undefined)).toMatchObject({ source: "default", template: { templateId: "review" } });
   });
 
-  it("keeps Findings, Operations, and Settings separate", () => {
-    expect(dashboard).toContain('view === "findings"');
-    expect(dashboard).toContain('view === "operations"');
-    expect(dashboard).toContain('view === "settings"');
+  it("immediately follows a Settings default change while no override exists", () => {
+    expect(resolveStartTemplate(repo("review")).template?.templateId).toBe("review");
+    expect(resolveStartTemplate(repo("write")).template?.templateId).toBe("write");
+  });
+
+  it("keeps profile, initialization, repair, and empty-prompt starts blocked with distinct reasons", () => {
+    const valid = { hasRepository: true, prompt: "確認してください", hasTemplate: true, profileEnabled: true, initializationRequired: false, initializationRepairRequired: false, selectionRequired: false };
+    expect(taskStartBlockReason({ ...valid, profileEnabled: false })).toBe("profile_disabled");
+    expect(taskStartBlockReason({ ...valid, initializationRequired: true })).toBe("initialization_required");
+    expect(taskStartBlockReason({ ...valid, initializationRepairRequired: true })).toBe("repair_required");
+    expect(taskStartBlockReason({ ...valid, prompt: "  " })).toBe("empty_prompt");
+    expect(taskStartBlockReason({ ...valid, hasTemplate: false })).toBe("no_template");
+  });
+
+  it("blocks duplicate submissions while preserving the prompt for retry after failure", async () => {
+    const lock = { current: false };
+    const busy: boolean[] = [];
+    const errors: string[] = [];
+    let requests = 0;
+    let reject!: (reason: Error) => void;
+    const pending = new Promise<void>((_, nextReject) => { reject = nextReject; });
+    const form = { repoId: "repo-1", templateId: "review", explicitOverrideId: "review", prompt: "ログイン画面を修正してください" };
+    const options = {
+      acquire: () => { if (lock.current) return false; lock.current = true; return true; },
+      release: () => { lock.current = false; }, setBusy: (value: boolean) => busy.push(value), clearError: () => errors.splice(0), setError: (value: string) => errors.push(value),
+      form,
+      request: (submitted: Readonly<{ repoId: string; templateId: string; explicitOverrideId?: string; prompt: string }>) => { requests += 1; expect(submitted).toEqual(form); return pending; },
+    };
+    const first = submitTaskStart(options);
+    expect(busy).toEqual([true]);
+    expect(await submitTaskStart(options)).toBe(false);
+    expect(requests).toBe(1);
+    reject(new Error("開始できませんでした"));
+    await expect(first).resolves.toBe(false);
+    expect(busy).toEqual([true, false]);
+    expect(errors).toEqual(["開始できませんでした"]);
+    expect(form).toEqual({ repoId: "repo-1", templateId: "review", explicitOverrideId: "review", prompt: "ログイン画面を修正してください" });
+    await expect(submitTaskStart({ ...options, request: async (submitted: Readonly<{ repoId: string; templateId: string; explicitOverrideId?: string; prompt: string }>) => { requests += 1; expect(submitted.prompt).toBe("ログイン画面を修正してください"); } })).resolves.toBe(true);
+    expect(requests).toBe(2);
   });
 });
