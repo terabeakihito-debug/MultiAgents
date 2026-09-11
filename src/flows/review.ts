@@ -114,6 +114,7 @@ async function executeStep(step: FlowStep, input: string, adapters: AgentSet, si
     step.output = run.output;
     step.error = run.error;
     step.runtimeViolation = run.runtimeViolation;
+    step.terminationReason = run.terminationReason;
   } catch (error) {
     step.status = "error";
     step.error = error instanceof Error ? error.message : "Agent execution failed";

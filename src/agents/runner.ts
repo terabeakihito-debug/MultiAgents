@@ -177,6 +177,11 @@ function runProcess(
       // owned by this common spawned-child finalizer.
       const stdout = new BoundedUtf8Output(MAX_OUTPUT_BYTES);
       const stderr = new BoundedUtf8Output(MAX_OUTPUT_BYTES);
+      const lifecycle = {
+        spawnedAt: new Date().toISOString(),
+        stdoutBytes: 0,
+        stderrBytes: 0,
+      } as import("./types").AgentLifecycleTelemetry;
       let closeObserved = false;
       let finalizing = false;
       let settledSpawned = false;
@@ -200,6 +205,7 @@ function runProcess(
       let registration: ReturnType<typeof registerChildProcess> | undefined;
       let primaryResult: AgentResult | undefined;
       let primaryOperational = false;
+      let terminationReason: import("./types").AgentTerminationReason | undefined;
       let auditError: unknown;
       const authoritativeAudits: Promise<void>[] = [];
       let lifecycleError: unknown;
@@ -212,30 +218,44 @@ function runProcess(
       const output = () => redactKnownSecrets(stdout.value()).trim();
       const error = (reason: unknown) => errorResult(definition.id, reason);
 
-      const setOperationalFailure = (result: AgentResult) => {
+      const setOperationalFailure = (result: AgentResult, reason?: import("./types").AgentTerminationReason) => {
         if (primaryOperational) return;
         primaryOperational = true;
         primaryResult = result;
+        terminationReason = reason;
       };
       const signalChild = (signal: NodeJS.Signals) => {
         try {
           if (child.pid && process.platform !== "win32") process.kill(-child.pid, signal);
           else child.kill(signal);
-        } catch { try { child.kill(signal); } catch { /* close observation remains authoritative */ } }
+          return true;
+        } catch { try { child.kill(signal); return true; } catch { return false; } }
+      };
+      const noteSignalRequested = (signal: "SIGTERM" | "SIGKILL") => {
+        if (signal === "SIGTERM") lifecycle.sigtermRequestedAt ??= new Date().toISOString();
+        else lifecycle.sigkillRequestedAt ??= new Date().toISOString();
+      };
+      const noteSignalSent = (signal: NodeJS.Signals) => {
+        if (signal === "SIGTERM") lifecycle.sigtermSentAt ??= new Date().toISOString();
+        if (signal === "SIGKILL") {
+          lifecycle.sigkillSentAt ??= new Date().toISOString();
+          lifecycle.terminationMethod = "kill_required";
+        }
       };
       const requestTermination = () => {
         if (terminationRequested) return;
         terminationRequested = true;
+        noteSignalRequested("SIGTERM");
         if (registration?.id) {
-          void registration.terminate({ graceMs: FORCE_KILL_GRACE_MS }).catch((failure) => { lifecycleError ??= failure; });
+          void registration.terminate({ graceMs: FORCE_KILL_GRACE_MS, onSignal: noteSignalSent }).catch((failure) => { lifecycleError ??= failure; });
           return;
         }
-        signalChild("SIGTERM");
-        forceKillTimer = setTimeout(() => signalChild("SIGKILL"), FORCE_KILL_GRACE_MS);
+        if (signalChild("SIGTERM")) noteSignalSent("SIGTERM");
+        forceKillTimer = setTimeout(() => { noteSignalRequested("SIGKILL"); if (signalChild("SIGKILL")) noteSignalSent("SIGKILL"); }, FORCE_KILL_GRACE_MS);
         forceKillTimer.unref();
       };
-      const requestFailure = (failure: unknown, terminate = true) => {
-        setOperationalFailure(error(failure));
+      const requestFailure = (failure: unknown, terminate = true, reason?: import("./types").AgentTerminationReason) => {
+        setOperationalFailure(error(failure), reason);
         if (terminate) requestTermination();
       };
 
@@ -297,6 +317,20 @@ function runProcess(
         else finalResult = verifiedResult;
         try { await cleanupRuntime(); }
         catch (failure) { if (!primaryOperational) finalResult = error(failure); }
+        const telemetry = { ...lifecycle, ...(terminationReason ? { terminationReason } : {}) };
+        try {
+          const reported = runOptions?.onLifecycleTelemetry?.(telemetry);
+          if (reported && typeof (reported as Promise<void>).then === "function") await boundedAudit(Promise.resolve(reported));
+        } catch (failure) {
+          if (!primaryOperational) finalResult = error(failure);
+        }
+        if (terminationReason || runOptions?.onLifecycleTelemetry) {
+          finalResult = {
+            ...finalResult,
+            ...(terminationReason ? { terminationReason } : {}),
+            lifecycleTelemetry: telemetry,
+          };
+        }
         try { endAgentExecution!(); }
         finally {
           if (!settledSpawned) {
@@ -309,6 +343,10 @@ function runProcess(
       const onClose = (code: number | null, closeSignal: NodeJS.Signals | null) => {
         if (closeObserved) return;
         closeObserved = true;
+        lifecycle.childClosedAt = new Date().toISOString();
+        if (code !== null) lifecycle.exitCode = code;
+        if (closeSignal) lifecycle.exitSignal = closeSignal;
+        if (lifecycle.sigtermRequestedAt && !lifecycle.sigkillRequestedAt) lifecycle.terminationMethod = "term_only";
         if (forceKillTimer) clearTimeout(forceKillTimer);
         if (finalizationUnconfirmed) {
           // A real ChildProcess close event is the canonical lifecycle
@@ -368,7 +406,8 @@ function runProcess(
         return unconfirmedReconcile;
       };
       const reconcileUnconfirmedProcess = async () => {
-        signalChild("SIGKILL");
+        noteSignalRequested("SIGKILL");
+        if (signalChild("SIGKILL")) noteSignalSent("SIGKILL");
         // A manual or shutdown retry does not inherit a prior assumption: it
         // obtains a fresh identity/group result and advances only on death.
         if (!capturedExecution) return;
@@ -456,7 +495,8 @@ function runProcess(
         fallbackCloseTimer = setInterval(maybeConfirmFallbackClose, 25);
         fallbackCloseTimer.unref();
         fallbackDeadlineTimer = setTimeout(() => {
-          signalChild("SIGKILL");
+          noteSignalRequested("SIGKILL");
+          if (signalChild("SIGKILL")) noteSignalSent("SIGKILL");
           for (const stream of streams) {
             try { stream.destroy(); } catch { /* bounded fail-closed fallback */ }
             if (stream.destroyed || stream.readableEnded) markStreamClosed(stream);
@@ -497,15 +537,31 @@ function runProcess(
       }); } catch (failure) { requestFailure(failure, true); }
 
       finalizeSpawnedFailure = (failure) => requestFailure(failure, true);
+      const observeOutput = (stream: "stdout" | "stderr", chunk: unknown) => {
+        const bytes = Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(String(chunk));
+        const now = new Date().toISOString();
+        if (stream === "stdout") {
+          lifecycle.stdoutBytes += bytes;
+          lifecycle.stdoutFirstByteAt ??= now;
+          lifecycle.stdoutLastByteAt = now;
+        } else {
+          lifecycle.stderrBytes += bytes;
+          lifecycle.stderrFirstByteAt ??= now;
+          lifecycle.stderrLastByteAt = now;
+        }
+      };
       try {
-        child.stdout?.on("data", (chunk) => stdout.append(chunk));
-        child.stderr?.on("data", (chunk) => stderr.append(chunk));
+        child.stdout?.on("data", (chunk) => { observeOutput("stdout", chunk); stdout.append(chunk); });
+        child.stderr?.on("data", (chunk) => { observeOutput("stderr", chunk); stderr.append(chunk); });
         registration = registerChildProcess({ child, purpose: "agent" });
         const createdAuditError = captureAuditFailure({ type: "os_sandbox_created", profile, provider: definition.id, capabilityClass: policy.policyClass });
         if (createdAuditError) requestTermination();
-        abort = () => requestFailure(new Error("Request was aborted"), true);
+        abort = () => requestFailure(new Error("Request was aborted"), true, signal?.reason instanceof Error && signal.reason.message === "Review flow timed out" ? "flow_aborted" : "request_aborted");
         signal?.addEventListener("abort", abort, { once: true });
-        timer = setTimeout(() => requestFailure(new Error(`Process timed out after ${options.timeoutMs ?? DEFAULT_TIMEOUT_MS} ms`), true), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+        timer = setTimeout(() => {
+          lifecycle.timeoutRequestedAt = new Date().toISOString();
+          requestFailure(new Error(`Process timed out after ${options.timeoutMs ?? DEFAULT_TIMEOUT_MS} ms`), true, "agent_deadline_exceeded");
+        }, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
         timer.unref();
         if (signal?.aborted) abort();
       } catch (failure) {

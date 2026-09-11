@@ -19,6 +19,7 @@ import {
   persistTask,
   recordApprovalEvent,
   recordFlowEvent,
+  recordAgentLifecycle,
   recordTaskEvent,
   reloadTasksFromStoreForTests,
   resumeTask,
@@ -88,6 +89,25 @@ describe("Phase 8 SQLite state and audit history", () => {
     expect(getTaskHistory(task.id).events.map((event) => event.type)).toEqual(["task_created", "profile_snapshot_created", "template_snapshot_created", "flow_started", "flow_completed"]);
     reloadTasksFromStoreForTests();
     expect(getTaskHistory(task.id).events.map((event) => event.type)).toEqual(["task_created", "profile_snapshot_created", "template_snapshot_created", "flow_started", "flow_completed"]);
+  });
+
+  it("persists the strict content-free agent lifecycle schema and rejects body-like fields", async () => {
+    const { task } = await repositoryTask();
+    const telemetry = {
+      spawnedAt: "2026-01-01T00:00:00.000Z", timeoutRequestedAt: "2026-01-01T00:02:00.000Z",
+      sigtermRequestedAt: "2026-01-01T00:02:00.000Z", sigtermSentAt: "2026-01-01T00:02:00.001Z",
+      childClosedAt: "2026-01-01T00:02:00.010Z", exitSignal: "SIGTERM" as const,
+      stdoutBytes: 12, stderrBytes: 34, stdoutFirstByteAt: "2026-01-01T00:00:01.000Z", stdoutLastByteAt: "2026-01-01T00:01:59.000Z",
+      terminationMethod: "term_only" as const, terminationReason: "agent_deadline_exceeded" as const,
+    };
+    recordAgentLifecycle(task, "cursor", telemetry, "cursor_review");
+    const event = getTaskHistory(task.id).events.at(-1)!;
+    expect(event).toMatchObject({ type: "agent_lifecycle_recorded", actor: "cursor", stepId: "cursor_review", metadata: { lifecycle: telemetry } });
+    expect(JSON.stringify(event.metadata)).not.toContain("prompt");
+    expect(() => store.appendTaskEvent(task.id, {
+      type: "agent_lifecycle_recorded", actor: "cursor",
+      metadata: { lifecycle: { ...telemetry, stdoutText: "repository-derived text" } } as never,
+    })).toThrow("forbidden");
   });
 
   it("increments step versions on rerun and preserves the old output", async () => {

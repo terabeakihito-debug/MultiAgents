@@ -16,6 +16,7 @@ import { redactKnownSecrets, redactKnownSecretsInValue } from "./credential-reso
 import type { RuntimePolicy, RuntimeViolation, RuntimeViolationRecord } from "../runtime/types";
 import { runtimeViolationMessage } from "./runtime-policy";
 import type { OsSandboxAudit } from "./os-sandbox";
+import type { AgentLifecycleTelemetry } from "../agents/types";
 import { acquireTaskLock, holdsTaskLock, isTaskLocked, releaseTaskLock } from "./task-lock";
 import { beginRegisteredOperation } from "./operation-registry";
 
@@ -447,6 +448,15 @@ export function recordOsSandboxAudit(task: RepoTask, event: OsSandboxAudit, step
       capabilityClass: event.capabilityClass,
       failureCode: event.failureCode,
     },
+  });
+}
+
+/** Persist only the runner's fixed, content-free lifecycle schema. */
+export function recordAgentLifecycle(task: RepoTask, agent: "codex" | "cursor" | "claude", telemetry: AgentLifecycleTelemetry, stepId?: string) {
+  recordTaskEvent(task, "agent_lifecycle_recorded", agent, {
+    stepId,
+    status: telemetry.terminationMethod ?? "closed",
+    metadata: { agent, lifecycle: telemetry },
   });
 }
 
