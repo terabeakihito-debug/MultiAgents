@@ -117,11 +117,13 @@ function runProcess(
       }
 
       let command: SandboxCommand;
+      let safePrompt = "";
+      let innerArgs: string[] = [];
       let executionBinding: Awaited<ReturnType<typeof assertProviderExecutionIdentity>> | undefined;
       let immutableRuntime: Awaited<ReturnType<typeof prepareProviderImmutableBinding>> | undefined;
       try {
-        const safePrompt = redactKnownSecrets(prompt);
-        const innerArgs = definition.args(safePrompt, SANDBOX_PROJECT_ROOT, policy.source === "task_snapshots", policy.allowWrite);
+        safePrompt = redactKnownSecrets(prompt);
+        innerArgs = definition.args(safePrompt, SANDBOX_PROJECT_ROOT, policy.source === "task_snapshots", policy.allowWrite);
         executionBinding = !testBypass ? await assertProviderExecutionIdentity(definition.id, diagnostic!) : undefined;
         immutableRuntime = !testBypass && executionBinding ? await prepareProviderImmutableBinding(definition.id, executionBinding) : undefined;
         command = testBypass
@@ -152,6 +154,7 @@ function runProcess(
         detached: process.platform !== "win32",
         stdio: ["ignore", "pipe", "pipe"],
       };
+      if (definition.id === "codex") logCodexSandboxLaunch(command, innerArgs, safePrompt);
       // This is the final admission decision. There is deliberately no await
       // between lease acquisition and spawn: a newly quarantined process must
       // reject prepared work before it can create an unmanaged child.
@@ -318,6 +321,7 @@ function runProcess(
         if (code === 0) fallback = { agent: definition.id, status: "completed", output: output() };
         else {
           const diagnostic = stderr.value().trim();
+          if (definition.id === "codex") logCodexFailureStderr(code, closeSignal, diagnostic);
           fallback = diagnostic.startsWith("bwrap:")
             ? error(new OsSandboxUnavailableError("sandbox_launch_failed"))
             : { agent: definition.id, status: "error", output: output(), error: diagnostic ? `Process exited with code ${code ?? "unknown"}${closeSignal ? ` (${closeSignal})` : ""}: ${redactKnownSecrets(diagnostic)}` : `Process exited with code ${code ?? "unknown"}${closeSignal ? ` (${closeSignal})` : ""}` };
@@ -510,6 +514,45 @@ function runProcess(
 
 function testSandboxCommand(binary: string, args: readonly string[]): SandboxCommand {
   return { binary: BWRAP_BINARY, args: ["--", binary, ...args], cwd: "/", env: { HOME: "/home/runtime", PATH: "/usr/bin:/bin", NODE_ENV: "test" }, sandboxCwd: SANDBOX_PROJECT_ROOT };
+}
+
+const CODEX_DIAGNOSTIC_MAX_CHARS = 16_000;
+
+/**
+ * Logs launch facts needed to diagnose the nested Codex/outer-bwrap boundary.
+ * The task prompt is deliberately replaced instead of merely redacted: prompts
+ * are user-controlled and may contain credentials unknown to the server.
+ */
+function logCodexSandboxLaunch(command: SandboxCommand, innerArgs: readonly string[], prompt: string) {
+  const separator = command.args.indexOf("--");
+  const mappedCodexBinary = separator >= 0 ? command.args[separator + 1] : undefined;
+  console.warn("codex_sandbox_launch", JSON.stringify({
+    outerBubblewrapArgv: safeCodexDiagnosticArgs(command.args, prompt),
+    sandboxCwd: command.sandboxCwd,
+    mappedCodexBinary,
+    innerCodexArgs: safeCodexDiagnosticArgs(innerArgs, prompt),
+  }));
+}
+
+function logCodexFailureStderr(code: number | null, closeSignal: NodeJS.Signals | null, stderr: string) {
+  console.warn("codex_cli_stderr", JSON.stringify({
+    exitCode: code,
+    signal: closeSignal,
+    stderr: boundedRedactedDiagnostic(stderr),
+  }));
+}
+
+function safeCodexDiagnosticArgs(args: readonly string[], prompt: string) {
+  // codexArgs places the prompt last. Replace every exact copy defensively in
+  // case a future command layout uses it more than once.
+  return args.map((arg) => arg === prompt ? "[PROMPT_OMITTED]" : redactKnownSecrets(arg));
+}
+
+function boundedRedactedDiagnostic(value: string) {
+  const redacted = redactKnownSecrets(value);
+  return redacted.length <= CODEX_DIAGNOSTIC_MAX_CHARS
+    ? redacted
+    : `${redacted.slice(0, CODEX_DIAGNOSTIC_MAX_CHARS)}\n[diagnostic truncated at ${CODEX_DIAGNOSTIC_MAX_CHARS} chars]`;
 }
 
 /** Audit persistence must not take ownership of an agent's lifecycle result. */

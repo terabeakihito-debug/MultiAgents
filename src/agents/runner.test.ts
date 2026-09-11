@@ -132,6 +132,57 @@ describe("createAgentAdapter", () => {
     );
   });
 
+  it("records Codex launch diagnostics without recording the prompt", async () => {
+    const child = fakeChild();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const spawnProcess = vi.fn(() => child);
+    try {
+      const adapter = createAgentAdapter(
+        { id: "codex", name: "Codex", binary: "codex", args: codexArgs },
+        { cwd: "/default", unsafeTestOnlyBypassOsSandbox: true, spawnProcess: spawnProcess as never },
+      );
+      const prompt = "do not log TEST_SECRET_PROMPT";
+      const pending = adapter.run(prompt, { policy: policy("codex", "/isolated/task", true) });
+      child.emit("close", 0, null);
+      await pending;
+      const entry = warn.mock.calls.find(([event]) => event === "codex_sandbox_launch");
+      expect(entry).toBeDefined();
+      expect(JSON.stringify(entry)).not.toContain(prompt);
+      const fields = JSON.parse(entry![1] as string) as { outerBubblewrapArgv: string[]; sandboxCwd: string; mappedCodexBinary: string; innerCodexArgs: string[] };
+      expect(fields.sandboxCwd).toBe("/project");
+      expect(fields.mappedCodexBinary).toBe("codex");
+      expect(fields.outerBubblewrapArgv).toContain("[PROMPT_OMITTED]");
+      expect(fields.innerCodexArgs).toContain("--dangerously-bypass-approvals-and-sandbox");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("logs redacted Codex stderr when the CLI fails", async () => {
+    const fixture = "TEST_SECRET_DO_NOT_LEAK";
+    const previous = process.env.MULTIAGENTS_SLACK_WEBHOOK_URL;
+    process.env.MULTIAGENTS_SLACK_WEBHOOK_URL = fixture;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const child = fakeChild();
+      const adapter = createAgentAdapter(
+        { id: "codex", name: "Codex", binary: "codex", args: codexArgs },
+        { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
+      );
+      const pending = adapter.run("implement", { policy: policy("codex", "/isolated/task", true) });
+      child.stderr.write(`failure: ${fixture}`);
+      child.emit("close", 1, null);
+      await pending;
+      const entry = warn.mock.calls.find(([event]) => event === "codex_cli_stderr");
+      expect(JSON.stringify(entry)).toContain("[REDACTED_SECRET]");
+      expect(JSON.stringify(entry)).not.toContain(fixture);
+    } finally {
+      warn.mockRestore();
+      if (previous === undefined) delete process.env.MULTIAGENTS_SLACK_WEBHOOK_URL;
+      else process.env.MULTIAGENTS_SLACK_WEBHOOK_URL = previous;
+    }
+  });
+
   it("forces a normal non-repository Codex run into read-only mode", async () => {
     const child = fakeChild();
     const spawnProcess = vi.fn(() => child);
