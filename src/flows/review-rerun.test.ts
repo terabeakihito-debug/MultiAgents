@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { AgentAdapter, AgentId, AgentResult, AgentRunOptions, FlowStep, ReviewRerunEvent } from "../agents/types";
+import { isReviewFlowTimeoutAbortReason, reviewFlowTimeoutAbortReason } from "../agents/abort-origin";
 import { parseReviewRerunCommand, reconstructReviewRerunRequest, rerunReviewStep } from "./review-rerun";
 
 const completedSteps = (): FlowStep[] => [
@@ -12,6 +13,20 @@ const request = (stepId: "cursor_review" | "claude_review" | "codex_final") => (
 
 function agents(run: (id: AgentId, prompt: string, options?: AgentRunOptions) => Promise<AgentResult>) {
   return Object.fromEntries((["codex", "cursor", "claude"] as AgentId[]).map((id) => [id, { id, name: id, run: (prompt: string, options?: AgentRunOptions) => run(id, prompt, options) }])) as Record<AgentId, AgentAdapter>;
+}
+
+function abortAwareAgents() {
+  return agents((id, _prompt, options) => new Promise((resolve) => {
+    const finish = () => resolve({
+      agent: id,
+      status: "error",
+      output: "",
+      error: "Request was aborted",
+      terminationReason: isReviewFlowTimeoutAbortReason(options?.signal?.reason) ? "flow_aborted" : "request_aborted",
+    });
+    if (options?.signal?.aborted) finish();
+    else options?.signal?.addEventListener("abort", finish, { once: true });
+  }));
 }
 
 describe("rerunReviewStep", () => {
@@ -46,23 +61,43 @@ describe("rerunReviewStep", () => {
     expect(input).toContain("claude-old");
   });
 
-  it("keeps the previous successful output when rerun is aborted", async () => {
+  it("keeps the previous successful output and request provenance when rerun is externally aborted", async () => {
     const controller = new AbortController();
-    const promise = rerunReviewStep(request("cursor_review"), { signal: controller.signal, agents: agents((id, _prompt, options) => new Promise((resolve) => options?.signal?.addEventListener("abort", () => resolve({ agent: id, status: "error", output: "partial", error: "Request was aborted" }), { once: true }))) });
+    const promise = rerunReviewStep(request("cursor_review"), { signal: controller.signal, agents: abortAwareAgents() });
     controller.abort();
     const result = await promise;
     expect(result.status).toBe("aborted");
     expect(result.steps[1].output).toBe("cursor-old");
     expect(result.steps[1].error).toContain("Re-run failed");
+    expect(result.steps[1].terminationReason).toBe("request_aborted");
   });
 
-  it("times out and retains the old output", async () => {
+  it("classifies a rerun budget timeout as flow-originated and retains the old output", async () => {
     vi.useFakeTimers();
-    const promise = rerunReviewStep(request("cursor_review"), { maxRerunMs: 10, agents: agents((id, _prompt, options) => new Promise((resolve) => options?.signal?.addEventListener("abort", () => resolve({ agent: id, status: "error", output: "", error: "Request was aborted" }), { once: true }))) });
+    const promise = rerunReviewStep(request("cursor_review"), { maxRerunMs: 10, agents: abortAwareAgents() });
     await vi.advanceTimersByTimeAsync(10);
     const result = await promise;
     expect(result.status).toBe("timed_out"); expect(result.steps[1].output).toBe("cursor-old");
+    expect(result.steps[1].terminationReason).toBe("flow_aborted");
     vi.useRealTimers();
+  });
+
+  it("keeps an external abort request-originated when it has the rerun timeout text", async () => {
+    const controller = new AbortController();
+    const promise = rerunReviewStep(request("cursor_review"), { signal: controller.signal, agents: abortAwareAgents() });
+    controller.abort(new Error("Review step rerun timed out"));
+    const result = await promise;
+    expect(result.status).toBe("aborted");
+    expect(result.steps[1].terminationReason).toBe("request_aborted");
+  });
+
+  it("does not depend on the rerun timeout diagnostic text for flow provenance", async () => {
+    const controller = new AbortController();
+    const promise = rerunReviewStep(request("cursor_review"), { signal: controller.signal, agents: abortAwareAgents() });
+    controller.abort(reviewFlowTimeoutAbortReason("A future rerun timeout display message"));
+    const result = await promise;
+    expect(result.status).toBe("aborted");
+    expect(result.steps[1].terminationReason).toBe("flow_aborted");
   });
 
   it("emits the rerun stream event sequence", async () => {

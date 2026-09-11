@@ -62,6 +62,7 @@ export const taskEventTypes = [
   "profile_snapshot_created", "template_snapshot_created",
   "finding_created", "finding_status_changed", "finding_converted", "implementation_task_created",
   "runtime_policy_created", "runtime_execution_started", "runtime_execution_completed", "runtime_violation_detected",
+  "agent_lifecycle_recorded",
   "os_sandbox_created", "os_sandbox_failed", "os_sandbox_violation", "os_sandbox_process_cleanup", "os_sandbox_finalization_unconfirmed", "os_sandbox_finalization_persistence_failed",
   "human_gate_rejected", "approval_snapshot_mismatch", "post_commit_verification_failed",
 ] as const;
@@ -89,6 +90,7 @@ export type TaskEventMetadata = Partial<{
   sandboxProfile: import("./os-sandbox").OsSandboxProfile;
   capabilityClass: string;
   failureCode: import("./os-sandbox").SandboxFailureCode;
+  lifecycle: import("../agents/types").AgentLifecycleTelemetry;
 }>;
 export type TaskEvent = {
   id: string;
@@ -1784,12 +1786,13 @@ function storedTaskTemplate(row: TaskRow, payload: Record<string, unknown>, prof
     return { template: fallback, valid: false };
   }
 }
-const metadataKeys = new Set(["durationMs", "diffHash", "commitSha", "prNumber", "changedFileCount", "additions", "deletions", "profileId", "profileVersion", "templateId", "templateVersion", "findingId", "sourceTaskId", "agent", "role", "policyClass", "runtimePolicyVersion", "violationType", "sandboxProfile", "capabilityClass", "failureCode"]);
+const metadataKeys = new Set(["durationMs", "diffHash", "commitSha", "prNumber", "changedFileCount", "additions", "deletions", "profileId", "profileVersion", "templateId", "templateVersion", "findingId", "sourceTaskId", "agent", "role", "policyClass", "runtimePolicyVersion", "violationType", "sandboxProfile", "capabilityClass", "failureCode", "lifecycle"]);
 function validateMetadata(value: TaskEventMetadata | undefined) {
   if (!value) return undefined;
   for (const [key, item] of Object.entries(value)) {
     if (!metadataKeys.has(key)) throw new Error(`Task event metadata key ${JSON.stringify(key)} is forbidden`);
     if (item === undefined) continue;
+    if (key === "lifecycle") { validateLifecycleTelemetry(item); continue; }
     if (["durationMs", "changedFileCount", "additions", "deletions"].includes(key) && (typeof item !== "number" || !Number.isSafeInteger(item) || item < 0)) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
     if (key === "prNumber" && (typeof item !== "number" || !Number.isSafeInteger(item) || item < 1)) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
     if (key === "diffHash" && (typeof item !== "string" || !/^[0-9a-f]{64}$/i.test(item))) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
@@ -1809,6 +1812,24 @@ function validateMetadata(value: TaskEventMetadata | undefined) {
     if (key === "failureCode" && !["backend_missing", "backend_not_executable", "namespace_unsupported", "invalid_sandbox_configuration", "sandbox_launch_failed"].includes(String(item))) throw new Error(`Task event metadata value for ${JSON.stringify(key)} is invalid`);
   }
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as TaskEventMetadata;
+}
+
+const lifecycleKeys = new Set(["spawnedAt", "timeoutRequestedAt", "sigtermRequestedAt", "sigtermSentAt", "sigkillRequestedAt", "sigkillSentAt", "childClosedAt", "exitCode", "exitSignal", "stdoutBytes", "stderrBytes", "stdoutFirstByteAt", "stdoutLastByteAt", "stderrFirstByteAt", "stderrLastByteAt", "terminationMethod", "terminationReason"]);
+const lifecycleTimestampKeys = new Set(["spawnedAt", "timeoutRequestedAt", "sigtermRequestedAt", "sigtermSentAt", "sigkillRequestedAt", "sigkillSentAt", "childClosedAt", "stdoutFirstByteAt", "stdoutLastByteAt", "stderrFirstByteAt", "stderrLastByteAt"]);
+const lifecycleIntegerKeys = new Set(["exitCode", "stdoutBytes", "stderrBytes"]);
+const lifecycleSignals = new Set(["SIGHUP", "SIGINT", "SIGQUIT", "SIGILL", "SIGTRAP", "SIGABRT", "SIGBUS", "SIGFPE", "SIGKILL", "SIGUSR1", "SIGSEGV", "SIGUSR2", "SIGTERM", "SIGCHLD", "SIGCONT", "SIGSTOP", "SIGTSTP", "SIGTTIN", "SIGTTOU", "SIGURG", "SIGXCPU", "SIGXFSZ", "SIGVTALRM", "SIGPROF", "SIGWINCH", "SIGIO", "SIGPWR", "SIGSYS"]);
+function validateLifecycleTelemetry(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Task lifecycle telemetry is invalid");
+  const telemetry = value as Record<string, unknown>;
+  for (const [key, item] of Object.entries(telemetry)) {
+    if (!lifecycleKeys.has(key) || item === undefined) throw new Error("Task lifecycle telemetry field is forbidden");
+    if (lifecycleTimestampKeys.has(key) && (typeof item !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(item) || Number.isNaN(Date.parse(item)))) throw new Error("Task lifecycle timestamp is invalid");
+    if (lifecycleIntegerKeys.has(key) && (typeof item !== "number" || !Number.isSafeInteger(item) || item < 0)) throw new Error("Task lifecycle count is invalid");
+    if (key === "exitSignal" && (typeof item !== "string" || !lifecycleSignals.has(item))) throw new Error("Task lifecycle signal is invalid");
+    if (key === "terminationMethod" && item !== "term_only" && item !== "kill_required") throw new Error("Task lifecycle termination method is invalid");
+    if (key === "terminationReason" && item !== "agent_deadline_exceeded" && item !== "request_aborted" && item !== "flow_aborted") throw new Error("Task lifecycle termination reason is invalid");
+  }
+  if (typeof telemetry.spawnedAt !== "string" || typeof telemetry.stdoutBytes !== "number" || typeof telemetry.stderrBytes !== "number") throw new Error("Task lifecycle telemetry is incomplete");
 }
 function nonnegativeInteger(value: number) {
   if (!Number.isSafeInteger(value) || value < 0) throw new Error("History count must be a non-negative integer");

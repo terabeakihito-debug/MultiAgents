@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { AgentAdapter, AgentId, AgentResult, AgentRunOptions, FlowEvent } from "../agents/types";
 import { cursorPrompt, runReviewFlow, truncateForHandoff } from "./review";
+import { isReviewFlowTimeoutAbortReason } from "../agents/abort-origin";
 import { buildGenericRuntimePolicy } from "../server/runtime-policy";
 
 function setup(results: Partial<Record<AgentId, AgentResult[]>>) {
@@ -148,6 +149,21 @@ describe("runReviewFlow", () => {
     await vi.advanceTimersByTimeAsync(10);
     const result = await promise;
     expect(result.status).toBe("timed_out"); expect(result.steps.map((step) => step.status)).toEqual(["completed", "error", "skipped", "skipped"]);
+    vi.useRealTimers();
+  });
+
+  it("uses a typed timeout reason when the review-flow deadline aborts a running agent", async () => {
+    vi.useFakeTimers();
+    const { adapters } = setup({ codex: [ok("codex", "draft")] });
+    let receivedReason: unknown;
+    adapters.cursor.run = vi.fn((_prompt: string, options?: AgentRunOptions) => new Promise<AgentResult>((resolve) => options?.signal?.addEventListener("abort", () => {
+      receivedReason = options.signal?.reason;
+      resolve(fail("cursor", "Request was aborted"));
+    }, { once: true })));
+    const pending = runReviewFlow("request", { agents: adapters, maxFlowMs: 10 });
+    await vi.advanceTimersByTimeAsync(10);
+    await pending;
+    expect(isReviewFlowTimeoutAbortReason(receivedReason)).toBe(true);
     vi.useRealTimers();
   });
 

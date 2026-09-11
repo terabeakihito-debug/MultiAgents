@@ -9,6 +9,7 @@ import { buildGenericRuntimePolicy } from "./runtime-policy";
 import { runGit } from "./git";
 
 const enabled = process.env.MULTIAGENTS_PROVIDER_ACCEPTANCE === "1";
+const cursorLifecycleEnabled = process.env.MULTIAGENTS_CURSOR_LIFECYCLE_ACCEPTANCE === "1";
 
 describe.runIf(enabled)("Phase 18 provider authentication acceptance", () => {
   let worktree: string;
@@ -61,6 +62,33 @@ describe.runIf(enabled)("Phase 18 provider authentication acceptance", () => {
     const result = await cursorAgent.run("Reply with exactly CURSOR_PHASE18_OK", { policy: buildGenericRuntimePolicy("cursor", worktree) });
     expect(result).toMatchObject({ status: "completed" });
     expect(result.output).toContain("CURSOR_PHASE18_OK");
+  }, 180_000);
+
+  it.runIf(cursorLifecycleEnabled)("captures content-free lifecycle telemetry for a production Cursor review", async () => {
+    const prompt = "Review README.md for one correctness or safety concern. Do not modify files, run Git mutations, or reveal file contents verbatim.";
+    const telemetry: import("../agents/types").AgentLifecycleTelemetry[] = [];
+    const result = await cursorAgent.run(prompt, {
+      policy: buildGenericRuntimePolicy("cursor", worktree),
+      onLifecycleTelemetry: (value) => { telemetry.push(value); },
+    });
+    // This is deliberately a successful-review probe: it exercises the real
+    // outer-bwrap + immutable-binding path without printing provider output.
+    expect(result.status).toBe("completed");
+    expect(telemetry).toHaveLength(1);
+    expect(telemetry[0]).toMatchObject({ stdoutBytes: expect.any(Number), stderrBytes: expect.any(Number), spawnedAt: expect.any(String), childClosedAt: expect.any(String), exitCode: 0 });
+    expect(telemetry[0].stdoutBytes).toBeGreaterThan(0);
+    expect(telemetry[0].stdoutFirstByteAt).toMatch(/^\d{4}-/);
+    expect(telemetry[0].stdoutLastByteAt).toMatch(/^\d{4}-/);
+    if (telemetry[0].stderrBytes > 0) {
+      expect(telemetry[0].stderrFirstByteAt).toMatch(/^\d{4}-/);
+      expect(telemetry[0].stderrLastByteAt).toMatch(/^\d{4}-/);
+    } else {
+      expect(telemetry[0].stderrFirstByteAt).toBeUndefined();
+      expect(telemetry[0].stderrLastByteAt).toBeUndefined();
+    }
+    expect(telemetry[0]).toMatchObject({ terminationReason: undefined, terminationMethod: undefined, timeoutRequestedAt: undefined, sigtermRequestedAt: undefined, sigtermSentAt: undefined, sigkillRequestedAt: undefined, sigkillSentAt: undefined, exitSignal: undefined });
+    expect(JSON.stringify(telemetry[0])).not.toContain(prompt);
+    expect(JSON.stringify(telemetry[0])).not.toContain("README.md");
   }, 180_000);
 
   it("runs Claude review with only its minimal credential file", async () => {

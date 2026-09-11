@@ -6,6 +6,7 @@ import { createEventStream } from "./event-stream";
 import type { RolePolicy } from "../profiles/policy";
 import type { RuntimePolicy } from "../runtime/types";
 import { buildGenericRuntimePolicy } from "../server/runtime-policy";
+import { reviewFlowTimeoutAbortReason } from "../agents/abort-origin";
 
 export const MAX_STEP_OUTPUT_CHARS = 1_000_000;
 type AgentSet = Record<AgentId, AgentAdapter>;
@@ -74,7 +75,7 @@ export async function rerunReviewStep(request: ReviewRerunRequest, options: Reru
   let timedOut = false;
   const abortFromRequest = () => controller.abort(options.signal?.reason);
   options.signal?.addEventListener("abort", abortFromRequest, { once: true });
-  const timeout = setTimeout(() => { timedOut = true; controller.abort(new Error("Review step rerun timed out")); }, options.maxRerunMs ?? MAX_FLOW_MS);
+  const timeout = setTimeout(() => { timedOut = true; controller.abort(reviewFlowTimeoutAbortReason("Review step rerun timed out")); }, options.maxRerunMs ?? MAX_FLOW_MS);
   timeout.unref();
 
   try {
@@ -82,6 +83,7 @@ export async function rerunReviewStep(request: ReviewRerunRequest, options: Reru
     const start = now();
     target.status = "running";
     target.error = undefined;
+    target.terminationReason = undefined;
     target.startedAt = new Date(start).toISOString();
     target.completedAt = undefined;
     target.durationMs = undefined;
@@ -111,6 +113,7 @@ export async function rerunReviewStep(request: ReviewRerunRequest, options: Reru
         target.output = previousOutput;
         target.error = `Re-run failed: ${result.error ?? "Agent execution failed"}`;
         target.runtimeViolation = result.runtimeViolation;
+        target.terminationReason = result.terminationReason;
       }
     } catch (error) {
       target.status = "error";

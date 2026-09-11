@@ -3,6 +3,29 @@ export const agentIds = ["codex", "cursor", "claude"] as const;
 export type AgentId = (typeof agentIds)[number];
 export type AgentStatus = "idle" | "running" | "completed" | "error";
 
+/** Content-free lifecycle facts for a spawned provider process. */
+export type AgentLifecycleTelemetry = {
+  spawnedAt: string;
+  timeoutRequestedAt?: string;
+  sigtermRequestedAt?: string;
+  sigtermSentAt?: string;
+  sigkillRequestedAt?: string;
+  sigkillSentAt?: string;
+  childClosedAt?: string;
+  exitCode?: number;
+  exitSignal?: NodeJS.Signals;
+  stdoutBytes: number;
+  stderrBytes: number;
+  stdoutFirstByteAt?: string;
+  stdoutLastByteAt?: string;
+  stderrFirstByteAt?: string;
+  stderrLastByteAt?: string;
+  terminationMethod?: "term_only" | "kill_required";
+  terminationReason?: AgentTerminationReason;
+};
+
+export type AgentTerminationReason = "agent_deadline_exceeded" | "request_aborted" | "flow_aborted";
+
 export type AgentResult = {
   agent: AgentId;
   status: "completed" | "error";
@@ -13,6 +36,8 @@ export type AgentResult = {
   finalizationUnconfirmed?: true;
   /** Durable ownership write failed; this server remains quarantined but restart safety is not established. */
   finalizationPersistenceFailed?: true;
+  terminationReason?: AgentTerminationReason;
+  lifecycleTelemetry?: AgentLifecycleTelemetry;
 };
 
 export type AgentDefinition = {
@@ -28,6 +53,8 @@ export type AgentRunOptions = {
   onSandboxAudit?: (event: import("../server/os-sandbox").OsSandboxAudit) => unknown;
   /** Runs after child close/unregister while the active-agent gate is held. */
   afterClose?: (result: AgentResult) => Promise<AgentResult> | AgentResult;
+  /** Receives content-free process lifecycle facts after child close. */
+  onLifecycleTelemetry?: (telemetry: AgentLifecycleTelemetry) => unknown;
 };
 
 export type AgentAdapter = {
@@ -55,6 +82,7 @@ export type FlowStep = {
   completedAt?: string;
   durationMs?: number;
   runtimeViolation?: import("../runtime/types").RuntimeViolation;
+  terminationReason?: AgentTerminationReason;
 };
 
 export type ReviewFlowResult = {

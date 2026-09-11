@@ -2,6 +2,8 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { ChildProcess } from "node:child_process";
 
 export type RegisteredChildPurpose = "git" | "github" | "validation" | "agent" | "other";
+export type ChildProcessSignalPhase = "requested" | "sent";
+type ChildProcessSignalObserver = (signal: NodeJS.Signals, phase: ChildProcessSignalPhase) => void;
 export type ActiveChildProcess = {
   id: string;
   operationId?: string;
@@ -10,7 +12,7 @@ export type ActiveChildProcess = {
   pgid?: number;
   startedAt: string;
   abort: () => void;
-  terminate: (options?: { graceMs?: number }) => Promise<boolean>;
+  terminate: (options?: { graceMs?: number; onSignal?: ChildProcessSignalObserver }) => Promise<boolean>;
 };
 
 type InternalChild = ActiveChildProcess & { child: ChildProcess; closed: Promise<void>; resolveClosed: () => void };
@@ -38,7 +40,7 @@ export function registerChildProcess(input: { child: ChildProcess; purpose: Regi
     id, operationId: input.operationId ?? operationContext.getStore(), purpose: input.purpose, pid, pgid: process.platform === "win32" ? undefined : pid,
     startedAt: new Date().toISOString(), child: input.child, closed, resolveClosed,
     abort: () => { signalProcessGroup(entry, "SIGTERM"); },
-    terminate: async (options?: { graceMs?: number }) => terminateOne(entry, options?.graceMs),
+    terminate: async (options?: { graceMs?: number; onSignal?: ChildProcessSignalObserver }) => terminateOne(entry, options?.graceMs, options?.onSignal),
   };
   active.set(id, entry);
   try {
@@ -57,7 +59,7 @@ export function registerChildProcess(input: { child: ChildProcess; purpose: Regi
     throw error;
   }
   audit("child_process_registered", entry);
-  return { id, unregister: () => unregisterChildProcess(id), terminate: (options?: { graceMs?: number }) => terminateOne(entry, options?.graceMs) };
+  return { id, unregister: () => unregisterChildProcess(id), terminate: (options?: { graceMs?: number; onSignal?: ChildProcessSignalObserver }) => terminateOne(entry, options?.graceMs, options?.onSignal) };
 }
 
 export function unregisterChildProcess(id: string) {
@@ -97,23 +99,26 @@ export function resetChildProcessRegistryForTests() {
   active.clear();
 }
 
-async function terminateOne(entry: InternalChild, graceMs = CHILD_PROCESS_GRACE_MS) {
+async function terminateOne(entry: InternalChild, graceMs = CHILD_PROCESS_GRACE_MS, onSignal?: ChildProcessSignalObserver) {
   if (!active.has(entry.id)) return false;
-  signalProcessGroup(entry, "SIGTERM");
+  onSignal?.("SIGTERM", "requested");
+  if (signalProcessGroup(entry, "SIGTERM")) onSignal?.("SIGTERM", "sent");
   if (await waitForClose(entry, graceMs)) return true;
-  signalProcessGroup(entry, "SIGKILL");
+  onSignal?.("SIGKILL", "requested");
+  if (signalProcessGroup(entry, "SIGKILL")) onSignal?.("SIGKILL", "sent");
   return waitForClose(entry, 1_000);
 }
 
 function signalProcessGroup(entry: InternalChild, signal: NodeJS.Signals) {
-  if (!active.has(entry.id)) return;
+  if (!active.has(entry.id)) return false;
   try {
     if (entry.pgid && process.platform !== "win32") process.kill(-entry.pgid, signal);
     else entry.child.kill(signal);
+    return true;
   } catch (error) {
     if (error instanceof Error && "code" in error && error.code === "ESRCH") {
       unregisterChildProcess(entry.id);
-      return;
+      return false;
     }
     throw error;
   }

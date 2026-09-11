@@ -5,6 +5,7 @@ import { codexArgs } from "./codex";
 import { cursorArgs } from "./cursor";
 import { claudeArgs } from "./claude";
 import { createAgentAdapter } from "./runner";
+import { reviewFlowTimeoutAbortReason } from "./abort-origin";
 import { buildGenericRuntimePolicy } from "../server/runtime-policy";
 import { isAgentExecutionActive } from "../server/agent-execution-guard";
 import { activeChildProcesses } from "../server/child-process-registry";
@@ -400,11 +401,13 @@ describe("createAgentAdapter", () => {
     expect(settled).toBe(false);
     expect(isAgentExecutionActive()).toBe(true);
     child.emit("close", null, "SIGKILL");
-    await expect(promise).resolves.toEqual({
+    await expect(promise).resolves.toMatchObject({
       agent: "claude",
       status: "error",
       output: "",
       error: "Process timed out after 10 ms",
+      terminationReason: "agent_deadline_exceeded",
+      lifecycleTelemetry: { stdoutBytes: 0, stderrBytes: 0, terminationMethod: "term_only" },
     });
     expect(child.kill).toHaveBeenCalledWith("SIGTERM");
     vi.useRealTimers();
@@ -427,10 +430,106 @@ describe("createAgentAdapter", () => {
     expect(settled).toBe(false);
     expect(isAgentExecutionActive()).toBe(true);
     child.emit("close", null, "SIGTERM");
-    await expect(promise).resolves.toMatchObject({ status: "error", error: "Request was aborted" });
+    await expect(promise).resolves.toMatchObject({ status: "error", error: "Request was aborted", terminationReason: "request_aborted" });
     expect(isAgentExecutionActive()).toBe(false);
     expect(child.kill).toHaveBeenCalledWith("SIGTERM");
     expect(audits).toEqual(["os_sandbox_created", "os_sandbox_process_cleanup"]);
+  });
+
+  it("records only content-free telemetry for timeout, TERM, close, and stream activity", async () => {
+    vi.useFakeTimers();
+    const secret = "ghp_THIS_MUST_NOT_APPEAR_IN_TELEMETRY_1234567890";
+    const child = fakeChild();
+    const received: import("./types").AgentLifecycleTelemetry[] = [];
+    const adapter = createAgentAdapter(
+      { id: "cursor", name: "Cursor", binary: "agent", args: (prompt) => ["-p", prompt] },
+      { timeoutMs: 10, unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
+    );
+    const pending = adapter.run("prompt must never enter telemetry", { onLifecycleTelemetry: (telemetry) => { received.push(telemetry); } });
+    child.stdout.write(secret); child.stderr.write(secret);
+    await vi.advanceTimersByTimeAsync(10);
+    child.emit("close", null, "SIGTERM");
+    const result = await pending;
+    expect(result.terminationReason).toBe("agent_deadline_exceeded");
+    expect(received).toHaveLength(1);
+    expect(received[0]).toMatchObject({
+      stdoutBytes: Buffer.byteLength(secret), stderrBytes: Buffer.byteLength(secret),
+      terminationMethod: "term_only", terminationReason: "agent_deadline_exceeded",
+    });
+    expect(received[0].stdoutFirstByteAt).toMatch(/^\d{4}-/);
+    expect(received[0].stdoutLastByteAt).toMatch(/^\d{4}-/);
+    expect(received[0].stderrFirstByteAt).toMatch(/^\d{4}-/);
+    expect(received[0].stderrLastByteAt).toMatch(/^\d{4}-/);
+    expect(JSON.stringify(received[0])).not.toContain(secret);
+    expect(JSON.stringify(received[0])).not.toContain("prompt must never enter telemetry");
+    vi.useRealTimers();
+  });
+
+  it("records SIGKILL only when TERM did not close the child", async () => {
+    vi.useFakeTimers();
+    const child = fakeChild();
+    const received: import("./types").AgentLifecycleTelemetry[] = [];
+    const adapter = createAgentAdapter(
+      { id: "cursor", name: "Cursor", binary: "agent", args: (prompt) => ["-p", prompt] },
+      { timeoutMs: 10, unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
+    );
+    const pending = adapter.run("review", { onLifecycleTelemetry: (telemetry) => { received.push(telemetry); } });
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+    child.emit("close", null, "SIGKILL");
+    await pending;
+    expect(received[0]).toMatchObject({ terminationMethod: "kill_required" });
+    expect(received[0].sigkillRequestedAt).toMatch(/^\d{4}-/);
+    expect(received[0].sigkillSentAt).toMatch(/^\d{4}-/);
+    vi.useRealTimers();
+  });
+
+  it("records registered TERM termination before unregistering the child", async () => {
+    vi.useFakeTimers();
+    const child = fakeChild(); Object.defineProperty(child, "pid", { value: 987_654 });
+    const received: import("./types").AgentLifecycleTelemetry[] = [];
+    const kill = vi.spyOn(process, "kill").mockImplementation((() => true) as typeof process.kill);
+    const adapter = createAgentAdapter(
+      { id: "cursor", name: "Cursor", binary: "agent", args: (prompt) => ["-p", prompt] },
+      { timeoutMs: 10, unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
+    );
+    const pending = adapter.run("review", { onLifecycleTelemetry: (telemetry) => { received.push(telemetry); } });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(kill).toHaveBeenCalledWith(-987_654, "SIGTERM");
+    child.emit("close", null, "SIGTERM");
+    await pending;
+    expect(activeChildProcesses()).toEqual([]);
+    expect(received[0]).toMatchObject({ terminationMethod: "term_only" });
+    expect(received[0].sigtermRequestedAt).toMatch(/^\d{4}-/);
+    expect(received[0].sigtermSentAt).toMatch(/^\d{4}-/);
+    expect(received[0].sigkillRequestedAt).toBeUndefined();
+    expect(received[0].sigkillSentAt).toBeUndefined();
+    vi.useRealTimers();
+  });
+
+  it("records registered SIGKILL request and send without reverting termination provenance on close", async () => {
+    vi.useFakeTimers();
+    const child = fakeChild(); Object.defineProperty(child, "pid", { value: 987_655 });
+    const received: import("./types").AgentLifecycleTelemetry[] = [];
+    const kill = vi.spyOn(process, "kill").mockImplementation((() => true) as typeof process.kill);
+    const adapter = createAgentAdapter(
+      { id: "cursor", name: "Cursor", binary: "agent", args: (prompt) => ["-p", prompt] },
+      { timeoutMs: 10, unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
+    );
+    const pending = adapter.run("review", { onLifecycleTelemetry: (telemetry) => { received.push(telemetry); } });
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(kill).toHaveBeenCalledWith(-987_655, "SIGTERM");
+    expect(kill).toHaveBeenCalledWith(-987_655, "SIGKILL");
+    child.emit("close", null, "SIGKILL");
+    await pending;
+    expect(activeChildProcesses()).toEqual([]);
+    expect(received[0]).toMatchObject({ terminationMethod: "kill_required" });
+    expect(received[0].sigkillRequestedAt).toMatch(/^\d{4}-/);
+    expect(received[0].sigkillSentAt).toMatch(/^\d{4}-/);
+    vi.useRealTimers();
   });
 
   it("keeps the abort result stable when abort and timeout race until close", async () => {
@@ -447,6 +546,42 @@ describe("createAgentAdapter", () => {
     await expect(pending).resolves.toMatchObject({ error: "Request was aborted" });
     expect(child.kill).toHaveBeenCalledTimes(1);
     vi.useRealTimers();
+  });
+
+  it("classifies a genuine review-flow timeout structurally", async () => {
+    const child = fakeChild(); const controller = new AbortController();
+    const adapter = createAgentAdapter(
+      { id: "cursor", name: "Cursor", binary: "agent", args: (prompt) => ["-p", prompt] },
+      { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
+    );
+    const pending = adapter.run("review", { signal: controller.signal });
+    controller.abort(reviewFlowTimeoutAbortReason());
+    child.emit("close", null, "SIGTERM");
+    await expect(pending).resolves.toMatchObject({ error: "Request was aborted", terminationReason: "flow_aborted" });
+  });
+
+  it("classifies an external abort with the old timeout text as request-originated", async () => {
+    const child = fakeChild(); const controller = new AbortController();
+    const adapter = createAgentAdapter(
+      { id: "cursor", name: "Cursor", binary: "agent", args: (prompt) => ["-p", prompt] },
+      { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
+    );
+    const pending = adapter.run("review", { signal: controller.signal });
+    controller.abort(new Error("Review flow timed out"));
+    child.emit("close", null, "SIGTERM");
+    await expect(pending).resolves.toMatchObject({ error: "Request was aborted", terminationReason: "request_aborted" });
+  });
+
+  it("does not depend on review-flow timeout diagnostic text", async () => {
+    const child = fakeChild(); const controller = new AbortController();
+    const adapter = createAgentAdapter(
+      { id: "cursor", name: "Cursor", binary: "agent", args: (prompt) => ["-p", prompt] },
+      { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
+    );
+    const pending = adapter.run("review", { signal: controller.signal });
+    controller.abort(reviewFlowTimeoutAbortReason("A future display message"));
+    child.emit("close", null, "SIGTERM");
+    await expect(pending).resolves.toMatchObject({ error: "Request was aborted", terminationReason: "flow_aborted" });
   });
 
   it("settles a PID-less spawn error because no OS child exists", async () => {
