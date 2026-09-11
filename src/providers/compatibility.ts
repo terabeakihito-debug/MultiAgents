@@ -18,7 +18,7 @@ export type ParsedProviderVersion = { normalized: string; major: number; minor: 
 export const providerCompatibilityDefinitions: Record<ProviderId, ProviderCompatibilityDefinition> = {
   codex: {
     provider: "codex", binary: "codex", supportedVersions: [{ kind: "minor", value: "0.153" }], warningVersions: [{ kind: "minor", value: "0.154" }],
-    requiredFlags: ["--ignore-user-config", "--ignore-rules", "--ephemeral", "--sandbox", "--cd"], credentialCapability: "agent_codex", sandboxProfile: "agent_read_only",
+    requiredFlags: ["--ignore-user-config", "--ignore-rules", "--ephemeral", "--sandbox", "--dangerously-bypass-approvals-and-sandbox", "--cd"], credentialCapability: "agent_codex", sandboxProfile: "agent_read_only",
   },
   cursor: {
     provider: "cursor", binary: "agent", supportedVersions: [{ kind: "build_family", value: "2026.09" }], warningVersions: [{ kind: "build_family", value: "2026.10" }],

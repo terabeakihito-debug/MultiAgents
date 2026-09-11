@@ -3,7 +3,7 @@ import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { classifyProviderVersion, parseProviderVersion } from "../providers/compatibility";
-import { assertProviderExecutionIdentity, diagnoseProvider, prepareCodexImmutableBinding, providerDiagnostics, providerExecutionIdentityForTests, PROVIDER_COMPATIBILITY_POLICY_VERSION, ProviderDiagnosticTimeoutError, resolveCodexRuntimeFresh } from "./provider-diagnostics";
+import { assertProviderExecutionIdentity, diagnoseProvider, prepareCodexImmutableBinding, providerDiagnostics, providerExecutionIdentityForTests, PROVIDER_COMPATIBILITY_POLICY_VERSION, ProviderDiagnosticTimeoutError, readCodexRuntimeResolverOutputForTests, resolveCodexRuntimeFresh } from "./provider-diagnostics";
 import { StateStore } from "./state-store";
 import { buildSandboxCommand } from "./os-sandbox";
 
@@ -59,11 +59,15 @@ describe("provider compatibility", () => {
     try {
       await mkdir(join(home, ".codex"), { recursive: true }); await mkdir(join(home, ".config", "cursor"), { recursive: true }); await mkdir(join(home, ".local", "bin"), { recursive: true });
       await mkdir(join(codex, "bin"), { recursive: true }); await mkdir(join(codex, "vendor", triple, "bin"), { recursive: true }); await mkdir(join(nodeRoot, "bin"), { recursive: true }); await mkdir(cursorInstall, { recursive: true });
-      await Promise.all([writeFile(nodePath, "node"), writeFile(join(codex, "bin", "codex.js"), "entry"), writeFile(join(codex, "package.json"), "{\"name\":\"codex\"}"), writeFile(join(codex, "vendor", triple, "bin", "codex"), "one"), writeFile(join(home, ".codex", "auth.json"), "metadata"), writeFile(join(home, ".config", "cursor", "auth.json"), "metadata"), writeFile(join(cursorInstall, "cursor-agent"), "one"), writeFile(join(cursorInstall, "node"), "one"), writeFile(join(cursorInstall, "index.js"), "one")]);
-      await Promise.all([chmod(nodePath, 0o700), chmod(join(codex, "bin", "codex.js"), 0o700), chmod(join(codex, "vendor", triple, "bin", "codex"), 0o700), chmod(join(cursorInstall, "cursor-agent"), 0o700), chmod(join(cursorInstall, "node"), 0o700), chmod(join(home, ".codex", "auth.json"), 0o600), chmod(join(home, ".config", "cursor", "auth.json"), 0o600)]);
+      await Promise.all([writeFile(nodePath, "node"), writeFile(join(codex, "bin", "codex.js"), "entry"), writeFile(join(codex, "package.json"), "{\"name\":\"codex\"}"), writeFile(join(codex, "vendor", triple, "bin", "codex"), "one"), writeFile(join(codex, "vendor", triple, "bin", "codex-code-mode-host"), "host-one"), writeFile(join(home, ".codex", "auth.json"), "metadata"), writeFile(join(home, ".config", "cursor", "auth.json"), "metadata"), writeFile(join(cursorInstall, "cursor-agent"), "one"), writeFile(join(cursorInstall, "node"), "one"), writeFile(join(cursorInstall, "index.js"), "one")]);
+      await Promise.all([chmod(nodePath, 0o700), chmod(join(codex, "bin", "codex.js"), 0o700), chmod(join(codex, "vendor", triple, "bin", "codex"), 0o700), chmod(join(codex, "vendor", triple, "bin", "codex-code-mode-host"), 0o700), chmod(join(cursorInstall, "cursor-agent"), 0o700), chmod(join(cursorInstall, "node"), 0o700), chmod(join(home, ".codex", "auth.json"), 0o600), chmod(join(home, ".config", "cursor", "auth.json"), 0o600)]);
       await symlink(join(cursorInstall, "launcher"), join(home, ".local", "bin", "agent")); await writeFile(join(cursorInstall, "launcher"), "launcher"); await chmod(join(cursorInstall, "launcher"), 0o700);
       const context = { home, nodePath, nodeRoot };
       const codexBefore = await providerExecutionIdentityForTests("codex", context); const cursorBefore = await providerExecutionIdentityForTests("cursor", context);
+      await rm(join(codex, "vendor", triple, "bin", "codex-code-mode-host"));
+      await expect(providerExecutionIdentityForTests("codex", context)).rejects.toThrow();
+      await expect(assertProviderExecutionIdentity("codex", { provider: "codex", status: "supported", flagsCompatible: true, credentialStatus: "available", sandboxCompatible: true, launchCompatible: true, checkedAt: new Date().toISOString(), versionChanged: false, identityChanged: false, identity: codexBefore }, context)).rejects.toThrow();
+      await writeFile(join(codex, "vendor", triple, "bin", "codex-code-mode-host"), "host-one"); await chmod(join(codex, "vendor", triple, "bin", "codex-code-mode-host"), 0o700);
       await writeFile(join(codex, "vendor", triple, "bin", "codex"), "two"); await writeFile(join(cursorInstall, "cursor-agent"), "two");
       expect(await providerExecutionIdentityForTests("codex", context)).not.toBe(codexBefore);
       expect(await providerExecutionIdentityForTests("cursor", context)).not.toBe(cursorBefore);
@@ -79,8 +83,8 @@ describe("provider compatibility", () => {
       const fallbackIdentity = await providerExecutionIdentityForTests("codex", context); const sibling = join(nodeRoot, "lib", "node_modules", "@openai", "codex-linux-x64"); const nested = join(codex, "node_modules", "@openai", "codex-linux-x64");
       for (const optional of [sibling, nested]) {
         await mkdir(join(optional, "vendor", triple, "bin"), { recursive: true });
-        await Promise.all([writeFile(join(optional, "package.json"), "{\"name\":\"optional\"}"), writeFile(join(optional, "vendor", triple, "bin", "codex"), optional === nested ? "nested" : "sibling")]);
-        await chmod(join(optional, "vendor", triple, "bin", "codex"), 0o700);
+        await Promise.all([writeFile(join(optional, "package.json"), "{\"name\":\"optional\"}"), writeFile(join(optional, "vendor", triple, "bin", "codex"), optional === nested ? "nested" : "sibling"), writeFile(join(optional, "vendor", triple, "bin", "codex-code-mode-host"), optional === nested ? "nested-host" : "sibling-host")]);
+        await Promise.all([chmod(join(optional, "vendor", triple, "bin", "codex"), 0o700), chmod(join(optional, "vendor", triple, "bin", "codex-code-mode-host"), 0o700)]);
       }
       expect((await resolveCodexRuntimeFresh(nodeRoot)).nativeExecutable).toBe(join(nested, "vendor", triple, "bin", "codex"));
       const nestedIdentity = await providerExecutionIdentityForTests("codex", context); expect(nestedIdentity).not.toBe(fallbackIdentity);
@@ -95,11 +99,11 @@ describe("provider compatibility", () => {
   it("observes fresh package exports resolution and binds the selected runtime through launch", async () => {
     const root = await mkdtemp(join(tmpdir(), "multiagents-fresh-codex-"));
     const home = join(root, "home"); const nodeRoot = join(root, "node"); const nodePath = join(nodeRoot, "bin", "node"); const codex = join(nodeRoot, "lib", "node_modules", "@openai", "codex"); const optional = join(codex, "node_modules", "@openai", "codex-linux-x64"); const triple = "x86_64-unknown-linux-musl";
-    const runtime = (name: string) => join(optional, name); const native = (name: string) => join(runtime(name), "vendor", triple, "bin", "codex");
+    const runtime = (name: string) => join(optional, name); const native = (name: string) => join(runtime(name), "vendor", triple, "bin", "codex"); const companion = (name: string) => join(runtime(name), "vendor", triple, "bin", "codex-code-mode-host");
     try {
       await Promise.all([mkdir(join(home, ".codex"), { recursive: true }), mkdir(join(codex, "bin"), { recursive: true }), mkdir(join(codex, "vendor", triple, "bin"), { recursive: true }), mkdir(join(nodeRoot, "bin"), { recursive: true }), mkdir(join(runtime("a"), "vendor", triple, "bin"), { recursive: true }), mkdir(join(runtime("b"), "vendor", triple, "bin"), { recursive: true })]);
-      await Promise.all([writeFile(nodePath, "node"), writeFile(join(home, ".codex", "auth.json"), "metadata"), writeFile(join(codex, "bin", "codex.js"), "entry"), writeFile(join(codex, "package.json"), "{}"), writeFile(join(codex, "vendor", triple, "bin", "codex"), "vendor"), writeFile(join(runtime("a"), "package.json"), "{}"), writeFile(join(runtime("b"), "package.json"), "{}"), writeFile(native("a"), "runtime-a"), writeFile(native("b"), "runtime-b")]);
-      await Promise.all([chmod(nodePath, 0o700), chmod(join(home, ".codex", "auth.json"), 0o600), chmod(join(codex, "bin", "codex.js"), 0o700), chmod(join(codex, "vendor", triple, "bin", "codex"), 0o700), chmod(native("a"), 0o700), chmod(native("b"), 0o700)]);
+      await Promise.all([writeFile(nodePath, "node"), writeFile(join(home, ".codex", "auth.json"), "metadata"), writeFile(join(codex, "bin", "codex.js"), "entry"), writeFile(join(codex, "package.json"), "{}"), writeFile(join(codex, "vendor", triple, "bin", "codex"), "vendor"), writeFile(join(codex, "vendor", triple, "bin", "codex-code-mode-host"), "vendor-host"), writeFile(join(runtime("a"), "package.json"), "{}"), writeFile(join(runtime("b"), "package.json"), "{}"), writeFile(native("a"), "runtime-a"), writeFile(native("b"), "runtime-b"), writeFile(companion("a"), "host-a"), writeFile(companion("b"), "host-b")]);
+      await Promise.all([chmod(nodePath, 0o700), chmod(join(home, ".codex", "auth.json"), 0o600), chmod(join(codex, "bin", "codex.js"), 0o700), chmod(join(codex, "vendor", triple, "bin", "codex"), 0o700), chmod(join(codex, "vendor", triple, "bin", "codex-code-mode-host"), 0o700), chmod(native("a"), 0o700), chmod(native("b"), 0o700), chmod(companion("a"), 0o700), chmod(companion("b"), 0o700)]);
       const context = { home, nodePath, nodeRoot };
       await writeFile(join(optional, "package.json"), JSON.stringify({ exports: { "./package.json": "./a/package.json" } }));
       const selectedA = await resolveCodexRuntimeFresh(nodeRoot); const identityA = await providerExecutionIdentityForTests("codex", context);
@@ -113,10 +117,13 @@ describe("provider compatibility", () => {
       const immutable = await prepareCodexImmutableBinding(binding.codexRuntime!);
       const pinnedCommand = buildSandboxCommand({ profile: "agent_read_only", provider: "codex", cwd: root, codexRuntime: immutable.binding, command: { binary: "codex", args: ["--version"] } });
       const pinnedArgs = pinnedCommand.args.join("\0");
-      expect(pinnedArgs).toContain(`${immutable.binding.stagedExecutable}\0/opt/multiagents/codex/codex`);
+      expect(pinnedArgs).toContain(`${immutable.binding.stagedRuntimeRoot}\0/opt/multiagents/codex`);
+      expect(immutable.binding.stagedExecutable).toBe(join(immutable.binding.stagedRuntimeRoot, "codex"));
+      expect(immutable.binding.stagedCompanionExecutable).toBe(join(immutable.binding.stagedRuntimeRoot, "codex-code-mode-host"));
       expect(pinnedArgs).not.toContain(`${codex}\0/opt/multiagents/codex`);
       await immutable.cleanup();
       await writeFile(native("a"), "unselected-runtime-changed"); expect(await providerExecutionIdentityForTests("codex", context)).toBe(identityB);
+      await writeFile(companion("b"), "selected-host-changed"); expect(await providerExecutionIdentityForTests("codex", context)).not.toBe(identityB);
       await writeFile(native("b"), "selected-runtime-changed"); expect(await providerExecutionIdentityForTests("codex", context)).not.toBe(identityB);
     } finally { await rm(root, { recursive: true, force: true }); }
   });
@@ -127,6 +134,15 @@ describe("provider compatibility", () => {
     await expect(resolveCodexRuntimeFresh(undefined, { execute: async () => result({ stdout: JSON.stringify({ source: "vendor", mainPackageRoot: "/etc", installRoot: "/etc", packageRoot: "/etc", packageJson: "/etc/passwd", nativeExecutable: "/bin/sh", optionalPackageName: "codex-linux-x64" }) }) })).rejects.toThrow();
     await expect(resolveCodexRuntimeFresh(undefined, { execute: async () => result({ timedOut: true }) })).rejects.toBeInstanceOf(ProviderDiagnosticTimeoutError);
     await expect(resolveCodexRuntimeFresh(undefined, { execute: async () => result({ stdoutTruncated: true, stdout: "x".repeat(200_000) }) })).rejects.toThrow("failed");
+  });
+
+  it("rejects oversized resolver file output without reading it unboundedly", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "multiagents-oversized-resolver-output-"));
+    const output = join(directory, "resolution.json");
+    try {
+      await writeFile(output, "x".repeat(64 * 1024 + 1));
+      await expect(readCodexRuntimeResolverOutputForTests(output)).rejects.toThrow("Codex runtime resolution failed");
+    } finally { await rm(directory, { recursive: true, force: true }); }
   });
 
   it.runIf(process.env.MULTIAGENTS_REAL_PROVIDER_CHECK === "1")("runs local-only diagnostics without provider requests", async () => {

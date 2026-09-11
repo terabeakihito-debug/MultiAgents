@@ -12,10 +12,11 @@ const execute = promisify(execFile);
 
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "multiagents-immutable-codex-"));
-  const source = join(root, "codex"); const replacement = join(root, "replacement");
+  const source = join(root, "codex"); const companion = join(root, "codex-code-mode-host"); const replacement = join(root, "replacement");
   const put = async (path: string, label: string) => { await writeFile(path, `#!/bin/sh\nprintf '${label}\\n'\n`); await chmod(path, 0o700); };
   await put(source, "A");
-  return { root, source, replacement, put };
+  await put(companion, "HOST");
+  return { root, source, companion, replacement, put };
 }
 
 describe("immutable Codex executable binding", () => {
@@ -23,7 +24,8 @@ describe("immutable Codex executable binding", () => {
     const value = await fixture();
     try {
       const approved = await executableContentIdentity(value.source);
-      const staged = await prepareImmutableExecutableBinding(value.source, approved);
+      const companionApproved = await executableContentIdentity(value.companion);
+      const staged = await prepareImmutableRuntimeBinding([{ name: "codex", sourcePath: value.source, identity: approved }, { name: "codex-code-mode-host", sourcePath: value.companion, identity: companionApproved }]);
       await value.put(value.replacement, "B"); await rename(value.replacement, value.source);
       const command = buildSandboxCommand({
         profile: "agent_read_only",
@@ -32,18 +34,19 @@ describe("immutable Codex executable binding", () => {
         command: { binary: "codex", args: [] },
         codexRuntime: {
           source: "optional", mainPackageRoot: value.root, installRoot: value.root, packageRoot: value.root,
-          packageJson: join(value.root, "package.json"), nativeExecutable: value.source, optionalPackageName: "codex-linux-x64",
-          nativeIdentity: approved, stagedExecutable: staged.path, stagedDigest: staged.digest,
+          packageJson: join(value.root, "package.json"), nativeExecutable: value.source, nativeCompanionExecutable: value.companion, optionalPackageName: "codex-linux-x64",
+          nativeIdentity: approved, nativeCompanionIdentity: companionApproved, aggregateDigest: staged.aggregateDigest,
+          stagedRuntimeRoot: staged.directory, stagedExecutable: staged.paths.codex, stagedCompanionExecutable: staged.paths["codex-code-mode-host"], stagedDigest: staged.aggregateDigest,
         },
       });
       const result = await execute(command.binary, command.args, { cwd: command.cwd, env: command.env });
       expect(result.stdout.trim()).toBe("A");
-      expect(command.args).toContain(staged.path);
+      expect(command.args).toContain(staged.directory);
       expect(command.args).not.toContain(value.source);
       await rm(value.source);
       expect((await execute(command.binary, command.args, { cwd: command.cwd, env: command.env })).stdout.trim()).toBe("A");
       await staged.cleanup();
-      await expect(stat(staged.path)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(stat(staged.paths.codex)).rejects.toMatchObject({ code: "ENOENT" });
     } finally { await rm(value.root, { recursive: true, force: true }); }
   });
 
@@ -54,6 +57,10 @@ describe("immutable Codex executable binding", () => {
       const sourceStat = await stat(value.source);
       await value.put(value.source, "B"); await utimes(value.source, sourceStat.atime, sourceStat.mtime);
       await expect(prepareImmutableExecutableBinding(value.source, approved)).rejects.toThrow("changed");
+      const companionApproved = await executableContentIdentity(value.companion);
+      const companionStat = await stat(value.companion);
+      await value.put(value.companion, "GOST"); await utimes(value.companion, companionStat.atime, companionStat.mtime);
+      await expect(prepareImmutableRuntimeBinding([{ name: "codex-code-mode-host", sourcePath: value.companion, identity: companionApproved }])).rejects.toThrow("changed");
     } finally { await rm(value.root, { recursive: true, force: true }); }
   });
 
@@ -63,6 +70,26 @@ describe("immutable Codex executable binding", () => {
       const approved = await executableContentIdentity(value.source);
       await rm(value.source); await symlink("/bin/sh", value.source);
       await expect(prepareImmutableExecutableBinding(value.source, approved)).rejects.toThrow("non-symlink");
+      await chmod(value.companion, 0o600);
+      await expect(executableContentIdentity(value.companion)).rejects.toThrow("regular required file");
+    } finally { await rm(value.root, { recursive: true, force: true }); }
+  });
+
+  it("stages both Codex executables into one read-only outer sandbox directory", async () => {
+    const value = await fixture();
+    try {
+      const staged = await prepareImmutableRuntimeBinding([
+        { name: "codex", sourcePath: value.source, identity: await executableContentIdentity(value.source) },
+        { name: "codex-code-mode-host", sourcePath: value.companion, identity: await executableContentIdentity(value.companion) },
+      ]);
+      const command = buildSandboxCommand({ profile: "agent_read_only", provider: "codex", cwd: value.root, command: { binary: "codex", args: [] }, codexRuntime: {
+        source: "vendor", mainPackageRoot: value.root, installRoot: value.root, packageRoot: value.root, packageJson: join(value.root, "package.json"), optionalPackageName: "codex-linux-x64",
+        nativeExecutable: value.source, nativeCompanionExecutable: value.companion, nativeIdentity: await executableContentIdentity(value.source), nativeCompanionIdentity: await executableContentIdentity(value.companion), aggregateDigest: staged.aggregateDigest,
+        stagedRuntimeRoot: staged.directory, stagedExecutable: staged.paths.codex, stagedCompanionExecutable: staged.paths["codex-code-mode-host"], stagedDigest: staged.aggregateDigest,
+      } });
+      const args = [...command.args]; const separator = args.lastIndexOf("--"); args.splice(separator + 1, args.length, "/bin/sh", "-c", "test -x /opt/multiagents/codex/codex && test -x /opt/multiagents/codex/codex-code-mode-host && test ! -w /opt/multiagents/codex/codex-code-mode-host && printf HOST_OK");
+      expect((await execute(command.binary, args, { cwd: command.cwd, env: command.env })).stdout.trim()).toBe("HOST_OK");
+      await staged.cleanup();
     } finally { await rm(value.root, { recursive: true, force: true }); }
   });
 });

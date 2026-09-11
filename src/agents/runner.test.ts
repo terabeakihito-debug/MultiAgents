@@ -127,9 +127,147 @@ describe("createAgentAdapter", () => {
     await promise;
     expect(spawnProcess).toHaveBeenCalledWith(
       "/usr/bin/bwrap",
-      ["--", "codex", "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--sandbox", "workspace-write", "--cd", "/project", "implement"],
+      ["--", "codex", "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--dangerously-bypass-approvals-and-sandbox", "--cd", "/project", "implement"],
       expect.objectContaining({ cwd: "/", shell: false }),
     );
+  });
+
+  it("records Codex launch diagnostics without recording the prompt", async () => {
+    const child = fakeChild();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const spawnProcess = vi.fn(() => child);
+    try {
+      const adapter = createAgentAdapter(
+        { id: "codex", name: "Codex", binary: "codex", args: codexArgs },
+        { cwd: "/default", unsafeTestOnlyBypassOsSandbox: true, spawnProcess: spawnProcess as never },
+      );
+      const prompt = "do not log TEST_SECRET_PROMPT";
+      const pending = adapter.run(prompt, { policy: policy("codex", "/isolated/task", true) });
+      child.emit("close", 0, null);
+      await pending;
+      const entry = warn.mock.calls.find(([event]) => event === "codex_sandbox_launch");
+      expect(entry).toBeDefined();
+      expect(JSON.stringify(entry)).not.toContain(prompt);
+      const fields = JSON.parse(entry![1] as string) as { outerBubblewrapArgv: string[]; sandboxCwd: string; mappedCodexBinary: string; innerCodexArgs: string[] };
+      expect(fields.sandboxCwd).toBe("/project");
+      expect(fields.mappedCodexBinary).toBe("codex");
+      expect(fields.outerBubblewrapArgv).toContain("[PROMPT_OMITTED]");
+      expect(fields.innerCodexArgs).toContain("--dangerously-bypass-approvals-and-sandbox");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("logs only a redacted Codex stderr diagnostic classification when the CLI fails", async () => {
+    const fixture = "TEST_SECRET_DO_NOT_LEAK";
+    const previous = process.env.MULTIAGENTS_SLACK_WEBHOOK_URL;
+    process.env.MULTIAGENTS_SLACK_WEBHOOK_URL = fixture;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const child = fakeChild();
+      const adapter = createAgentAdapter(
+        { id: "codex", name: "Codex", binary: "codex", args: codexArgs },
+        { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
+      );
+      const pending = adapter.run("implement", { policy: policy("codex", "/isolated/task", true) });
+      child.stderr.write(`failure: ${fixture}`);
+      child.emit("close", 1, null);
+      await pending;
+      const entry = warn.mock.calls.find(([event]) => event === "codex_cli_stderr");
+      expect(entry).toBeDefined();
+      expect(JSON.parse(entry![1] as string).stderr).toContain("failure");
+      expect(JSON.stringify(entry)).not.toContain(fixture);
+    } finally {
+      warn.mockRestore();
+      if (previous === undefined) delete process.env.MULTIAGENTS_SLACK_WEBHOOK_URL;
+      else process.env.MULTIAGENTS_SLACK_WEBHOOK_URL = previous;
+    }
+  });
+
+  it("logs only recognized Codex stderr diagnostics even when the CLI exits successfully", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const child = fakeChild();
+      const adapter = createAgentAdapter(
+        { id: "codex", name: "Codex", binary: "codex", args: codexArgs },
+        { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
+      );
+      const pending = adapter.run("read only", { policy: policy("codex", "/isolated/task", true) });
+      child.stderr.write("warning: tool command output that must not be logged");
+      child.emit("close", 0, null);
+      await expect(pending).resolves.toMatchObject({ status: "completed" });
+      expect(warn).toHaveBeenCalledWith("codex_cli_stderr", expect.stringContaining('"exitCode":0'));
+      const entry = warn.mock.calls.find(([event]) => event === "codex_cli_stderr");
+      expect(JSON.parse(entry![1] as string).stderr).toContain("warning");
+      expect(JSON.stringify(entry)).not.toContain("tool command output that must not be logged");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("never logs Codex prompts or repository-derived stderr text", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const child = fakeChild();
+      const adapter = createAgentAdapter(
+        { id: "codex", name: "Codex", binary: "codex", args: codexArgs },
+        { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
+      );
+      const prompt = "USER_PROMPT_MUST_NEVER_APPEAR";
+      const repositoryText = "REPOSITORY_DERIVED_TOOL_OUTPUT_MUST_NEVER_APPEAR";
+      const pending = adapter.run(prompt, { policy: policy("codex", "/isolated/task", true) });
+      child.stderr.write(`ERROR: ${prompt}\ntool output: ${repositoryText}\nfailed to apply patch: ${repositoryText}`);
+      child.emit("close", 1, null);
+      await pending;
+      const entry = warn.mock.calls.find(([event]) => event === "codex_cli_stderr");
+      expect(entry).toBeDefined();
+      const logged = JSON.stringify(entry);
+      expect(logged).not.toContain(prompt);
+      expect(logged).not.toContain(repositoryText);
+      expect(JSON.parse(entry![1] as string).stderr).toEqual(["error", "failure"]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("does not log harmless Codex stderr on successful completion", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const child = fakeChild();
+      const adapter = createAgentAdapter(
+        { id: "codex", name: "Codex", binary: "codex", args: codexArgs },
+        { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
+      );
+      const pending = adapter.run("read only", { policy: policy("codex", "/isolated/task", true) });
+      child.stderr.write("ordinary progress message");
+      child.emit("close", 0, null);
+      await expect(pending).resolves.toMatchObject({ status: "completed" });
+      expect(warn.mock.calls.some(([event]) => event === "codex_cli_stderr")).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("bounds the Codex stderr diagnostic classifications", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const child = fakeChild();
+      const adapter = createAgentAdapter(
+        { id: "codex", name: "Codex", binary: "codex", args: codexArgs },
+        { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
+      );
+      const pending = adapter.run("read only", { policy: policy("codex", "/isolated/task", true) });
+      child.stderr.write(Array.from({ length: 64 }, () => "warning: untrusted detail").join("\n"));
+      child.emit("close", 0, null);
+      await pending;
+      const entry = warn.mock.calls.find(([event]) => event === "codex_cli_stderr");
+      expect(entry).toBeDefined();
+      const payload = JSON.parse(entry![1] as string) as { stderr: string[] };
+      expect(payload.stderr).toHaveLength(32);
+      expect((entry![1] as string).length).toBeLessThanOrEqual(2_048);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("forces a normal non-repository Codex run into read-only mode", async () => {
@@ -149,6 +287,12 @@ describe("createAgentAdapter", () => {
     );
   });
 
+  it("uses Codex's inner-sandbox bypass only for an outer-sandboxed implementation", () => {
+    expect(codexArgs("implement", "/project", true, true)).toContain("--dangerously-bypass-approvals-and-sandbox");
+    expect(codexArgs("review", "/project", true, false)).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+    expect(codexArgs("answer", "/project", false, false)).toEqual(["exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--sandbox", "read-only", "--cd", "/project", "answer"]);
+  });
+
   it("does not let prompt content select the Codex sandbox or cwd", async () => {
     const child = fakeChild();
     const spawnProcess = vi.fn(() => child);
@@ -162,7 +306,7 @@ describe("createAgentAdapter", () => {
     await promise;
     expect(spawnProcess).toHaveBeenCalledWith(
       "/usr/bin/bwrap",
-      ["--", "codex", "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--sandbox", "workspace-write", "--cd", "/project", prompt],
+      ["--", "codex", "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--dangerously-bypass-approvals-and-sandbox", "--cd", "/project", prompt],
       expect.objectContaining({ cwd: "/", shell: false }),
     );
     const invokedArgs = spawnProcess.mock.calls[0] as unknown as [string, string[]];

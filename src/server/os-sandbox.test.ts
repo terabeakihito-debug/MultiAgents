@@ -25,10 +25,15 @@ const CODEX_RUNTIME_FIXTURE = {
   packageRoot: TEST_CODEX_ROOT,
   packageJson: join(TEST_CODEX_ROOT, "package.json"),
   nativeExecutable: process.execPath,
+  nativeCompanionExecutable: process.execPath,
   optionalPackageName: "codex-linux-x64",
   nativeIdentity: { digest: "fixture", dev: 0, ino: 0, size: 0, ctimeMs: 0, mode: 0o500, uid: 0, gid: 0 },
+  nativeCompanionIdentity: { digest: "fixture-companion", dev: 0, ino: 0, size: 0, ctimeMs: 0, mode: 0o500, uid: 0, gid: 0 },
+  aggregateDigest: "fixture-aggregate",
+  stagedRuntimeRoot: dirname(process.execPath),
   stagedExecutable: process.execPath,
-  stagedDigest: "fixture",
+  stagedCompanionExecutable: process.execPath,
+  stagedDigest: "fixture-aggregate",
 };
 const CURSOR_RUNTIME_FIXTURE = { stagedRuntimeRoot: dirname(process.execPath), aggregateDigest: "fixture" };
 const CLAUDE_RUNTIME_FIXTURE = { stagedExecutable: process.execPath, digest: "fixture" };
@@ -76,6 +81,7 @@ describe("Phase 18 OS sandbox command policy", () => {
     const implement = buildSandboxCommand({ profile: "agent_implement", cwd: "/tmp/task", writableRoot: "/tmp/task", baseRepoRoot: "/tmp/base", provider: "codex", codexRuntime: CODEX_RUNTIME_FIXTURE, command: { binary: "codex", args: ["--version"] } });
     const review = buildSandboxCommand({ profile: "agent_read_only", cwd: "/tmp/task", provider: "codex", codexRuntime: CODEX_RUNTIME_FIXTURE, command: { binary: "codex", args: ["--version"] } });
     expect(implement.args).toEqual(expect.arrayContaining(["--bind", "/tmp/task", "/project", "--ro-bind", "/tmp/base", "/tmp/base"]));
+    expect(implement.args).toEqual(expect.arrayContaining(["--ro-bind", CODEX_RUNTIME_FIXTURE.stagedRuntimeRoot, "/opt/multiagents/codex"]));
     expect(review.args).toEqual(expect.arrayContaining(["--ro-bind", "/tmp/task", "/project"]));
     expect(review.args).not.toContain("--unshare-net");
     expect(() => buildSandboxCommand({ profile: "agent_read_only", cwd: "/tmp/task", writableRoot: "/tmp/task", provider: "codex", codexRuntime: CODEX_RUNTIME_FIXTURE, command: { binary: "codex", args: [] } })).toThrow(OsSandboxUnavailableError);
@@ -154,9 +160,9 @@ describe("Phase 18 real bubblewrap enforcement", () => {
     expect(await readFile(join(project, "allowed.txt"), "utf8")).toBe("");
   });
 
-  it("makes implement worktree writable, base read-only, sibling hidden, and review project read-only", async () => {
+  it("lets a Codex implementation read and write its task worktree while base and sibling writes remain denied", async () => {
     const implement = shellCommand(buildSandboxCommand({ profile: "agent_implement", cwd: project, writableRoot: project, baseRepoRoot: base, provider: "codex", codexRuntime: CODEX_RUNTIME_FIXTURE, command: { binary: "codex", args: [] } }), [
-      "set -eu", "touch /project/implement.txt", `! touch ${base}/forbidden`, `test ! -e ${sibling}`, "printf IMPLEMENT_OK",
+      "set -eu", "printf codex-input > /project/codex-input.txt", "test \"$(cat /project/codex-input.txt)\" = codex-input", "printf codex-output > /project/implement.txt", "test \"$(cat /project/implement.txt)\" = codex-output", `test \"$(cat ${base}/base.txt)\" = base`, `! touch ${base}/forbidden`, `test ! -e ${sibling}`, "printf IMPLEMENT_OK",
     ].join("\n"));
     expect(await run(implement)).toMatchObject({ code: 0, stdout: "IMPLEMENT_OK" });
 

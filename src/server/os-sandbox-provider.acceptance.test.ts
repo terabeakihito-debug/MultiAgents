@@ -21,11 +21,22 @@ describe.runIf(enabled)("Phase 18 provider authentication acceptance", () => {
     await runGit(base, ["config", "user.email", "phase18@example.com"]);
     await runGit(base, ["config", "user.name", "Phase 18"]);
     await writeFile(join(base, "README.md"), "provider acceptance\n");
-    await runGit(base, ["add", "README.md"]);
+    await writeFile(join(base, "package.json"), "{\"name\":\"provider-acceptance\"}\n");
+    await runGit(base, ["add", "README.md", "package.json"]);
     await runGit(base, ["commit", "-m", "acceptance fixture"]);
     await runGit(base, ["worktree", "add", "-b", "phase18-provider", worktree, "HEAD"]);
   });
   afterAll(async () => { await Promise.all([worktree, base].filter(Boolean).map((path) => rm(path, { recursive: true, force: true }))); });
+
+  it("runs the Codex read-only repository-access diagnostic fixture in the production outer sandbox", async () => {
+    const result = await codexAgent.run(
+      "Run pwd, then run head -n 1 package.json. Do not modify anything. Report the exact tool error if either command fails.",
+      { policy: buildGenericRuntimePolicy("codex", worktree) },
+    );
+    // Deliberately inspect only the execution classification: provider stdout
+    // can contain repository-derived text and must not be logged by a test.
+    expect(result.status).toBe("completed");
+  }, 180_000);
 
   it("runs Codex with its minimal credential mount and writes only the task worktree", async () => {
     const generic = buildGenericRuntimePolicy("codex", worktree);

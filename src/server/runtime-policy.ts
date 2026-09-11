@@ -145,8 +145,12 @@ export async function runTaskAgentWithPolicy(input: {
       try { input.onAudit(type, policy, violation); }
       catch (error) { verificationAuditError ??= error; }
     };
+    let after: RuntimeState | undefined;
     let violations: RuntimeViolation[];
-    try { violations = compareRuntimeState(policy, before, await captureRuntimeState(task, policy)); }
+    try {
+      after = await captureRuntimeState(task, policy);
+      violations = compareRuntimeState(policy, before, after);
+    }
     catch { violations = ["worktree_escape"]; }
     auditSafely("runtime_execution_completed");
     if (violations.length) {
@@ -154,6 +158,17 @@ export async function runTaskAgentWithPolicy(input: {
       auditSafely("runtime_violation_detected", violation);
       try { input.onViolation(policy, violation); } catch { /* violation still wins */ }
       return { ...violationResult(policy.agent, violation), output: result.output };
+    }
+    if (isCodexRepositoryAccessSelfReport(policy, result, before, after)) {
+      // Do not log model output: it is untrusted task content. The fixed
+      // classification and empty-worktree signal correlate with the Codex
+      // launch and stderr diagnostics without disclosing task data.
+      console.warn("codex_repository_access_self_report", JSON.stringify({
+        agent: policy.agent,
+        status: result.status,
+        implementationDiffEmpty: true,
+        outputClassification: "repository_access_unavailable",
+      }));
     }
     if (verificationAuditError) throw verificationAuditError;
     return result;
@@ -173,6 +188,13 @@ export async function runTaskAgentWithPolicy(input: {
   } catch (error) {
     return { agent: policy.agent, status: "error", output: "", error: error instanceof Error ? error.message : "Agent execution failed" };
   }
+}
+
+function isCodexRepositoryAccessSelfReport(policy: RuntimePolicy, result: AgentResult, before: RuntimeState, after: RuntimeState | undefined) {
+  if (policy.agent !== "codex" || !policy.allowWrite || result.status !== "completed" || !after) return false;
+  if (before.target.fingerprint !== after.target.fingerprint) return false;
+  return /\brepository\s+access\s+(?:failed|is\s+(?:unavailable|denied)|cannot|could\s+not)\b/i.test(result.output)
+    || /(?:実行環境(?:のエラー)?|実行環境のエラー).{0,100}(?:アクセス|ファイル(?:確認|の確認)?|編集).{0,60}でき(?:ない|ません(?:でした)?)/.test(result.output);
 }
 
 export function runtimeViolationMessage(violation: RuntimeViolation) {

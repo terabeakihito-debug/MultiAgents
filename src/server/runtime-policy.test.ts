@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentAdapter, AgentId } from "../agents/types";
 import { buildChildProcessEnv } from "./child-process-env";
 import { prepareApproval } from "./pull-request";
@@ -144,6 +144,27 @@ describe("Phase 17 runtime capability policy", () => {
       onSandboxAudit: () => undefined,
     });
     expect(result).toMatchObject({ status: "error", runtimeViolation: "unexpected_write" });
+  });
+
+  it("warns when successful Codex output self-reports repository access failure with no implementation diff", async () => {
+    const { task } = await fixture();
+    const policy = (await buildTaskRuntimePolicies(task)).codex;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const result = await runTaskAgentWithPolicy({
+        task,
+        policy,
+        prompt: "implement",
+        adapter: { id: "codex", name: "codex", run: async () => ({ agent: "codex", status: "completed", output: "実行環境のエラーにより、ファイルの確認・編集ができませんでした" }) },
+        onAudit: () => undefined,
+        onViolation: () => undefined,
+        onSandboxAudit: () => undefined,
+      });
+      expect(result.status).toBe("completed");
+      expect(warn).toHaveBeenCalledWith("codex_repository_access_self_report", expect.stringContaining('"implementationDiffEmpty":true'));
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("persists only safe OS sandbox lifecycle metadata", async () => {

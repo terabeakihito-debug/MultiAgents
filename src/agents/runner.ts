@@ -117,11 +117,13 @@ function runProcess(
       }
 
       let command: SandboxCommand;
+      let safePrompt = "";
+      let innerArgs: string[] = [];
       let executionBinding: Awaited<ReturnType<typeof assertProviderExecutionIdentity>> | undefined;
       let immutableRuntime: Awaited<ReturnType<typeof prepareProviderImmutableBinding>> | undefined;
       try {
-        const safePrompt = redactKnownSecrets(prompt);
-        const innerArgs = definition.args(safePrompt, SANDBOX_PROJECT_ROOT, policy.source === "task_snapshots", policy.allowWrite);
+        safePrompt = redactKnownSecrets(prompt);
+        innerArgs = definition.args(safePrompt, SANDBOX_PROJECT_ROOT, policy.source === "task_snapshots", policy.allowWrite);
         executionBinding = !testBypass ? await assertProviderExecutionIdentity(definition.id, diagnostic!) : undefined;
         immutableRuntime = !testBypass && executionBinding ? await prepareProviderImmutableBinding(definition.id, executionBinding) : undefined;
         command = testBypass
@@ -152,6 +154,7 @@ function runProcess(
         detached: process.platform !== "win32",
         stdio: ["ignore", "pipe", "pipe"],
       };
+      if (definition.id === "codex") logCodexSandboxLaunch(command, innerArgs, safePrompt);
       // This is the final admission decision. There is deliberately no await
       // between lease acquisition and spawn: a newly quarantined process must
       // reject prepared work before it can create an unmanaged child.
@@ -314,10 +317,14 @@ function runProcess(
           if (terminationConfirmed) void resolveUnconfirmedTermination({ terminationConfirmed: true }).catch((failure) => { lifecycleError ??= failure; });
           return;
         }
+        const diagnostic = stderr.value().trim();
+        // Do not log provider output verbatim. Both streams can contain the
+        // prompt, tool commands, and repository-derived content. Codex stderr
+        // is reduced to fixed diagnostic classifications below.
+        if (definition.id === "codex" && diagnostic) logCodexStderr(code, closeSignal, diagnostic, prompt);
         let fallback: AgentResult;
         if (code === 0) fallback = { agent: definition.id, status: "completed", output: output() };
         else {
-          const diagnostic = stderr.value().trim();
           fallback = diagnostic.startsWith("bwrap:")
             ? error(new OsSandboxUnavailableError("sandbox_launch_failed"))
             : { agent: definition.id, status: "error", output: output(), error: diagnostic ? `Process exited with code ${code ?? "unknown"}${closeSignal ? ` (${closeSignal})` : ""}: ${redactKnownSecrets(diagnostic)}` : `Process exited with code ${code ?? "unknown"}${closeSignal ? ` (${closeSignal})` : ""}` };
@@ -510,6 +517,78 @@ function runProcess(
 
 function testSandboxCommand(binary: string, args: readonly string[]): SandboxCommand {
   return { binary: BWRAP_BINARY, args: ["--", binary, ...args], cwd: "/", env: { HOME: "/home/runtime", PATH: "/usr/bin:/bin", NODE_ENV: "test" }, sandboxCwd: SANDBOX_PROJECT_ROOT };
+}
+
+const CODEX_DIAGNOSTIC_MAX_CHARS = 2_048;
+const CODEX_DIAGNOSTIC_MAX_LINES = 32;
+
+const CODEX_STDERR_DIAGNOSTICS: ReadonlyArray<{ kind: string; matches: (line: string) => boolean }> = [
+  { kind: "warning", matches: (line) => /\bwarning\s*:/i.test(line) },
+  { kind: "error", matches: (line) => /\berror\b/i.test(line) },
+  { kind: "failure", matches: (line) => /\bfailure\b|\bfailed to\b/i.test(line) },
+  { kind: "missing_file", matches: (line) => /no such file or directory/i.test(line) },
+  { kind: "operation_not_permitted", matches: (line) => /operation not permitted/i.test(line) },
+  { kind: "permission_denied", matches: (line) => /permission denied/i.test(line) },
+];
+
+/**
+ * Logs launch facts needed to diagnose the nested Codex/outer-bwrap boundary.
+ * The task prompt is deliberately replaced instead of merely redacted: prompts
+ * are user-controlled and may contain credentials unknown to the server.
+ */
+function logCodexSandboxLaunch(command: SandboxCommand, innerArgs: readonly string[], prompt: string) {
+  const separator = command.args.indexOf("--");
+  const mappedCodexBinary = separator >= 0 ? command.args[separator + 1] : undefined;
+  console.warn("codex_sandbox_launch", JSON.stringify({
+    outerBubblewrapArgv: safeCodexDiagnosticArgs(command.args, prompt),
+    sandboxCwd: command.sandboxCwd,
+    mappedCodexBinary,
+    innerCodexArgs: safeCodexDiagnosticArgs(innerArgs, prompt),
+  }));
+}
+
+/**
+ * Captures CLI diagnostics independently of the process outcome. Codex can
+ * return zero after producing a tool/runtime warning on stderr.
+ */
+function logCodexStderr(code: number | null, closeSignal: NodeJS.Signals | null, stderr: string, prompt: string) {
+  const diagnostics = codexStderrDiagnostics(stderr, prompt);
+  // A successful CLI invocation with no recognized harmful diagnostic has no
+  // stderr log entry. This avoids making ordinary CLI chatter durable.
+  if (diagnostics.length === 0) return;
+  console.warn("codex_cli_stderr", JSON.stringify({
+    exitCode: code,
+    signal: closeSignal,
+    stderr: diagnostics,
+  }));
+}
+
+function safeCodexDiagnosticArgs(args: readonly string[], prompt: string) {
+  // codexArgs places the prompt last. Replace every exact copy defensively in
+  // case a future command layout uses it more than once.
+  return args.map((arg) => arg === prompt ? "[PROMPT_OMITTED]" : redactKnownSecrets(arg));
+}
+
+/**
+ * Return only fixed diagnostic classifications, never text from stderr.
+ * Even an apparent error line may interpolate a prompt, a command, a path,
+ * or tool output; retaining its text would make this log an exfiltration path.
+ */
+function codexStderrDiagnostics(value: string, prompt: string) {
+  // Keep secret handling before inspection. The prompt removal is defense in
+  // depth; classifications below are fixed strings and do not retain either.
+  const safe = redactKnownSecrets(value.split(prompt).join("[PROMPT_OMITTED]"));
+  const diagnostics: string[] = [];
+  for (const line of safe.split(/\r?\n/)) {
+    for (const diagnostic of CODEX_STDERR_DIAGNOSTICS) {
+      if (!diagnostic.matches(line)) continue;
+      const next = [...diagnostics, diagnostic.kind];
+      if (next.length > CODEX_DIAGNOSTIC_MAX_LINES || JSON.stringify(next).length > CODEX_DIAGNOSTIC_MAX_CHARS) return diagnostics;
+      diagnostics.push(diagnostic.kind);
+    }
+    if (diagnostics.length === CODEX_DIAGNOSTIC_MAX_LINES) break;
+  }
+  return diagnostics;
 }
 
 /** Audit persistence must not take ownership of an agent's lifecycle result. */

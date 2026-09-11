@@ -278,6 +278,12 @@ repositories are absent. Validation receives the task worktree read/write only
 for normal test/build artifacts. Post-run Phase 17 fingerprints and Git
 mutation checks remain active as a second boundary.
 
+For Codex implementation runs only, the server disables Codex's *inner*
+Linux sandbox because it cannot safely create a second user/mount namespace
+inside the already isolated Bubblewrap namespace. This does not disable the
+server's OS sandbox: Bubblewrap remains the enforced boundary and still mounts
+only `/project` read/write. Codex review runs retain their own read-only mode.
+
 Each run gets `HOME=/home/runtime`, a private tmpfs `/tmp`, and a `/proc` mount
 for its private PID namespace. The server HOME, `~/.multiagents/state.db`, gh
 configuration, arbitrary user files, and host `/tmp` are not mounted. Symlinks
