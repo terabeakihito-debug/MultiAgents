@@ -486,24 +486,49 @@ describe("createAgentAdapter", () => {
     vi.useRealTimers();
   });
 
-  it("unregisters a TERM-closed registered child before emitting telemetry", async () => {
+  it("records registered TERM termination before unregistering the child", async () => {
     vi.useFakeTimers();
     const child = fakeChild(); Object.defineProperty(child, "pid", { value: 987_654 });
     const received: import("./types").AgentLifecycleTelemetry[] = [];
-    const kill = vi.spyOn(process, "kill").mockImplementation(((pid: number, signal: NodeJS.Signals) => {
-      if (pid === -987_654 && signal === "SIGTERM") child.emit("close", null, "SIGTERM");
-      return true;
-    }) as typeof process.kill);
+    const kill = vi.spyOn(process, "kill").mockImplementation((() => true) as typeof process.kill);
     const adapter = createAgentAdapter(
       { id: "cursor", name: "Cursor", binary: "agent", args: (prompt) => ["-p", prompt] },
       { timeoutMs: 10, unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
     );
     const pending = adapter.run("review", { onLifecycleTelemetry: (telemetry) => { received.push(telemetry); } });
     await vi.advanceTimersByTimeAsync(10);
-    await pending;
     expect(kill).toHaveBeenCalledWith(-987_654, "SIGTERM");
+    child.emit("close", null, "SIGTERM");
+    await pending;
     expect(activeChildProcesses()).toEqual([]);
     expect(received[0]).toMatchObject({ terminationMethod: "term_only" });
+    expect(received[0].sigtermRequestedAt).toMatch(/^\d{4}-/);
+    expect(received[0].sigtermSentAt).toMatch(/^\d{4}-/);
+    expect(received[0].sigkillRequestedAt).toBeUndefined();
+    expect(received[0].sigkillSentAt).toBeUndefined();
+    vi.useRealTimers();
+  });
+
+  it("records registered SIGKILL request and send without reverting termination provenance on close", async () => {
+    vi.useFakeTimers();
+    const child = fakeChild(); Object.defineProperty(child, "pid", { value: 987_655 });
+    const received: import("./types").AgentLifecycleTelemetry[] = [];
+    const kill = vi.spyOn(process, "kill").mockImplementation((() => true) as typeof process.kill);
+    const adapter = createAgentAdapter(
+      { id: "cursor", name: "Cursor", binary: "agent", args: (prompt) => ["-p", prompt] },
+      { timeoutMs: 10, unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
+    );
+    const pending = adapter.run("review", { onLifecycleTelemetry: (telemetry) => { received.push(telemetry); } });
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(kill).toHaveBeenCalledWith(-987_655, "SIGTERM");
+    expect(kill).toHaveBeenCalledWith(-987_655, "SIGKILL");
+    child.emit("close", null, "SIGKILL");
+    await pending;
+    expect(activeChildProcesses()).toEqual([]);
+    expect(received[0]).toMatchObject({ terminationMethod: "kill_required" });
+    expect(received[0].sigkillRequestedAt).toMatch(/^\d{4}-/);
+    expect(received[0].sigkillSentAt).toMatch(/^\d{4}-/);
     vi.useRealTimers();
   });
 

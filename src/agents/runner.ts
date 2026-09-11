@@ -246,11 +246,18 @@ function runProcess(
       const requestTermination = () => {
         if (terminationRequested) return;
         terminationRequested = true;
-        noteSignalRequested("SIGTERM");
         if (registration?.id) {
-          void registration.terminate({ graceMs: FORCE_KILL_GRACE_MS, onSignal: noteSignalSent }).catch((failure) => { lifecycleError ??= failure; });
+          void registration.terminate({
+            graceMs: FORCE_KILL_GRACE_MS,
+            onSignal: (signal, phase) => {
+              if (signal !== "SIGTERM" && signal !== "SIGKILL") return;
+              if (phase === "requested") noteSignalRequested(signal);
+              else noteSignalSent(signal);
+            },
+          }).catch((failure) => { lifecycleError ??= failure; });
           return;
         }
+        noteSignalRequested("SIGTERM");
         if (signalChild("SIGTERM")) noteSignalSent("SIGTERM");
         forceKillTimer = setTimeout(() => { noteSignalRequested("SIGKILL"); if (signalChild("SIGKILL")) noteSignalSent("SIGKILL"); }, FORCE_KILL_GRACE_MS);
         forceKillTimer.unref();
@@ -347,7 +354,7 @@ function runProcess(
         lifecycle.childClosedAt = new Date().toISOString();
         if (code !== null) lifecycle.exitCode = code;
         if (closeSignal) lifecycle.exitSignal = closeSignal;
-        if (lifecycle.sigtermRequestedAt && !lifecycle.sigkillRequestedAt) lifecycle.terminationMethod = "term_only";
+        if (lifecycle.sigtermRequestedAt && !lifecycle.sigkillRequestedAt && lifecycle.terminationMethod !== "kill_required") lifecycle.terminationMethod = "term_only";
         if (forceKillTimer) clearTimeout(forceKillTimer);
         if (finalizationUnconfirmed) {
           // A real ChildProcess close event is the canonical lifecycle
