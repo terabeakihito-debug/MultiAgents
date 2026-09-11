@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { agents as defaultAgents } from "../agents";
+import { reviewFlowTimeoutAbortReason } from "../agents/abort-origin";
 import type { AgentAdapter, AgentId, FlowEvent, FlowRole, FlowStep, FlowStepId, ReviewFlowResult } from "../agents/types";
 import type { RolePolicy } from "../profiles/policy";
 import type { RuntimePolicy } from "../runtime/types";
@@ -46,7 +47,7 @@ export async function runReviewFlow(prompt: string, options: FlowOptions = {}): 
   options.signal?.addEventListener("abort", abortFromRequest, { once: true });
   const timeout = setTimeout(() => {
     timedOut = true;
-    controller.abort(new Error("Review flow timed out"));
+    controller.abort(reviewFlowTimeoutAbortReason());
   }, options.maxFlowMs ?? MAX_FLOW_MS);
   timeout.unref();
 

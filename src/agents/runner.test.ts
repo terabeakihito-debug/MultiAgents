@@ -5,6 +5,7 @@ import { codexArgs } from "./codex";
 import { cursorArgs } from "./cursor";
 import { claudeArgs } from "./claude";
 import { createAgentAdapter } from "./runner";
+import { reviewFlowTimeoutAbortReason } from "./abort-origin";
 import { buildGenericRuntimePolicy } from "../server/runtime-policy";
 import { isAgentExecutionActive } from "../server/agent-execution-guard";
 import { activeChildProcesses } from "../server/child-process-registry";
@@ -522,7 +523,19 @@ describe("createAgentAdapter", () => {
     vi.useRealTimers();
   });
 
-  it("classifies a flow abort separately from an agent deadline", async () => {
+  it("classifies a genuine review-flow timeout structurally", async () => {
+    const child = fakeChild(); const controller = new AbortController();
+    const adapter = createAgentAdapter(
+      { id: "cursor", name: "Cursor", binary: "agent", args: (prompt) => ["-p", prompt] },
+      { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
+    );
+    const pending = adapter.run("review", { signal: controller.signal });
+    controller.abort(reviewFlowTimeoutAbortReason());
+    child.emit("close", null, "SIGTERM");
+    await expect(pending).resolves.toMatchObject({ error: "Request was aborted", terminationReason: "flow_aborted" });
+  });
+
+  it("classifies an external abort with the old timeout text as request-originated", async () => {
     const child = fakeChild(); const controller = new AbortController();
     const adapter = createAgentAdapter(
       { id: "cursor", name: "Cursor", binary: "agent", args: (prompt) => ["-p", prompt] },
@@ -530,6 +543,18 @@ describe("createAgentAdapter", () => {
     );
     const pending = adapter.run("review", { signal: controller.signal });
     controller.abort(new Error("Review flow timed out"));
+    child.emit("close", null, "SIGTERM");
+    await expect(pending).resolves.toMatchObject({ error: "Request was aborted", terminationReason: "request_aborted" });
+  });
+
+  it("does not depend on review-flow timeout diagnostic text", async () => {
+    const child = fakeChild(); const controller = new AbortController();
+    const adapter = createAgentAdapter(
+      { id: "cursor", name: "Cursor", binary: "agent", args: (prompt) => ["-p", prompt] },
+      { unsafeTestOnlyBypassOsSandbox: true, spawnProcess: vi.fn(() => child) as never },
+    );
+    const pending = adapter.run("review", { signal: controller.signal });
+    controller.abort(reviewFlowTimeoutAbortReason("A future display message"));
     child.emit("close", null, "SIGTERM");
     await expect(pending).resolves.toMatchObject({ error: "Request was aborted", terminationReason: "flow_aborted" });
   });
