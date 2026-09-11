@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
-import { access, lstat, readdir, readFile, realpath, stat } from "node:fs/promises";
-import { homedir } from "node:os";
+import { access, lstat, mkdtemp, open, readdir, readFile, realpath, rm, stat } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { createHash } from "node:crypto";
 import type { AgentId } from "../agents/types";
@@ -16,6 +16,7 @@ const DIAGNOSTIC_TTL_MS = 24 * 60 * 60 * 1_000;
 const PARSER_AND_SANDBOX_POLICY_VERSION = "provider-parser-sandbox-21c8-cursor-runtime-manifest-nested-deps";
 const CODEX_RUNTIME_RESOLVER = join(process.cwd(), "src", "server", "codex-runtime-resolver.mjs");
 const CODEX_RUNTIME_RESOLUTION_TIMEOUT_MS = 2_000;
+const MAX_CODEX_RUNTIME_RESOLUTION_BYTES = 64 * 1024;
 export const PROVIDER_COMPATIBILITY_POLICY_VERSION = createHash("sha256")
   .update(JSON.stringify({ definitions: providerCompatibilityDefinitions, parserAndSandbox: PARSER_AND_SANDBOX_POLICY_VERSION }))
   .digest("hex").slice(0, 24);
@@ -142,8 +143,10 @@ async function captureProviderExecutionIdentity(provider: AgentId, context = cur
   let claudeRuntime: ClaudeRuntimeBinding | undefined;
   if (provider === "codex") {
     const resolution = await resolveCodexRuntimeFresh(context.nodeRoot);
-    codexRuntime = { ...resolution, nativeIdentity: await executableContentIdentity(resolution.nativeExecutable) };
-    parts.push(`node=${await pathIdentity(context.nodePath, true)}`, `packageRoot=${await pathIdentity(codexRuntime.mainPackageRoot)}`, `packageJson=${await pathIdentity(join(codexRuntime.mainPackageRoot, "package.json"))}`, `entry=${await pathIdentity(join(codexRuntime.mainPackageRoot, "bin", "codex.js"), true)}`, `runtimeSource=${codexRuntime.source}`, `runtimeInstall=${await pathIdentity(codexRuntime.installRoot)}`, `runtimePackage=${await pathIdentity(codexRuntime.packageRoot)}`, `runtimePackageJson=${await pathIdentity(codexRuntime.packageJson)}`, `native=${JSON.stringify(codexRuntime.nativeIdentity)}`);
+    const nativeIdentity = await executableContentIdentity(resolution.nativeExecutable);
+    const nativeCompanionIdentity = await executableContentIdentity(resolution.nativeCompanionExecutable);
+    codexRuntime = { ...resolution, nativeIdentity, nativeCompanionIdentity, aggregateDigest: aggregateRuntimeArtifactIdentity([{ name: "codex", identity: nativeIdentity }, { name: "codex-code-mode-host", identity: nativeCompanionIdentity }]) };
+    parts.push(`node=${await pathIdentity(context.nodePath, true)}`, `packageRoot=${await pathIdentity(codexRuntime.mainPackageRoot)}`, `packageJson=${await pathIdentity(join(codexRuntime.mainPackageRoot, "package.json"))}`, `entry=${await pathIdentity(join(codexRuntime.mainPackageRoot, "bin", "codex.js"), true)}`, `runtimeSource=${codexRuntime.source}`, `runtimeInstall=${await pathIdentity(codexRuntime.installRoot)}`, `runtimePackage=${await pathIdentity(codexRuntime.packageRoot)}`, `runtimePackageJson=${await pathIdentity(codexRuntime.packageJson)}`, `native=${JSON.stringify(codexRuntime.nativeIdentity)}`, `nativeCompanion=${JSON.stringify(codexRuntime.nativeCompanionIdentity)}`, `runtimeAggregate=${codexRuntime.aggregateDigest}`);
   }
   if (provider === "cursor") {
     const launcher = providerBinaryPath(provider, context); const resolvedLauncher = await realpath(launcher).catch(() => "missing"); const runtimeRoot = resolvedLauncher === "missing" ? "missing" : dirname(resolvedLauncher);
@@ -263,9 +266,12 @@ function assertCursorRuntimeArtifactSecurity(artifact: CursorRuntimeManifestArti
   }
 }
 export async function prepareCodexImmutableBinding(binding: CodexRuntimeBinding): Promise<{ binding: StagedCodexRuntimeBinding; cleanup: () => Promise<void> }> {
-  const staged = await prepareImmutableExecutableBinding(binding.nativeExecutable, binding.nativeIdentity);
-  if (staged.digest !== binding.nativeIdentity.digest) throw new Error("Approved Codex runtime digest changed before sandbox launch");
-  return { binding: { ...binding, stagedExecutable: staged.path, stagedDigest: staged.digest }, cleanup: staged.cleanup };
+  const staged = await prepareImmutableRuntimeBinding([
+    { name: "codex", sourcePath: binding.nativeExecutable, identity: binding.nativeIdentity },
+    { name: "codex-code-mode-host", sourcePath: binding.nativeCompanionExecutable, identity: binding.nativeCompanionIdentity },
+  ]);
+  if (staged.aggregateDigest !== binding.aggregateDigest) { await staged.cleanup(); throw new Error("Approved Codex runtime digest changed before sandbox launch"); }
+  return { binding: { ...binding, stagedRuntimeRoot: staged.directory, stagedExecutable: staged.paths.codex, stagedCompanionExecutable: staged.paths["codex-code-mode-host"], stagedDigest: staged.aggregateDigest }, cleanup: staged.cleanup };
 }
 export async function prepareProviderImmutableBinding(provider: AgentId, capture: ProviderIdentityCapture): Promise<{ codexRuntime?: StagedCodexRuntimeBinding; cursorRuntime?: StagedCursorRuntimeBinding; claudeRuntime?: StagedClaudeRuntimeBinding; cleanup: () => Promise<void> }> {
   if (provider === "codex" && capture.codexRuntime) {
@@ -292,14 +298,7 @@ export class ProviderDiagnosticTimeoutError extends Error { constructor() { supe
 type ResolverProcessResult = { code: number | null; stdout: string; stderr: string; timedOut: boolean; stdoutTruncated: boolean; stderrTruncated: boolean };
 export async function resolveCodexRuntimeFresh(nodeRoot = currentIdentityContext().nodeRoot, options: { execute?: () => Promise<ResolverProcessResult> } = {}): Promise<CodexRuntimeResolution> {
   const entrypoint = join(nodeRoot, "lib", "node_modules", "@openai", "codex", "bin", "codex.js");
-  const execute = options.execute ?? (() => runHardenedProcess({
-    binary: process.execPath,
-    args: [CODEX_RUNTIME_RESOLVER, entrypoint, process.arch],
-    cwd: "/",
-    env: buildChildProcessEnv({ purpose: "validation", baseEnv: { NODE_ENV: process.env.NODE_ENV, PATH: "/usr/bin:/bin" } }),
-    purpose: "validation",
-    timeoutMs: CODEX_RUNTIME_RESOLUTION_TIMEOUT_MS,
-  }));
+  const execute = options.execute ?? (() => executeCodexRuntimeResolver(entrypoint));
   const result = await execute();
   if (result.timedOut) throw new ProviderDiagnosticTimeoutError();
   if (result.code !== 0 || result.stdoutTruncated || result.stderrTruncated) throw new Error("Codex runtime resolution failed");
@@ -307,8 +306,59 @@ export async function resolveCodexRuntimeFresh(nodeRoot = currentIdentityContext
   try { value = JSON.parse(result.stdout); } catch { throw new Error("Codex runtime resolver returned malformed JSON"); }
   return validateCodexRuntimeResolution(value, nodeRoot);
 }
+
+/**
+ * The managed Codex host can report a successful Node child while dropping
+ * captured pipe output. Keep the resolver's fixed argv and private environment,
+ * but redirect its single JSON record to a 0700 temporary directory instead.
+ */
+async function executeCodexRuntimeResolver(entrypoint: string): Promise<ResolverProcessResult> {
+  const directory = await mkdtemp(join(tmpdir(), "multiagents-codex-runtime-resolver-"));
+  const output = join(directory, "resolution.json");
+  try {
+    const result = await runHardenedProcess({
+      binary: "/bin/sh",
+      // All positional values are server-owned absolute paths; the fixed script
+      // deliberately avoids interpolating them into shell source.
+      args: ["-c", "exec \"$1\" \"$2\" \"$3\" \"$4\" > \"$5\"", "codex-runtime-resolver", process.execPath, CODEX_RUNTIME_RESOLVER, entrypoint, process.arch, output],
+      cwd: "/",
+      env: buildChildProcessEnv({ purpose: "validation", baseEnv: { NODE_ENV: process.env.NODE_ENV, PATH: "/usr/bin:/bin" } }),
+      purpose: "validation",
+      timeoutMs: CODEX_RUNTIME_RESOLUTION_TIMEOUT_MS,
+    });
+    return { ...result, stdout: await readCodexRuntimeResolverOutput(output) };
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+async function readCodexRuntimeResolverOutput(output: string): Promise<string> {
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  const oversized = new Error("Codex runtime resolution failed");
+  try {
+    handle = await open(output, "r");
+    // Read one sentinel byte beyond the permitted record size, so an untrusted
+    // resolver output can never make this process allocate or read unbounded data.
+    const buffer = Buffer.allocUnsafe(MAX_CODEX_RUNTIME_RESOLUTION_BYTES + 1);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    if (bytesRead > MAX_CODEX_RUNTIME_RESOLUTION_BYTES) throw oversized;
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } catch (error) {
+    if (error === oversized) throw error;
+    // Preserve the previous missing/unreadable-output behavior: it reaches the
+    // malformed-JSON fail-closed path in resolveCodexRuntimeFresh.
+    return "";
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+/** Test-only seam for the bounded resolver-output reader. */
+export async function readCodexRuntimeResolverOutputForTests(output: string) {
+  return readCodexRuntimeResolverOutput(output);
+}
 async function validateCodexRuntimeResolution(value: unknown, nodeRoot: string): Promise<CodexRuntimeResolution> {
-  const keys = ["installRoot", "mainPackageRoot", "nativeExecutable", "optionalPackageName", "packageJson", "packageRoot", "source"];
+  const keys = ["installRoot", "mainPackageRoot", "nativeCompanionExecutable", "nativeExecutable", "optionalPackageName", "packageJson", "packageRoot", "source"];
   if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).sort().join("|") !== keys.join("|")) throw new Error("Codex runtime resolver schema is invalid");
   const resolution = value as Record<string, unknown>;
   if (!Object.values(resolution).every((item) => typeof item === "string") || !["optional", "vendor"].includes(resolution.source as string)) throw new Error("Codex runtime resolver schema is invalid");
@@ -323,8 +373,9 @@ async function validateCodexRuntimeResolution(value: unknown, nodeRoot: string):
   await validateResolutionPath(output.packageRoot, "directory");
   await validateResolutionPath(output.packageJson, "file");
   await validateResolutionPath(output.nativeExecutable, "executable");
+  await validateResolutionPath(output.nativeCompanionExecutable, "executable");
   const triple = process.arch === "arm64" ? "aarch64-unknown-linux-musl" : "x86_64-unknown-linux-musl";
-  if (output.packageJson !== join(output.packageRoot, "package.json") || output.nativeExecutable !== join(output.packageRoot, "vendor", triple, "bin", "codex")) throw new Error("Codex runtime resolver paths are inconsistent");
+  if (output.packageJson !== join(output.packageRoot, "package.json") || output.nativeExecutable !== join(output.packageRoot, "vendor", triple, "bin", "codex") || output.nativeCompanionExecutable !== join(output.packageRoot, "vendor", triple, "bin", "codex-code-mode-host")) throw new Error("Codex runtime resolver paths are inconsistent");
   if (output.source === "vendor") {
     if (output.installRoot !== expectedMain || output.packageRoot !== expectedMain) throw new Error("Codex vendor runtime is inconsistent");
   } else {

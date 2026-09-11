@@ -217,8 +217,8 @@ function addProviderRuntime(args: string[], provider: AgentId, command: { binary
     if (command.binary !== "codex") invalid("Codex provider command is not fixed");
     if (!runtimes.codex) invalid("Codex sandbox requires a fresh runtime binding");
     const runtime = runtimes.codex;
-    if (!runtime.stagedExecutable.startsWith("/")) invalid("Codex immutable runtime binding is invalid");
-    args.push("--dir", "/opt/multiagents/codex", "--ro-bind", runtime.stagedExecutable, "/opt/multiagents/codex/codex");
+    if (!runtime.stagedExecutable.startsWith("/") || !runtime.stagedCompanionExecutable.startsWith("/") || !runtime.stagedRuntimeRoot.startsWith("/") || dirname(runtime.stagedExecutable) !== runtime.stagedRuntimeRoot || dirname(runtime.stagedCompanionExecutable) !== runtime.stagedRuntimeRoot) invalid("Codex immutable runtime binding is invalid");
+    args.push("--ro-bind", runtime.stagedRuntimeRoot, "/opt/multiagents/codex");
     addCredentialFile(args, join(hostHome, ".codex", "auth.json"), join(SANDBOX_HOME, ".codex", "auth.json"));
     return { binary: "/opt/multiagents/codex/codex", args: [...command.args] };
   }
@@ -237,9 +237,9 @@ function addProviderRuntime(args: string[], provider: AgentId, command: { binary
   return { binary: "/opt/multiagents/claude", args: [...command.args] };
 }
 
-export type CodexRuntimeResolution = { source: "optional" | "vendor"; mainPackageRoot: string; installRoot: string; packageRoot: string; packageJson: string; nativeExecutable: string; optionalPackageName: string };
-export type CodexRuntimeBinding = CodexRuntimeResolution & { nativeIdentity: ExecutableContentIdentity };
-export type StagedCodexRuntimeBinding = CodexRuntimeBinding & { stagedExecutable: string; stagedDigest: string };
+export type CodexRuntimeResolution = { source: "optional" | "vendor"; mainPackageRoot: string; installRoot: string; packageRoot: string; packageJson: string; nativeExecutable: string; nativeCompanionExecutable: string; optionalPackageName: string };
+export type CodexRuntimeBinding = CodexRuntimeResolution & { nativeIdentity: ExecutableContentIdentity; nativeCompanionIdentity: ExecutableContentIdentity; aggregateDigest: string };
+export type StagedCodexRuntimeBinding = CodexRuntimeBinding & { stagedRuntimeRoot: string; stagedExecutable: string; stagedCompanionExecutable: string; stagedDigest: string };
 export type StagedCursorRuntimeBinding = { stagedRuntimeRoot: string; aggregateDigest: string };
 export type StagedClaudeRuntimeBinding = { stagedExecutable: string; digest: string };
 

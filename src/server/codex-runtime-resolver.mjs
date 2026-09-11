@@ -26,8 +26,10 @@ try {
     .map((candidate) => { try { return realpathSync(candidate); } catch { return undefined; } })
     .find((candidate) => candidate && within(packageRoot, candidate));
   if (!installRoot) process.exit(3);
-  value = { source: "optional", mainPackageRoot, installRoot, packageRoot, packageJson, nativeExecutable: join(packageRoot, "vendor", triple, "bin", "codex"), optionalPackageName };
+  const nativeExecutable = join(packageRoot, "vendor", triple, "bin", "codex");
+  value = { source: "optional", mainPackageRoot, installRoot, packageRoot, packageJson, nativeExecutable, nativeCompanionExecutable: join(dirname(nativeExecutable), "codex-code-mode-host"), optionalPackageName };
 } catch {
-  value = { source: "vendor", mainPackageRoot, installRoot: mainPackageRoot, packageRoot: mainPackageRoot, packageJson: join(mainPackageRoot, "package.json"), nativeExecutable: join(mainPackageRoot, "vendor", triple, "bin", "codex"), optionalPackageName };
+  const nativeExecutable = join(mainPackageRoot, "vendor", triple, "bin", "codex");
+  value = { source: "vendor", mainPackageRoot, installRoot: mainPackageRoot, packageRoot: mainPackageRoot, packageJson: join(mainPackageRoot, "package.json"), nativeExecutable, nativeCompanionExecutable: join(dirname(nativeExecutable), "codex-code-mode-host"), optionalPackageName };
 }
 process.stdout.write(`${JSON.stringify(value)}\n`);

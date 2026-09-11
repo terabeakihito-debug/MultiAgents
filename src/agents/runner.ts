@@ -318,10 +318,10 @@ function runProcess(
           return;
         }
         const diagnostic = stderr.value().trim();
-        // Retain non-empty Codex stderr even when it exits successfully. Do
-        // not log stdout: it is untrusted provider output and may include
-        // repository or prompt-derived data.
-        if (definition.id === "codex" && diagnostic) logCodexStderr(code, closeSignal, diagnostic);
+        // Do not log provider output verbatim. Both streams can contain the
+        // prompt, tool commands, and repository-derived content. Codex stderr
+        // is reduced to fixed diagnostic classifications below.
+        if (definition.id === "codex" && diagnostic) logCodexStderr(code, closeSignal, diagnostic, prompt);
         let fallback: AgentResult;
         if (code === 0) fallback = { agent: definition.id, status: "completed", output: output() };
         else {
@@ -519,7 +519,17 @@ function testSandboxCommand(binary: string, args: readonly string[]): SandboxCom
   return { binary: BWRAP_BINARY, args: ["--", binary, ...args], cwd: "/", env: { HOME: "/home/runtime", PATH: "/usr/bin:/bin", NODE_ENV: "test" }, sandboxCwd: SANDBOX_PROJECT_ROOT };
 }
 
-const CODEX_DIAGNOSTIC_MAX_CHARS = 16_000;
+const CODEX_DIAGNOSTIC_MAX_CHARS = 2_048;
+const CODEX_DIAGNOSTIC_MAX_LINES = 32;
+
+const CODEX_STDERR_DIAGNOSTICS: ReadonlyArray<{ kind: string; matches: (line: string) => boolean }> = [
+  { kind: "warning", matches: (line) => /\bwarning\s*:/i.test(line) },
+  { kind: "error", matches: (line) => /\berror\b/i.test(line) },
+  { kind: "failure", matches: (line) => /\bfailure\b|\bfailed to\b/i.test(line) },
+  { kind: "missing_file", matches: (line) => /no such file or directory/i.test(line) },
+  { kind: "operation_not_permitted", matches: (line) => /operation not permitted/i.test(line) },
+  { kind: "permission_denied", matches: (line) => /permission denied/i.test(line) },
+];
 
 /**
  * Logs launch facts needed to diagnose the nested Codex/outer-bwrap boundary.
@@ -541,11 +551,15 @@ function logCodexSandboxLaunch(command: SandboxCommand, innerArgs: readonly stri
  * Captures CLI diagnostics independently of the process outcome. Codex can
  * return zero after producing a tool/runtime warning on stderr.
  */
-function logCodexStderr(code: number | null, closeSignal: NodeJS.Signals | null, stderr: string) {
+function logCodexStderr(code: number | null, closeSignal: NodeJS.Signals | null, stderr: string, prompt: string) {
+  const diagnostics = codexStderrDiagnostics(stderr, prompt);
+  // A successful CLI invocation with no recognized harmful diagnostic has no
+  // stderr log entry. This avoids making ordinary CLI chatter durable.
+  if (diagnostics.length === 0) return;
   console.warn("codex_cli_stderr", JSON.stringify({
     exitCode: code,
     signal: closeSignal,
-    stderr: boundedRedactedDiagnostic(stderr),
+    stderr: diagnostics,
   }));
 }
 
@@ -555,11 +569,26 @@ function safeCodexDiagnosticArgs(args: readonly string[], prompt: string) {
   return args.map((arg) => arg === prompt ? "[PROMPT_OMITTED]" : redactKnownSecrets(arg));
 }
 
-function boundedRedactedDiagnostic(value: string) {
-  const redacted = redactKnownSecrets(value);
-  return redacted.length <= CODEX_DIAGNOSTIC_MAX_CHARS
-    ? redacted
-    : `${redacted.slice(0, CODEX_DIAGNOSTIC_MAX_CHARS)}\n[diagnostic truncated at ${CODEX_DIAGNOSTIC_MAX_CHARS} chars]`;
+/**
+ * Return only fixed diagnostic classifications, never text from stderr.
+ * Even an apparent error line may interpolate a prompt, a command, a path,
+ * or tool output; retaining its text would make this log an exfiltration path.
+ */
+function codexStderrDiagnostics(value: string, prompt: string) {
+  // Keep secret handling before inspection. The prompt removal is defense in
+  // depth; classifications below are fixed strings and do not retain either.
+  const safe = redactKnownSecrets(value.split(prompt).join("[PROMPT_OMITTED]"));
+  const diagnostics: string[] = [];
+  for (const line of safe.split(/\r?\n/)) {
+    for (const diagnostic of CODEX_STDERR_DIAGNOSTICS) {
+      if (!diagnostic.matches(line)) continue;
+      const next = [...diagnostics, diagnostic.kind];
+      if (next.length > CODEX_DIAGNOSTIC_MAX_LINES || JSON.stringify(next).length > CODEX_DIAGNOSTIC_MAX_CHARS) return diagnostics;
+      diagnostics.push(diagnostic.kind);
+    }
+    if (diagnostics.length === CODEX_DIAGNOSTIC_MAX_LINES) break;
+  }
+  return diagnostics;
 }
 
 /** Audit persistence must not take ownership of an agent's lifecycle result. */

@@ -21,7 +21,8 @@ describe.runIf(enabled)("Phase 18 provider authentication acceptance", () => {
     await runGit(base, ["config", "user.email", "phase18@example.com"]);
     await runGit(base, ["config", "user.name", "Phase 18"]);
     await writeFile(join(base, "README.md"), "provider acceptance\n");
-    await runGit(base, ["add", "README.md"]);
+    await writeFile(join(base, "package.json"), "{\"name\":\"provider-acceptance\"}\n");
+    await runGit(base, ["add", "README.md", "package.json"]);
     await runGit(base, ["commit", "-m", "acceptance fixture"]);
     await runGit(base, ["worktree", "add", "-b", "phase18-provider", worktree, "HEAD"]);
   });

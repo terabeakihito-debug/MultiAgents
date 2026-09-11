@@ -15,6 +15,7 @@ export async function cleanupDeferredRuntimeBinding(directory: string) {
 
 export function runtimeBindingDirectory(input: { codexRuntime?: { stagedExecutable: string }; cursorRuntime?: { stagedRuntimeRoot: string }; claudeRuntime?: { stagedExecutable: string } } | undefined) {
   if (input?.cursorRuntime) return input.cursorRuntime.stagedRuntimeRoot;
+  if (input?.codexRuntime && "stagedRuntimeRoot" in input.codexRuntime) return input.codexRuntime.stagedRuntimeRoot as string;
   const executable = input?.codexRuntime?.stagedExecutable ?? input?.claudeRuntime?.stagedExecutable;
   return executable ? join(executable, "..") : undefined;
 }
