@@ -94,7 +94,7 @@ export type ReviewFlowResult = {
   finalOutput: string;
 };
 
-export const rerunnableStepIds = ["cursor_review", "claude_review", "codex_final"] as const;
+export const rerunnableStepIds = ["codex_draft", "cursor_review", "claude_review", "codex_final"] as const;
 export type RerunnableStepId = (typeof rerunnableStepIds)[number];
 
 export type ReviewRerunResult = {
