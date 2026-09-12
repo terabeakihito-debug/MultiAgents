@@ -10,11 +10,15 @@ describe("dependency recovery UI presentation", () => {
     expect(dependencyRecoveryPresentation(undefined)).toBeUndefined();
   });
 
-  it("uses the existing approval snapshot path and never offers automatic installation", async () => {
+  it("keeps managed paths out of initial UI source and requests instructions only after an explicit button action", async () => {
     const page = await readFile(new URL("./page.tsx", import.meta.url), "utf8");
     expect(page).toContain("Dependencies required");
+    expect(page).toContain("Show setup command");
     expect(page).toContain("Recheck approval snapshot");
     expect(page).toContain("refreshDiff(task)");
-    expect(page).not.toContain("npm install");
+    expect(page).toContain("showSetupCommand(task)");
+    expect(page).toContain("/dependency-recovery-instructions");
+    expect(page).not.toContain("worktreePath");
+    expect(page).not.toContain("&& npm install");
   });
 });

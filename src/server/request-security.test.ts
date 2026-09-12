@@ -77,6 +77,15 @@ describe("requireHumanMutation", () => {
     expect(requireHumanMutation(request, "task-create", { now: 2_000 })?.status).toBe(403);
   });
 
+  it("recognizes dependency setup instructions as an explicit human-only action", async () => {
+    const issued = issueHumanMutationNonce(new Request(`${ORIGIN}/api/human-session`, { headers: {
+      host: "localhost:3000", referer: `${ORIGIN}/`, "sec-fetch-site": "same-origin",
+    } }));
+    const cookie = issued.headers.get("set-cookie")!.split(";")[0];
+    const { nonce } = await issued.json() as { nonce: string };
+    expect(requireHumanMutation(mutation(authorizedHeaders(nonce, cookie, "task-dependency-recovery-instructions")), "task-dependency-recovery-instructions")).toBeUndefined();
+  });
+
   it("uses the browser Host as the exact origin when the framework normalizes request.url", async () => {
     const browserOrigin = "http://127.0.0.1:3000";
     const nonceResponse = issueHumanMutationNonce(new Request(`${ORIGIN}/api/human-session`, { headers: {

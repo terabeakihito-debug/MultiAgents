@@ -7,6 +7,7 @@ import { cloneGitSeedFixture, createGitSeedFixture, type GitSeedFixture } from "
 import type { AgentAdapter, AgentId, AgentResult, FlowStep, RerunnableStepId } from "../agents/types";
 import { reconstructReviewRerunRequest, rerunReviewStep } from "../flows/review-rerun";
 import { approveAndCreatePullRequest, checkTaskDependencies, prepareApproval, ProcessExecutionError, retryPullRequest } from "./pull-request";
+import { dependencyRecoveryInstructions } from "./dependency-recovery";
 import { runGit } from "./git";
 import { SCHEMA_VERSION, StateStore, replaceStateStoreForTests } from "./state-store";
 import { acquireTaskLock, isTaskLocked, releaseTaskLock } from "./task-lock";
@@ -210,6 +211,9 @@ describe("Phase 8 SQLite state and audit history", () => {
       worktreeAvailable: true,
       worktreeStatus: "available",
     });
+    // Browserless recovery handoff: an explicit instruction request reveals the
+    // task-local command; this fixture, not MultiAgents, restores dependencies.
+    expect(dependencyRecoveryInstructions(restored!)).toEqual({ command: `cd -- '${restored!.worktreePath}' && npm install` });
     await prepareApproval(restored!);
     expect(restored?.dependencyRecovery).toBe("dependency_setup_required");
 
