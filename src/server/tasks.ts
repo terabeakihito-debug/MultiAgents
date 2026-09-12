@@ -61,6 +61,7 @@ export type WorktreeStatus = "available" | "not_required" | "missing" | "removed
 export type BaseState = "base_current" | "base_advanced" | "base_diverged" | "base_missing";
 export type ValidationCheck = { name: string; status: "pass" | "fail" | "skip"; detail?: string };
 export type SecretFinding = { path: string; kind: "filename" | "content" | "limit"; rule: string };
+export type DependencyRecoveryReason = "dependency_setup_required";
 
 export type RepoTask = {
   id: string;
@@ -87,6 +88,8 @@ export type RepoTask = {
   approvalState: ApprovalState;
   approvalPurpose?: ApprovalPurpose;
   validation: ValidationCheck[];
+  /** Set only when the task-local dependency readiness gate fails. */
+  dependencyRecovery?: DependencyRecoveryReason;
   secretFindings: SecretFinding[];
   commitSha?: string;
   prUrl?: string;
@@ -373,6 +376,14 @@ export function registerRecoveredTask(task: RepoTask) {
 }
 
 export function publicTask(task: RepoTask) {
+  // Do not expose the managed worktree path. The UI only needs to know whether
+  // it is safe to offer the existing approval-snapshot recheck action.
+  const dependencyRecovery = task.dependencyRecovery === "dependency_setup_required"
+    && task.worktreeAvailable
+    && task.worktreeStatus === "available"
+    && task.recoveryStatus === "recoverable"
+    ? { reason: "dependency_setup_required" as const, recheckAvailable: true }
+    : undefined;
   return redactKnownSecretsInValue({
     id: task.id,
     repoId: task.repoId,
@@ -383,6 +394,7 @@ export function publicTask(task: RepoTask) {
     approvalState: task.approvalState,
     approvalPurpose: task.approvalPurpose,
     validation: task.validation,
+    dependencyRecovery,
     secretFindings: task.secretFindings,
     commitSha: task.commitSha,
     prUrl: task.prUrl,

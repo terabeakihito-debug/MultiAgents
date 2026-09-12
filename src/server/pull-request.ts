@@ -125,6 +125,11 @@ export class ApprovalError extends Error {
   constructor(message: string, public readonly statusCode = 409) { super(message); }
 }
 
+/** A fixed, internal classification for the task-local dependency readiness gate. */
+export class DependencyReadinessError extends Error {
+  constructor() { super("dependencies not installed in task worktree"); }
+}
+
 export async function prepareApproval(task: RepoTask) {
   requireNoRuntimeViolation(task);
   let snapshot: DiffSnapshot | undefined;
@@ -185,6 +190,9 @@ export async function prepareApproval(task: RepoTask) {
       task.error = undefined;
     }
   }
+  // Recheck is deliberately just a new approval snapshot. It does not install
+  // or validate anything; a later approval still runs every existing gate.
+  if (issued) task.dependencyRecovery = undefined;
   persistTask(task);
   if (issued) recordApprovalEvent(task, "issued", issued, "pending");
   return {
@@ -241,6 +249,7 @@ export async function approveAndCreatePullRequest(taskId: string, input: Approva
     task.error = undefined;
     task.validation = [];
     task.secretFindings = [];
+    task.dependencyRecovery = undefined;
 
     try {
       await validateTaskSafety(task);
@@ -742,8 +751,16 @@ export async function runProjectValidation(task: RepoTask, deps: Pick<ApprovalDe
     try {
       await deps.checkDependencies(task);
       pass(task, "npm dependencies", "Available in task worktree");
-    } catch {
+    } catch (error) {
+      if (!(error instanceof DependencyReadinessError)) {
+        fail(task, "npm dependencies", "Dependency readiness check failed");
+        task.approvalState = "invalidated";
+        transitionTask(task, "validation_failed");
+        task.error = "Task-local dependency readiness could not be verified. No commit was created.";
+        throw new ApprovalError(task.error);
+      }
       fail(task, "npm dependencies", "dependencies not installed in task worktree");
+      task.dependencyRecovery = "dependency_setup_required";
       task.approvalState = "invalidated";
       transitionTask(task, "validation_failed");
       task.error = "dependencies not installed in task worktree. Install dependencies there explicitly, then retry validation. No commit was created.";
@@ -776,15 +793,15 @@ export async function checkTaskDependencies(task: RepoTask) {
   try {
     info = await lstat(modulesPath);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error("dependencies not installed in task worktree");
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new DependencyReadinessError();
     throw error;
   }
-  if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("dependencies not installed in task worktree");
+  if (!info.isDirectory() || info.isSymbolicLink()) throw new DependencyReadinessError();
   const npm = npmCommand(["ls", "--all", "--include=dev", "--ignore-scripts", "--offline"]);
   try {
     await checkedProcess(npm.binary, npm.args, task.worktreePath, COMMAND_TIMEOUT_MS);
   } catch {
-    throw new Error("dependencies not installed in task worktree");
+    throw new DependencyReadinessError();
   }
 }
 

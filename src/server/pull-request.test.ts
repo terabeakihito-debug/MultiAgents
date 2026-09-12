@@ -32,12 +32,14 @@ import {
   createTask,
   getTaskDiff,
   getTaskHistory,
+  publicTask,
   transitionTask,
   type RepoTask,
 } from "./tasks";
 import { getStateStore } from "./state-store";
 import { acquireTaskLock, releaseTaskLock } from "./task-lock";
 import { activeChildProcesses, resetChildProcessRegistryForTests } from "./child-process-registry";
+import { OsSandboxUnavailableError } from "./os-sandbox";
 
 const roots: string[] = [];
 
@@ -400,6 +402,63 @@ describe("Phase 5 approval and PR state machine", () => {
     expect(runValidation).not.toHaveBeenCalled();
     expect(commit).not.toHaveBeenCalled();
     expect(task.status).toBe("validation_failed");
+    expect(task.dependencyRecovery).toBe("dependency_setup_required");
+    expect(publicTask(task)).toMatchObject({ dependencyRecovery: { reason: "dependency_setup_required", recheckAvailable: true } });
+  });
+
+  it("classifies incomplete and symlinked task-local dependency trees for recovery", async () => {
+    const incomplete = await createRepo();
+    await writeFile(join(incomplete.task.worktreePath, "package.json"), JSON.stringify({ scripts: { lint: "eslint ." }, dependencies: { "missing-for-validation-test": "1.0.0" } }));
+    await mkdir(join(incomplete.task.worktreePath, "node_modules"));
+    await writeFile(join(incomplete.task.worktreePath, "README.md"), "initial\napproved change\n");
+    beginTaskReview(incomplete.task, "Add an approved change"); completeTaskReview(incomplete.task, true);
+    const incompleteApproval = await prepareApproval(incomplete.task);
+    await expect(approveAndCreatePullRequest(incomplete.task.id, { approved: true, diffHash: incompleteApproval.approval!.diffHash!, approvalId: incompleteApproval.approval!.approvalId! }, successfulDependencies({ checkDependencies: checkTaskDependencies }))).rejects.toThrow("dependencies not installed in task worktree");
+    expect(incomplete.task.dependencyRecovery).toBe("dependency_setup_required");
+
+    const symlinked = await createRepo();
+    await writeFile(join(symlinked.task.worktreePath, "package.json"), JSON.stringify({ scripts: { lint: "eslint ." } }));
+    const sourceModules = join(symlinked.repoPath, "node_modules");
+    await mkdir(sourceModules);
+    await symlink(sourceModules, join(symlinked.task.worktreePath, "node_modules"), "dir");
+    await writeFile(join(symlinked.task.worktreePath, "README.md"), "initial\napproved change\n");
+    beginTaskReview(symlinked.task, "Add an approved change"); completeTaskReview(symlinked.task, true);
+    const symlinkApproval = await prepareApproval(symlinked.task);
+    await expect(approveAndCreatePullRequest(symlinked.task.id, { approved: true, diffHash: symlinkApproval.approval!.diffHash!, approvalId: symlinkApproval.approval!.approvalId! }, successfulDependencies({ checkDependencies: checkTaskDependencies }))).rejects.toThrow("dependencies not installed in task worktree");
+    expect(symlinked.task.dependencyRecovery).toBe("dependency_setup_required");
+  });
+
+  it("does not classify generic validation, sandbox, or secret-scan failures as dependency recovery", async () => {
+    const validation = await readyTask({ path: "package.json", content: JSON.stringify({ scripts: { test: "false" } }) });
+    await expect(approveAndCreatePullRequest(validation.task.id, validation.input, successfulDependencies({ runValidation: async () => { throw new Error("test failure"); } }))).rejects.toThrow("npm test failed");
+    expect(validation.task.dependencyRecovery).toBeUndefined();
+
+    const sandbox = await readyTask({ path: "package.json", content: JSON.stringify({ scripts: { test: "true" } }) });
+    await expect(approveAndCreatePullRequest(sandbox.task.id, sandbox.input, successfulDependencies({ runValidation: async () => { throw new OsSandboxUnavailableError("namespace_unsupported"); } }))).rejects.toThrow("npm test failed");
+    expect(sandbox.task.dependencyRecovery).toBeUndefined();
+
+    const secret = await readyTask({ path: ".env", content: "SAFE_PLACEHOLDER=yes\n" });
+    await expect(approveAndCreatePullRequest(secret.task.id, secret.input, successfulDependencies())).rejects.toThrow("Secret scan");
+    expect(secret.task.dependencyRecovery).toBeUndefined();
+  });
+
+  it("hides dependency recovery and all managed paths when the worktree is unavailable", async () => {
+    const { task } = await createRepo();
+    task.dependencyRecovery = "dependency_setup_required";
+    task.worktreeAvailable = false;
+    task.worktreeStatus = "missing";
+    task.recoveryStatus = "orphaned";
+    const serialized = JSON.stringify(publicTask(task));
+    expect(serialized).not.toContain("dependency_setup_required");
+    expect(serialized).not.toContain(task.worktreePath);
+  });
+
+  it("rechecks through the existing approval snapshot path and clears the recovery card", async () => {
+    const { task, input } = await readyTask({ path: "package.json", content: JSON.stringify({ scripts: { lint: "eslint ." } }) });
+    await expect(approveAndCreatePullRequest(task.id, input, successfulDependencies({ checkDependencies: checkTaskDependencies }))).rejects.toThrow("dependencies not installed");
+    const rechecked = await prepareApproval(task);
+    expect(rechecked.approval).toMatchObject({ diffHash: expect.any(String), approvalId: expect.any(String) });
+    expect(task.dependencyRecovery).toBeUndefined();
   });
 
   it("constructs build validation environment with production NODE_ENV", () => {

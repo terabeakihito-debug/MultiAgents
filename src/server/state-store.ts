@@ -324,6 +324,7 @@ export class StateStore {
     const payload = redactKnownSecretsInValue({
       reviewReady: task.reviewReady,
       validation: task.validation,
+      dependencyRecovery: task.dependencyRecovery,
       secretFindings: task.secretFindings,
       prReview: review ? {
         ...review,
@@ -1195,6 +1196,7 @@ export class StateStore {
       approvalState: String(row.approval_state) as RepoTask["approvalState"],
       approvalPurpose: optionalString(row.approval_purpose) as RepoTask["approvalPurpose"],
       approvalId: optionalString(row.approval_id), validation: array(payload.validation),
+      dependencyRecovery: payload.dependencyRecovery === "dependency_setup_required" ? "dependency_setup_required" : undefined,
       secretFindings: array(payload.secretFindings), commitSha: optionalString(row.commit_sha),
       prNumber: optionalNumber(row.pr_number), prUrl: optionalString(row.pr_url),
       prReview: objectOrUndefined(payload.prReview), reviewIntake: objectOrUndefined(payload.reviewIntake),

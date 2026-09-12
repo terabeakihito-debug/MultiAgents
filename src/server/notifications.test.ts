@@ -93,6 +93,14 @@ describe("Phase 14 built-in watch rules", () => {
     expect(store.queryNotifications(query({ type: "task_needs_attention" })).notifications).toHaveLength(2);
   });
 
+  it("keeps dependency recovery metadata and managed paths out of notification payloads", () => {
+    const value = task("validation_failed", { dependencyRecovery: "dependency_setup_required" });
+    store.saveTask(value); evaluateTaskNotifications(value);
+    const serialized = JSON.stringify(store.queryNotifications(query()).notifications);
+    expect(serialized).not.toContain("dependency_setup_required");
+    expect(serialized).not.toContain(value.worktreePath);
+  });
+
   it("honors disabled preferences and creates on a later enabled evaluation", () => {
     store.saveNotificationPreferences({ ...defaultNotificationPreferences, ciFailed: false });
     const value = task("ci_failed", { prReview: review("a".repeat(40)) }); store.saveTask(value); evaluateTaskNotifications(value);
