@@ -4,13 +4,15 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { cloneGitSeedFixture, createGitSeedFixture, type GitSeedFixture } from "../../test/git-seed-fixture";
-import type { FlowStep } from "../agents/types";
+import type { AgentAdapter, AgentId, AgentResult, FlowStep, RerunnableStepId } from "../agents/types";
+import { reconstructReviewRerunRequest, rerunReviewStep } from "../flows/review-rerun";
 import { approveAndCreatePullRequest, prepareApproval, retryPullRequest } from "./pull-request";
 import { runGit } from "./git";
 import { SCHEMA_VERSION, StateStore, replaceStateStoreForTests } from "./state-store";
 import { acquireTaskLock, isTaskLocked, releaseTaskLock } from "./task-lock";
 import {
   beginTaskReview,
+  beginTaskRerun,
   clearTasksForTests,
   completeTaskReview,
   createTask,
@@ -63,6 +65,62 @@ const steps = (): FlowStep[] => [
 ];
 
 describe("Phase 8 SQLite state and audit history", () => {
+  it("recovers a persisted draft budget failure through the complete manual rerun chain", async () => {
+    const { task } = await repositoryTask();
+    const flowId = "recovery-flow";
+    const initialSteps: FlowStep[] = [
+      { id: "codex_draft", agent: "codex", role: "draft", status: "error", output: "", error: "Review step budget exhausted." },
+      { id: "cursor_review", agent: "cursor", role: "review", status: "skipped", output: "", error: "Codex draft failed" },
+      { id: "claude_review", agent: "claude", role: "review", status: "skipped", output: "", error: "Codex draft failed" },
+      { id: "codex_final", agent: "codex", role: "final", status: "skipped", output: "", error: "Codex draft failed" },
+    ];
+    beginTaskReview(task, "Recover the interrupted review");
+    recordFlowEvent(task, { type: "flow_started", flowId, timestamp: "2026-01-01T00:00:00.000Z" });
+    recordFlowEvent(task, { type: "flow_completed", flowId, result: { flowId, status: "error", steps: initialSteps, finalOutput: "" } });
+
+    const calls: Record<AgentId, number> = { codex: 0, cursor: 0, claude: 0 };
+    const adapters: Record<AgentId, AgentAdapter> = {
+      codex: { id: "codex", name: "codex", run: async (): Promise<AgentResult> => ({ agent: "codex", status: "completed", output: ++calls.codex === 1 ? "draft recovered" : "final recovered" }) },
+      cursor: { id: "cursor", name: "cursor", run: async (): Promise<AgentResult> => ({ agent: "cursor", status: "completed", output: (++calls.cursor, "cursor recovered") }) },
+      claude: { id: "claude", name: "claude", run: async (): Promise<AgentResult> => ({ agent: "claude", status: "completed", output: (++calls.claude, "claude recovered") }) },
+    };
+    const rerun = async (stepId: RerunnableStepId) => {
+      const persisted = getTask(task.id)!;
+      const request = reconstructReviewRerunRequest(persisted, stepId);
+      if ("error" in request) throw new Error(request.error);
+      beginTaskRerun(task, task.prompt);
+      const result = await rerunReviewStep(request, { agents: adapters, onEvent: (event) => recordFlowEvent(task, event) });
+      completeTaskReview(task, result.status === "completed" && result.stepId === "codex_final" && result.steps[3]?.status === "completed");
+      return result;
+    };
+
+    const draft = await rerun("codex_draft");
+    expect(draft.steps.map((step) => step.status)).toEqual(["completed", "stale", "stale", "stale"]);
+    expect(calls).toEqual({ codex: 1, cursor: 0, claude: 0 });
+    expect(reconstructReviewRerunRequest(getTask(task.id)!, "claude_review")).toEqual({ error: "Missing usable upstream data: cursor_review" });
+
+    await rerun("cursor_review");
+    await rerun("claude_review");
+    const final = await rerun("codex_final");
+
+    expect(final.steps.every((step) => step.status === "completed")).toBe(true);
+    expect(calls).toEqual({ codex: 2, cursor: 1, claude: 1 });
+    expect(task.status).toBe("awaiting_approval");
+    expect(task.reviewReady).toBe(true);
+    reloadTasksFromStoreForTests();
+    expect(getTask(task.id)).toMatchObject({
+      status: "awaiting_approval",
+      reviewReady: true,
+      flowSteps: [
+        { id: "codex_draft", status: "completed", output: "draft recovered" },
+        { id: "cursor_review", status: "completed", output: "cursor recovered" },
+        { id: "claude_review", status: "completed", output: "claude recovered" },
+        { id: "codex_final", status: "completed", output: "final recovered" },
+      ],
+    });
+    expect(getTaskHistory(task.id).events.filter((event) => event.type === "step_rerun")).toHaveLength(4);
+  });
+
   it("releases the cleanup lease when cleanup persistence fails", async () => {
     const { task } = await repositoryTask();
     const save = vi.spyOn(store, "saveTask").mockImplementation(() => { throw new Error("injected SQLITE_FULL"); });
