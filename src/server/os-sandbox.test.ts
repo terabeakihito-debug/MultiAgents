@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createServer } from "node:http";
@@ -11,6 +11,7 @@ import {
   SANDBOX_HOME,
   SANDBOX_PATH,
   buildSandboxCommand,
+  buildSandboxCommandForTests,
   checkOsSandboxAvailability,
   publicOsSandboxPolicy,
 } from "./os-sandbox";
@@ -91,16 +92,26 @@ describe("Phase 18 OS sandbox command policy", () => {
     expect(() => buildSandboxCommand({ profile: "agent_read_only", cwd: "/tmp/task", writableRoot: "/tmp/task", provider: "codex", codexRuntime: CODEX_RUNTIME_FIXTURE, command: { binary: "codex", args: [] } })).toThrow(OsSandboxUnavailableError);
   });
 
-  it("mounts only provider-specific credential files and excludes history, plugins, projects, and server state", () => {
-    const cases = [
-      buildSandboxCommand({ profile: "agent_read_only", cwd: "/tmp/task", provider: "codex", codexRuntime: CODEX_RUNTIME_FIXTURE, command: { binary: "codex", args: [] } }),
-      buildSandboxCommand({ profile: "agent_read_only", cwd: "/tmp/task", provider: "cursor", cursorRuntime: CURSOR_RUNTIME_FIXTURE, command: { binary: "agent", args: [] } }),
-      buildSandboxCommand({ profile: "agent_read_only", cwd: "/tmp/task", provider: "claude", claudeRuntime: CLAUDE_RUNTIME_FIXTURE, command: { binary: join(homedir(), ".local", "bin", "claude"), args: [] } }),
-    ];
-    const serialized = cases.map((item) => item.args.join("\0")).join("\n");
-    expect(serialized).toContain("auth.json");
-    expect(serialized).toContain(".credentials.json");
-    for (const forbidden of ["history.jsonl", "/plugins", "/projects", ".multiagents", "state.db", "/home/justa\0/home/justa"]) expect(serialized).not.toContain(forbidden);
+  it("mounts only provider-specific credential files and excludes history, plugins, projects, and server state", async () => {
+    const fixtureRoot = await mkdtemp(join(tmpdir(), "multiagents-sandbox-credentials-"));
+    const fixtures = ["codex-auth.json", "cursor-auth.json", "claude-credentials.json"].map((name) => join(fixtureRoot, name));
+    await Promise.all(fixtures.map((path) => writeFile(path, "fixture\n")));
+    const resolver = (source: string) => source.endsWith(".codex/auth.json") ? fixtures[0]
+      : source.endsWith(".config/cursor/auth.json") ? fixtures[1]
+        : source.endsWith(".claude/.credentials.json") ? fixtures[2] : undefined;
+    try {
+      const cases = [
+        buildSandboxCommandForTests({ profile: "agent_read_only", cwd: "/tmp/task", provider: "codex", codexRuntime: CODEX_RUNTIME_FIXTURE, command: { binary: "codex", args: [] } }, resolver),
+        buildSandboxCommandForTests({ profile: "agent_read_only", cwd: "/tmp/task", provider: "cursor", cursorRuntime: CURSOR_RUNTIME_FIXTURE, command: { binary: "agent", args: [] } }, resolver),
+        buildSandboxCommandForTests({ profile: "agent_read_only", cwd: "/tmp/task", provider: "claude", claudeRuntime: CLAUDE_RUNTIME_FIXTURE, command: { binary: join(homedir(), ".local", "bin", "claude"), args: [] } }, resolver),
+      ];
+      const serialized = cases.map((item) => item.args.join("\0")).join("\n");
+      for (const fixture of fixtures) expect(serialized).toContain(fixture);
+      expect(serialized).toContain("/home/runtime/.codex/auth.json");
+      expect(serialized).toContain("/home/runtime/.config/cursor/auth.json");
+      expect(serialized).toContain("/home/runtime/.claude/.credentials.json");
+      for (const forbidden of ["history.jsonl", "/plugins", "/projects", ".multiagents", "state.db"]) expect(serialized).not.toContain(forbidden);
+    } finally { await rm(fixtureRoot, { recursive: true, force: true }); }
   });
 
   it("returns path-free public summaries", () => {

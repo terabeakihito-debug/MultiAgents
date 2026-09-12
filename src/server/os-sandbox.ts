@@ -82,7 +82,7 @@ export function publicOsSandboxPolicy(profile: OsSandboxProfile): PublicOsSandbo
   };
 }
 
-export function buildSandboxCommand(input: {
+export type SandboxCommandInput = {
   profile: OsSandboxProfile;
   cwd: string;
   writableRoot?: string;
@@ -95,7 +95,21 @@ export function buildSandboxCommand(input: {
   codexRuntime?: StagedCodexRuntimeBinding;
   cursorRuntime?: StagedCursorRuntimeBinding;
   claudeRuntime?: StagedClaudeRuntimeBinding;
-}): SandboxCommand {
+};
+
+export function buildSandboxCommand(input: SandboxCommandInput): SandboxCommand {
+  return buildSandboxCommandWithCredentialResolver(input, (source) => isRegularKnown(source) ? source : undefined);
+}
+
+/** Test-only deterministic credential fixture seam; production callers use buildSandboxCommand. */
+export function buildSandboxCommandForTests(input: SandboxCommandInput, resolveCredentialFile: (source: string) => string | undefined): SandboxCommand {
+  return buildSandboxCommandWithCredentialResolver(input, (source) => {
+    const fixture = resolveCredentialFile(source);
+    return fixture && isRegularKnown(fixture) ? fixture : undefined;
+  });
+}
+
+function buildSandboxCommandWithCredentialResolver(input: SandboxCommandInput, resolveCredentialFile: (source: string) => string | undefined): SandboxCommand {
   const cwd = requireAbsoluteSafePath(input.cwd, "sandbox cwd");
   if (input.profile === "agent_implement") {
     if (!input.writableRoot || resolve(input.writableRoot) !== cwd) invalid("Implement sandbox requires the task worktree as its only writable root");
@@ -132,7 +146,7 @@ export function buildSandboxCommand(input: {
 
   addOptionalSystemFiles(args);
   const mappedCommand = input.provider
-    ? addProviderRuntime(args, input.provider, input.command, { codex: input.codexRuntime, cursor: input.cursorRuntime, claude: input.claudeRuntime })
+    ? addProviderRuntime(args, input.provider, input.command, { codex: input.codexRuntime, cursor: input.cursorRuntime, claude: input.claudeRuntime }, resolveCredentialFile)
     : addValidationRuntime(args, input.command);
 
   if (input.profile === "agent_implement") {
@@ -211,7 +225,7 @@ function runProbe(binary: string) {
   });
 }
 
-function addProviderRuntime(args: string[], provider: AgentId, command: { binary: string; args: readonly string[] }, runtimes: { codex?: StagedCodexRuntimeBinding; cursor?: StagedCursorRuntimeBinding; claude?: StagedClaudeRuntimeBinding }) {
+function addProviderRuntime(args: string[], provider: AgentId, command: { binary: string; args: readonly string[] }, runtimes: { codex?: StagedCodexRuntimeBinding; cursor?: StagedCursorRuntimeBinding; claude?: StagedClaudeRuntimeBinding }, resolveCredentialFile: (source: string) => string | undefined) {
   const hostHome = homedir();
   if (provider === "codex") {
     if (command.binary !== "codex") invalid("Codex provider command is not fixed");
@@ -219,21 +233,21 @@ function addProviderRuntime(args: string[], provider: AgentId, command: { binary
     const runtime = runtimes.codex;
     if (!runtime.stagedExecutable.startsWith("/") || !runtime.stagedCompanionExecutable.startsWith("/") || !runtime.stagedRuntimeRoot.startsWith("/") || dirname(runtime.stagedExecutable) !== runtime.stagedRuntimeRoot || dirname(runtime.stagedCompanionExecutable) !== runtime.stagedRuntimeRoot) invalid("Codex immutable runtime binding is invalid");
     args.push("--ro-bind", runtime.stagedRuntimeRoot, "/opt/multiagents/codex");
-    addCredentialFile(args, join(hostHome, ".codex", "auth.json"), join(SANDBOX_HOME, ".codex", "auth.json"));
+    addCredentialFile(args, resolveCredentialFile(join(hostHome, ".codex", "auth.json")), join(SANDBOX_HOME, ".codex", "auth.json"));
     return { binary: "/opt/multiagents/codex/codex", args: [...command.args] };
   }
   if (provider === "cursor") {
     if (command.binary !== "agent") invalid("Cursor provider command is not fixed");
     if (!runtimes.cursor?.stagedRuntimeRoot.startsWith("/")) invalid("Cursor sandbox requires an immutable runtime binding");
     args.push("--ro-bind", runtimes.cursor.stagedRuntimeRoot, "/opt/multiagents/cursor");
-    addCredentialFile(args, join(hostHome, ".config", "cursor", "auth.json"), join(SANDBOX_HOME, ".config", "cursor", "auth.json"));
+    addCredentialFile(args, resolveCredentialFile(join(hostHome, ".config", "cursor", "auth.json")), join(SANDBOX_HOME, ".config", "cursor", "auth.json"));
     return { binary: "/opt/multiagents/cursor/cursor-agent", args: [...command.args] };
   }
   const expected = join(hostHome, ".local", "bin", "claude");
   if (command.binary !== expected) invalid("Claude provider command is not fixed");
   if (!runtimes.claude?.stagedExecutable.startsWith("/")) invalid("Claude sandbox requires an immutable runtime binding");
   args.push("--ro-bind", runtimes.claude.stagedExecutable, "/opt/multiagents/claude");
-  addCredentialFile(args, join(hostHome, ".claude", ".credentials.json"), join(SANDBOX_HOME, ".claude", ".credentials.json"));
+  addCredentialFile(args, resolveCredentialFile(join(hostHome, ".claude", ".credentials.json")), join(SANDBOX_HOME, ".claude", ".credentials.json"));
   return { binary: "/opt/multiagents/claude", args: [...command.args] };
 }
 
@@ -317,8 +331,8 @@ function addOptionalSystemFiles(args: string[]) {
   }
 }
 
-function addCredentialFile(args: string[], source: string, destination: string) {
-  if (!isRegularKnown(source)) return;
+function addCredentialFile(args: string[], source: string | undefined, destination: string) {
+  if (!source) return;
   addParentDirectories(args, destination);
   args.push("--ro-bind", source, destination);
 }
