@@ -1,8 +1,9 @@
-import { mkdir, mkdtemp, rename, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { cloneGitSeedFixture, createGitSeedFixture, type GitSeedFixture } from "../../test/git-seed-fixture";
 import type { FlowStep } from "../agents/types";
 import { approveAndCreatePullRequest, prepareApproval, retryPullRequest } from "./pull-request";
 import { runGit } from "./git";
@@ -28,6 +29,10 @@ import {
 
 let testRoot: string;
 let store: StateStore;
+let gitSeed: GitSeedFixture;
+
+beforeAll(async () => { gitSeed = await createGitSeedFixture({ "README.md": "initial\n" }); });
+afterAll(async () => { await gitSeed.cleanup(); });
 
 beforeEach(async () => {
   testRoot = await mkdtemp(join(tmpdir(), "multiagents-state-"));
@@ -36,22 +41,16 @@ beforeEach(async () => {
   clearTasksForTests();
 });
 
-afterEach(() => {
+afterEach(async () => {
   clearTasksForTests();
   replaceStateStoreForTests(new StateStore(":memory:"));
+  await rm(testRoot, { recursive: true, force: true });
 });
 
 async function repositoryTask(name = "project") {
   const allowedRoot = join(testRoot, "code");
   const repoPath = join(allowedRoot, name);
-  await mkdir(repoPath, { recursive: true });
-  await runGit(repoPath, ["init", "-b", "main"]);
-  await runGit(repoPath, ["config", "user.email", "test@example.com"]);
-  await runGit(repoPath, ["config", "user.name", "Test"]);
-  await writeFile(join(repoPath, "README.md"), "initial\n");
-  await runGit(repoPath, ["add", "README.md"]);
-  await runGit(repoPath, ["commit", "-m", "initial"]);
-  await runGit(repoPath, ["remote", "add", "origin", "https://github.com/example/project.git"]);
+  await cloneGitSeedFixture(gitSeed, repoPath, "https://github.com/example/project.git");
   const task = await createTask(name, { allowedRoot, worktreeRoot: join(testRoot, "worktrees") });
   return { allowedRoot, repoPath, task };
 }
