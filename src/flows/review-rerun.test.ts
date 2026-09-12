@@ -9,7 +9,7 @@ const completedSteps = (): FlowStep[] => [
   { id: "claude_review", agent: "claude", role: "review", status: "completed", output: "claude-old" },
   { id: "codex_final", agent: "codex", role: "final", status: "completed", output: "final-old" },
 ];
-const request = (stepId: "cursor_review" | "claude_review" | "codex_final") => ({ prompt: "user request", flowId: "flow-1", stepId, steps: completedSteps() });
+const request = (stepId: "codex_draft" | "cursor_review" | "claude_review" | "codex_final") => ({ prompt: "user request", flowId: "flow-1", stepId, steps: completedSteps() });
 
 function agents(run: (id: AgentId, prompt: string, options?: AgentRunOptions) => Promise<AgentResult>) {
   return Object.fromEntries((["codex", "cursor", "claude"] as AgentId[]).map((id) => [id, { id, name: id, run: (prompt: string, options?: AgentRunOptions) => run(id, prompt, options) }])) as Record<AgentId, AgentAdapter>;
@@ -30,6 +30,15 @@ function abortAwareAgents() {
 }
 
 describe("rerunReviewStep", () => {
+  it("reruns a failed Codex draft without requiring retained output and marks all downstream steps stale", async () => {
+    const data = request("codex_draft");
+    data.steps[0] = { ...data.steps[0], status: "error", output: "", error: "Review step budget exhausted." };
+    const result = await rerunReviewStep(data, { agents: agents(async (id) => ({ agent: id, status: "completed", output: "draft-new" })) });
+    expect(result.status).toBe("completed");
+    expect(result.steps.map((step) => step.status)).toEqual(["completed", "stale", "stale", "stale"]);
+    expect(result.steps[0].output).toBe("draft-new");
+  });
+
   it("replaces Cursor and marks Claude and Final stale while retaining their output", async () => {
     const result = await rerunReviewStep(request("cursor_review"), { agents: agents(async (id) => ({ agent: id, status: "completed", output: "cursor-new" })) });
     expect(result.status).toBe("completed");
@@ -118,8 +127,9 @@ describe("server-side rerun reconstruction", () => {
   const taskId = "11111111-1111-4111-8111-111111111111";
 
   it("accepts only taskId and a rerunnable stepId", () => {
+    expect(parseReviewRerunCommand({ taskId, stepId: "codex_draft" })).toEqual({ taskId, stepId: "codex_draft" });
     expect(parseReviewRerunCommand({ taskId, stepId: "cursor_review" })).toEqual({ taskId, stepId: "cursor_review" });
-    expect(parseReviewRerunCommand({ taskId, stepId: "codex_draft" })).toEqual({ error: "Invalid rerun stepId" });
+    expect(parseReviewRerunCommand({ taskId, stepId: "unknown_step" })).toEqual({ error: "Invalid rerun stepId" });
   });
 
   it("rejects client prompt, agent, role, flow, and step output overrides", () => {
@@ -137,6 +147,12 @@ describe("server-side rerun reconstruction", () => {
       expect(parsed).toMatchObject({ prompt: "user request", flowId: "flow-1", stepId: "claude_review" });
       expect(parsed.steps[1]).toMatchObject({ agent: "cursor", role: "review", output: "cursor-old" });
     }
+  });
+
+  it("reconstructs a failed Codex draft without requiring prior output", () => {
+    const persisted = request("codex_draft");
+    persisted.steps[0] = { ...persisted.steps[0], status: "error", output: "", error: "Review step budget exhausted." };
+    expect(reconstructReviewRerunRequest({ prompt: persisted.prompt, flowId: persisted.flowId, flowSteps: persisted.steps }, "codex_draft")).toMatchObject({ stepId: "codex_draft" });
   });
 
   it("rejects missing persisted upstream output", () => {

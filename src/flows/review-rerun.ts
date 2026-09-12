@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { agents as defaultAgents } from "../agents";
 import { flowStepIds, rerunnableStepIds, type AgentAdapter, type AgentId, type FlowStep, type RerunnableStepId, type ReviewRerunEvent, type ReviewRerunResult } from "../agents/types";
-import { MAX_FLOW_MS, claudePrompt, cursorPrompt, finalPrompt } from "./review";
+import { MAX_FLOW_MS, claudePrompt, cursorPrompt, draftPrompt, finalPrompt } from "./review";
 import { createEventStream } from "./event-stream";
 import type { RolePolicy } from "../profiles/policy";
 import type { RuntimePolicy } from "../runtime/types";
@@ -152,6 +152,7 @@ export function createReviewRerunStream(request: ReviewRerunRequest, requestSign
 
 function buildRerunPrompt(prompt: string, stepId: RerunnableStepId, steps: FlowStep[]) {
   const draft = steps[0].output;
+  if (stepId === "codex_draft") return draftPrompt(prompt, true);
   if (stepId === "cursor_review") return cursorPrompt(prompt, draft);
   if (stepId === "claude_review") return claudePrompt(prompt, draft, steps[1]);
   return finalPrompt(prompt, draft, steps[1], steps[2]);
@@ -167,6 +168,7 @@ function markDownstreamStale(steps: FlowStep[], stepId: RerunnableStepId) {
 }
 
 function requiredUpstream(stepId: RerunnableStepId) {
+  if (stepId === "codex_draft") return [] as const;
   if (stepId === "cursor_review") return ["codex_draft"] as const;
   if (stepId === "claude_review") return ["codex_draft", "cursor_review"] as const;
   return ["codex_draft", "cursor_review", "claude_review"] as const;
