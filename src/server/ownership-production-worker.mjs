@@ -6,6 +6,8 @@ import authenticProcess from "node:process";
 import ts from "typescript";
 
 process.env.NODE_ENV ??= "production";
+const [socketName] = process.argv.slice(2);
+if (!/^multiagents-test-ownership-[a-z0-9-]+$/i.test(socketName ?? "")) throw new Error("Missing test ownership socket name");
 const root = process.cwd();
 function load(name, dependencies = {}) {
   const filename = path.join(root, "src/server", `${name}.ts`);
@@ -18,7 +20,9 @@ function load(name, dependencies = {}) {
   return compiled.exports;
 }
 
-const lock = load("server-instance-lock");
+const lock = load("server-instance-lock", {
+  "./server-ownership-socket.mjs": { getServerOwnershipSocketName: () => `\0${socketName}` },
+});
 const ownershipLatch = load("ownership-loss-latch");
 const registry = load("operation-registry", { "./ownership-loss-latch": ownershipLatch });
 const events = load("server-ownership-events");
