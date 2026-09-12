@@ -20,6 +20,18 @@ const enabled = process.env.MULTIAGENTS_PROVIDER_ACCEPTANCE === "1";
 const cursorLifecycleEnabled = process.env.MULTIAGENTS_CURSOR_LIFECYCLE_ACCEPTANCE === "1";
 const fullReviewEnabled = enabled && process.env.MULTIAGENTS_FULL_REVIEW_ACCEPTANCE === "1";
 
+function requireAvailableFullReviewProviders(diagnostics: Awaited<ReturnType<typeof providerDiagnostics>>) {
+  const unavailable = diagnostics.filter((diagnostic) => diagnostic.status === "missing" || diagnostic.status === "credential_unavailable");
+  if (unavailable.length) throw new Error(`Full provider review acceptance unavailable: ${unavailable.map((diagnostic) => diagnostic.provider).join(",")}`);
+}
+
+describe("Phase 18 full provider review acceptance gate", () => {
+  it("fails an opted-in full review when diagnostics report an unavailable provider", () => {
+    const diagnostics = [{ provider: "claude", status: "credential_unavailable" }] as Awaited<ReturnType<typeof providerDiagnostics>>;
+    expect(() => requireAvailableFullReviewProviders(diagnostics)).toThrow("claude");
+  });
+});
+
 describe.runIf(enabled)("Phase 18 provider authentication acceptance", () => {
   let worktree: string;
   let base: string;
@@ -106,7 +118,7 @@ describe.runIf(enabled)("Phase 18 provider authentication acceptance", () => {
     expect(result.output).toContain("CLAUDE_PHASE18_OK");
   }, 180_000);
 
-  it.runIf(fullReviewEnabled)("runs the complete production review flow with all three real providers", async (context) => {
+  it.runIf(fullReviewEnabled)("runs the complete production review flow with all three real providers", async () => {
     const root = await mkdtemp(join(tmpdir(), "multiagents-provider-full-review-"));
     const suppressProviderDiagnostics = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const allowedRoot = join(root, "projects");
@@ -131,11 +143,7 @@ describe.runIf(enabled)("Phase 18 provider authentication acceptance", () => {
         prompt: "Review the synthetic task and return a concise result. Do not commit, push, create a pull request, or access credentials.",
       });
       const diagnostics = await providerDiagnostics({ cwd: task.worktreePath, force: true });
-      const unavailable = diagnostics.filter((diagnostic) => diagnostic.status === "missing" || diagnostic.status === "credential_unavailable");
-      if (unavailable.length) {
-        context.skip(`Provider acceptance unavailable: ${unavailable.map((diagnostic) => diagnostic.provider).join(",")}`);
-        return;
-      }
+      requireAvailableFullReviewProviders(diagnostics);
       for (const diagnostic of diagnostics) {
         expect(["supported", "supported_with_warning"]).toContain(diagnostic.status);
       }
