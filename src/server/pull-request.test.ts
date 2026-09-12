@@ -100,6 +100,10 @@ function successfulDependencies(overrides: Partial<ApprovalDependencies> = {}): 
   };
 }
 
+async function dependencyTreeNonzero(): Promise<never> {
+  throw new ProcessExecutionError({ stdout: "", stderr: "", code: 1, signal: null, timedOut: false, stdoutTruncated: false, stderrTruncated: false });
+}
+
 afterEach(() => {
   clearTasksForTests();
   clearApprovalLocksForTests();
@@ -413,7 +417,7 @@ describe("Phase 5 approval and PR state machine", () => {
     await writeFile(join(incomplete.task.worktreePath, "README.md"), "initial\napproved change\n");
     beginTaskReview(incomplete.task, "Add an approved change"); completeTaskReview(incomplete.task, true);
     const incompleteApproval = await prepareApproval(incomplete.task);
-    await expect(approveAndCreatePullRequest(incomplete.task.id, { approved: true, diffHash: incompleteApproval.approval!.diffHash!, approvalId: incompleteApproval.approval!.approvalId! }, successfulDependencies({ checkDependencies: checkTaskDependencies }))).rejects.toThrow("dependencies not installed in task worktree");
+    await expect(approveAndCreatePullRequest(incomplete.task.id, { approved: true, diffHash: incompleteApproval.approval!.diffHash!, approvalId: incompleteApproval.approval!.approvalId! }, successfulDependencies({ checkDependencies: (task) => checkTaskDependencies(task, dependencyTreeNonzero) }))).rejects.toThrow("dependencies not installed in task worktree");
     expect(incomplete.task.dependencyRecovery).toBe("dependency_setup_required");
 
     const symlinked = await createRepo();
@@ -428,7 +432,7 @@ describe("Phase 5 approval and PR state machine", () => {
     expect(symlinked.task.dependencyRecovery).toBe("dependency_setup_required");
   });
 
-  it("does not classify generic validation, sandbox, or secret-scan failures as dependency recovery", async () => {
+  it("does not classify generic validation, sandbox, dependency infrastructure, or secret-scan failures as dependency recovery", async () => {
     const validation = await readyTask({ path: "package.json", content: JSON.stringify({ scripts: { test: "false" } }) });
     await expect(approveAndCreatePullRequest(validation.task.id, validation.input, successfulDependencies({ runValidation: async () => { throw new Error("test failure"); } }))).rejects.toThrow("npm test failed");
     expect(validation.task.dependencyRecovery).toBeUndefined();
@@ -436,6 +440,15 @@ describe("Phase 5 approval and PR state machine", () => {
     const sandbox = await readyTask({ path: "package.json", content: JSON.stringify({ scripts: { test: "true" } }) });
     await expect(approveAndCreatePullRequest(sandbox.task.id, sandbox.input, successfulDependencies({ runValidation: async () => { throw new OsSandboxUnavailableError("namespace_unsupported"); } }))).rejects.toThrow("npm test failed");
     expect(sandbox.task.dependencyRecovery).toBeUndefined();
+
+    const timeout = await readyTask({ path: "package.json", content: JSON.stringify({ scripts: { test: "true" } }) });
+    const timeoutError = new ProcessExecutionError({ stdout: "", stderr: "", code: null, signal: "SIGTERM", timedOut: true, stdoutTruncated: false, stderrTruncated: false });
+    await expect(approveAndCreatePullRequest(timeout.task.id, timeout.input, successfulDependencies({ checkDependencies: async () => { throw timeoutError; } }))).rejects.toThrow("Task-local dependency readiness could not be verified");
+    expect(timeout.task.dependencyRecovery).toBeUndefined();
+
+    const spawn = await readyTask({ path: "package.json", content: JSON.stringify({ scripts: { test: "true" } }) });
+    await expect(approveAndCreatePullRequest(spawn.task.id, spawn.input, successfulDependencies({ checkDependencies: async () => { throw new Error("spawn unavailable"); } }))).rejects.toThrow("Task-local dependency readiness could not be verified");
+    expect(spawn.task.dependencyRecovery).toBeUndefined();
 
     const secret = await readyTask({ path: ".env", content: "SAFE_PLACEHOLDER=yes\n" });
     await expect(approveAndCreatePullRequest(secret.task.id, secret.input, successfulDependencies())).rejects.toThrow("Secret scan");
@@ -453,12 +466,36 @@ describe("Phase 5 approval and PR state machine", () => {
     expect(serialized).not.toContain(task.worktreePath);
   });
 
-  it("rechecks through the existing approval snapshot path and clears the recovery card", async () => {
+  it("keeps dependency recovery through snapshot recheck, then clears it only after a successful approval validation", async () => {
     const { task, input } = await readyTask({ path: "package.json", content: JSON.stringify({ scripts: { lint: "eslint ." } }) });
     await expect(approveAndCreatePullRequest(task.id, input, successfulDependencies({ checkDependencies: checkTaskDependencies }))).rejects.toThrow("dependencies not installed");
     const rechecked = await prepareApproval(task);
     expect(rechecked.approval).toMatchObject({ diffHash: expect.any(String), approvalId: expect.any(String) });
+    expect(task.dependencyRecovery).toBe("dependency_setup_required");
+
+    // The user has restored the task-local tree; the next approval attempt is
+    // the only place that clears the old recovery state.
+    await mkdir(join(task.worktreePath, "node_modules"));
+    const next = await prepareApproval(task);
+    await expect(approveAndCreatePullRequest(task.id, {
+      approved: true,
+      diffHash: next.approval!.diffHash!,
+      approvalId: next.approval!.approvalId!,
+    }, successfulDependencies())).resolves.toMatchObject({ status: "pr_created" });
     expect(task.dependencyRecovery).toBeUndefined();
+  });
+
+  it("classifies only a normal npm ls nonzero exit as dependency readiness", async () => {
+    const { task } = await createRepo();
+    await mkdir(join(task.worktreePath, "node_modules"));
+    await expect(checkTaskDependencies(task, dependencyTreeNonzero)).rejects.toThrow("dependencies not installed in task worktree");
+
+    const timeout = new ProcessExecutionError({ stdout: "", stderr: "", code: null, signal: "SIGTERM", timedOut: true, stdoutTruncated: false, stderrTruncated: false });
+    await expect(checkTaskDependencies(task, async () => { throw timeout; })).rejects.toBe(timeout);
+    const signal = new ProcessExecutionError({ stdout: "", stderr: "", code: null, signal: "SIGTERM", timedOut: false, stdoutTruncated: false, stderrTruncated: false });
+    await expect(checkTaskDependencies(task, async () => { throw signal; })).rejects.toBe(signal);
+    const infrastructure = new Error("spawn unavailable");
+    await expect(checkTaskDependencies(task, async () => { throw infrastructure; })).rejects.toBe(infrastructure);
   });
 
   it("constructs build validation environment with production NODE_ENV", () => {
@@ -560,14 +597,14 @@ describe("Phase 5 approval and PR state machine", () => {
     const sourceModules = join(repoPath, "node_modules");
     await mkdir(sourceModules);
     await symlink(sourceModules, join(task.worktreePath, "node_modules"), "dir");
-    await expect(checkTaskDependencies(task)).rejects.toThrow("dependencies not installed in task worktree");
+    await expect(checkTaskDependencies(task, dependencyTreeNonzero)).rejects.toThrow("dependencies not installed in task worktree");
   });
 
   it("rejects an incomplete task-local dependency tree", async () => {
     const { task } = await createRepo();
     await writeFile(join(task.worktreePath, "package.json"), JSON.stringify({ dependencies: { "missing-for-validation-test": "1.0.0" } }));
     await mkdir(join(task.worktreePath, "node_modules"));
-    await expect(checkTaskDependencies(task)).rejects.toThrow("dependencies not installed in task worktree");
+    await expect(checkTaskDependencies(task, dependencyTreeNonzero)).rejects.toThrow("dependencies not installed in task worktree");
   });
 
   it("does not push after commit failure", async () => {

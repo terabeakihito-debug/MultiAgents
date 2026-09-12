@@ -191,8 +191,8 @@ export async function prepareApproval(task: RepoTask) {
     }
   }
   // Recheck is deliberately just a new approval snapshot. It does not install
-  // or validate anything; a later approval still runs every existing gate.
-  if (issued) task.dependencyRecovery = undefined;
+  // or validate anything, so it must not clear an unresolved dependency
+  // recovery state. A new approval attempt clears it before re-validating.
   persistTask(task);
   if (issued) recordApprovalEvent(task, "issued", issued, "pending");
   return {
@@ -787,7 +787,7 @@ export async function runProjectValidation(task: RepoTask, deps: Pick<ApprovalDe
   }
 }
 
-export async function checkTaskDependencies(task: RepoTask) {
+export async function checkTaskDependencies(task: RepoTask, execute = checkedProcess) {
   const modulesPath = join(task.worktreePath, "node_modules");
   let info;
   try {
@@ -799,9 +799,15 @@ export async function checkTaskDependencies(task: RepoTask) {
   if (!info.isDirectory() || info.isSymbolicLink()) throw new DependencyReadinessError();
   const npm = npmCommand(["ls", "--all", "--include=dev", "--ignore-scripts", "--offline"]);
   try {
-    await checkedProcess(npm.binary, npm.args, task.worktreePath, COMMAND_TIMEOUT_MS);
-  } catch {
-    throw new DependencyReadinessError();
+    await execute(npm.binary, npm.args, task.worktreePath, COMMAND_TIMEOUT_MS);
+  } catch (error) {
+    // npm ls uses a normal non-zero exit to report an inconsistent dependency
+    // tree. Do not recast sandbox, spawn, timeout, or signal termination
+    // failures as a user-actionable dependency setup problem.
+    if (error instanceof ProcessExecutionError && !error.result.timedOut && error.result.code !== null) {
+      throw new DependencyReadinessError();
+    }
+    throw error;
   }
 }
 
