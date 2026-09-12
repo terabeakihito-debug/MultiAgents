@@ -54,6 +54,7 @@ type TaskDiff = {
   truncated: boolean; approvable: boolean; blockedReason?: string;
 };
 type Approval = { diffHash?: string; approvalId?: string; blockedReason?: string };
+type DependencyRecoveryInstructions = { command?: string; error?: string };
 type TaskEvent = { id: string; sequence: number; taskId: string; type: string; createdAt: string; actor: string; stepId?: string; status?: string; metadata?: Record<string, string | number> };
 type StepVersion = { id: string; taskId: string; stepId: FlowStep["id"]; version: number; agent: AgentId; createdAt: string; output: string; status: FlowStep["status"]; durationMs?: number };
 type DiffVersion = { id: string; taskId: string; version: number; diffHash: string; changedFileCount: number; additions: number; deletions: number; createdAt: string };
@@ -92,6 +93,8 @@ export default function Home() {
   const [approval, setApproval] = useState<Approval | null>(null);
   const [reviewedDiff, setReviewedDiff] = useState(false);
   const [approvalProcessing, setApprovalProcessing] = useState(false);
+  const [setupCommand, setSetupCommand] = useState("");
+  const [setupCommandLoading, setSetupCommandLoading] = useState(false);
   const [reviewProcessing, setReviewProcessing] = useState(false);
   const [taskError, setTaskError] = useState("");
   const [taskStartError, setTaskStartError] = useState("");
@@ -129,6 +132,8 @@ export default function Home() {
     }).catch((error: unknown) => { if (!controller.signal.aborted) setTaskError(message(error)); });
     return () => controller.abort();
   }, [task?.id]);
+
+  useEffect(() => { setSetupCommand(""); }, [task?.id]);
 
   async function loadTaskHistory(taskId: string) {
     const response = await fetch(`/api/tasks/${taskId}/history`);
@@ -221,6 +226,19 @@ export default function Home() {
     if (!data.approval?.diffHash || data.approval.diffHash !== previousHash || data.approval.approvalId !== previousApprovalId) setReviewedDiff(false);
     await loadTaskHistory(activeTask.id);
     if (!response.ok && data.error) setTaskError(data.error);
+  }
+
+  async function showSetupCommand(activeTask = task) {
+    if (!activeTask || setupCommandLoading) return;
+    setSetupCommandLoading(true);
+    setTaskError("");
+    try {
+      const response = await humanMutationFetch(`/api/tasks/${activeTask.id}/dependency-recovery-instructions`, "task-dependency-recovery-instructions", { method: "POST" });
+      const data = await response.json() as DependencyRecoveryInstructions;
+      if (!response.ok || !data.command) throw new Error(data.error || "Setup instructions are unavailable");
+      setSetupCommand(data.command);
+    } catch (error) { setTaskError(message(error)); }
+    finally { setSetupCommandLoading(false); }
   }
 
   async function deleteWorktree() {
@@ -440,7 +458,7 @@ export default function Home() {
     {task && ["security_review", "investigation"].includes(task.template.taskType) ? <FindingsPanel task={task} templates={selectedRepo?.templates ?? []} findings={findings} busy={sending || reviewProcessing} onFindings={setFindings} onOpenTask={(id) => void resumePersistedTask(id)} onHistoryRefresh={() => void loadTaskHistory(task.id)} onDashboardRefresh={() => setDashboardRefresh((value) => value + 1)} onError={setTaskError} /> : null}
     {taskDiff && detailTab === "changes" && <section className="diff card"><h2>Review changes</h2><h3>Tracked changed files</h3><pre>{taskDiff.trackedFiles.join("\n") || "None."}</pre><h3>Untracked files</h3><pre>{taskDiff.untrackedFiles.join("\n") || "None."}</pre><h3>Changed lines</h3><pre>{taskDiff.stat || "No tracked changes."}</pre><details><summary>View full diff</summary><pre>{[taskDiff.patch, taskDiff.untrackedPatch].filter(Boolean).join("\n\n") || "No changes."}</pre></details>{taskDiff.blockedReason && <p className="staleReason">{taskDiff.blockedReason}</p>}
       {(task?.validation.length || approvalProcessing) && <div className="validation"><h3>Pre-PR Validation</h3>{task?.validation.map((check, index) => <div className="validationRow" key={`${check.name}-${index}`}><span>{check.name}</span><Status domain="validation" value={check.status} /><span>{check.detail}</span></div>)}{approvalProcessing && <p>Server-side checks and PR creation are running…</p>}</div>}
-      {task && dependencyRecoveryPresentation(task.dependencyRecovery) ? <section className="dependencyRecovery" aria-labelledby="dependency-recovery-title"><span className="eyebrow">Validation recovery</span><h3 id="dependency-recovery-title">Dependencies required</h3><p>Pre-PR validation stopped because this task worktree does not have a complete local dependency tree.</p><p>MultiAgents never installs dependencies automatically. Package installation can run lifecycle scripts, so install dependencies yourself in a terminal for this managed task worktree.</p><button type="button" className="secondary" disabled={approvalProcessing || sending} onClick={() => void refreshDiff(task)}>Recheck approval snapshot</button></section> : null}
+      {task && dependencyRecoveryPresentation(task.dependencyRecovery) ? <section className="dependencyRecovery" aria-labelledby="dependency-recovery-title"><span className="eyebrow">Validation recovery</span><h3 id="dependency-recovery-title">Dependencies required</h3><p>Pre-PR validation stopped because this task worktree does not have a complete local dependency tree.</p><button type="button" className="secondary" disabled={approvalProcessing || sending || setupCommandLoading} onClick={() => void showSetupCommand(task)}>{setupCommandLoading ? "Loading setup command…" : "Show setup command"}</button>{setupCommand ? <div><p><strong>MultiAgents does not run this command.</strong> Package installation may execute lifecycle scripts. Review the command before running it.</p><pre><code>{setupCommand}</code></pre></div> : null}<button type="button" className="secondary" disabled={approvalProcessing || sending} onClick={() => void refreshDiff(task)}>Recheck approval snapshot</button></section> : null}
       {task?.secretFindings.length ? <div className="error"><strong>Secret scan findings</strong><ul>{task.secretFindings.map((finding, index) => <li key={`${finding.path}-${finding.rule}-${index}`}><code>{finding.path}</code>: {finding.rule}</li>)}</ul></div> : null}
       {approval?.diffHash && approval.approvalId && <div className="approval"><p>Review changes ↓ Approve ↓ Validate ↓ Commit ↓ Create PR</p><label><input type="checkbox" checked={reviewedDiff} disabled={sending || approvalProcessing} onChange={(event) => setReviewedDiff(event.target.checked)} /> {task?.approvalPurpose === "rework" ? "I reviewed the revised final diff" : "I reviewed the final diff"}</label><button type="button" disabled={!reviewedDiff || sending || approvalProcessing} onClick={approveFinalDiff}>{approvalProcessing ? "Validating…" : task?.approvalPurpose === "rework" ? "Approve & Update Existing PR" : "Approve & Create PR"}</button><details><summary>Technical approval details</summary><code>{approval.diffHash}</code></details></div>}
       {approval?.blockedReason && <p className="staleReason">{approval.blockedReason}</p>}
