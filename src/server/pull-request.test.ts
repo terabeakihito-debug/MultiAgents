@@ -546,6 +546,22 @@ describe("Phase 5 approval and PR state machine", () => {
     expect(serialized).not.toContain(task.worktreePath);
   });
 
+  it("exposes recoverable dependency guidance without exposing an available managed worktree path", async () => {
+    const { task } = await createRepo();
+    task.dependencyRecovery = "dependency_setup_required";
+    task.recoveryStatus = "recoverable";
+    task.worktreeAvailable = true;
+    task.worktreeStatus = "available";
+
+    const payload = publicTask(task);
+    const serialized = JSON.stringify(payload);
+    const managedRootFragment = task.worktreePath.split("/").find((part) => part.startsWith("multiagents-phase5-"));
+    expect(payload.dependencyRecovery).toEqual({ reason: "dependency_setup_required", recheckAvailable: true });
+    expect(serialized).not.toContain(task.worktreePath);
+    expect(managedRootFragment).toBeTruthy();
+    expect(serialized).not.toContain(managedRootFragment!);
+  });
+
   it("keeps dependency recovery through snapshot recheck, then clears it only after a successful approval validation", async () => {
     const { task, input } = await readyTask({ path: "package.json", content: JSON.stringify({ scripts: { lint: "eslint ." } }) });
     await expect(approveAndCreatePullRequest(task.id, input, successfulDependencies({ checkDependencies: checkTaskDependencies }))).rejects.toThrow("dependencies not installed");

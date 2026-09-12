@@ -1,4 +1,4 @@
-import { mkdtemp, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -6,7 +6,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { cloneGitSeedFixture, createGitSeedFixture, type GitSeedFixture } from "../../test/git-seed-fixture";
 import type { AgentAdapter, AgentId, AgentResult, FlowStep, RerunnableStepId } from "../agents/types";
 import { reconstructReviewRerunRequest, rerunReviewStep } from "../flows/review-rerun";
-import { approveAndCreatePullRequest, prepareApproval, retryPullRequest } from "./pull-request";
+import { approveAndCreatePullRequest, checkTaskDependencies, prepareApproval, ProcessExecutionError, retryPullRequest } from "./pull-request";
 import { runGit } from "./git";
 import { SCHEMA_VERSION, StateStore, replaceStateStoreForTests } from "./state-store";
 import { acquireTaskLock, isTaskLocked, releaseTaskLock } from "./task-lock";
@@ -119,6 +119,132 @@ describe("Phase 8 SQLite state and audit history", () => {
       ],
     });
     expect(getTaskHistory(task.id).events.filter((event) => event.type === "step_rerun")).toHaveLength(4);
+  });
+
+  it("reloads a failed review before manually recovering every persisted step", async () => {
+    const { allowedRoot, task } = await repositoryTask();
+    const flowId = "restart-recovery-flow";
+    const initialSteps: FlowStep[] = [
+      { id: "codex_draft", agent: "codex", role: "draft", status: "error", output: "", error: "Review step budget exhausted." },
+      { id: "cursor_review", agent: "cursor", role: "review", status: "skipped", output: "", error: "Codex draft failed" },
+      { id: "claude_review", agent: "claude", role: "review", status: "skipped", output: "", error: "Codex draft failed" },
+      { id: "codex_final", agent: "codex", role: "final", status: "skipped", output: "", error: "Codex draft failed" },
+    ];
+    beginTaskReview(task, "Recover after restart");
+    recordFlowEvent(task, { type: "flow_started", flowId, timestamp: "2026-01-01T00:00:00.000Z" });
+    recordFlowEvent(task, { type: "flow_completed", flowId, result: { flowId, status: "error", steps: initialSteps, finalOutput: "" } });
+
+    reloadTasksFromStoreForTests();
+    const restored = getTask(task.id)!;
+    expect(restored).toMatchObject({
+      flowId,
+      flowStatus: "error",
+      status: "draft",
+      reviewReady: false,
+      flowSteps: initialSteps,
+    });
+    await resumeTask(task.id, { allowedRoot, worktreeRoot: task.worktreeRoot });
+
+    const calls: Record<AgentId, number> = { codex: 0, cursor: 0, claude: 0 };
+    const adapters: Record<AgentId, AgentAdapter> = {
+      codex: { id: "codex", name: "codex", run: async (): Promise<AgentResult> => ({ agent: "codex", status: "completed", output: ++calls.codex === 1 ? "draft after restart" : "final after restart" }) },
+      cursor: { id: "cursor", name: "cursor", run: async (): Promise<AgentResult> => ({ agent: "cursor", status: "completed", output: (++calls.cursor, "cursor after restart") }) },
+      claude: { id: "claude", name: "claude", run: async (): Promise<AgentResult> => ({ agent: "claude", status: "completed", output: (++calls.claude, "claude after restart") }) },
+    };
+    const rerun = async (stepId: RerunnableStepId) => {
+      const persisted = getTask(task.id)!;
+      const request = reconstructReviewRerunRequest(persisted, stepId);
+      if ("error" in request) throw new Error(request.error);
+      beginTaskRerun(persisted, persisted.prompt);
+      const result = await rerunReviewStep(request, { agents: adapters, onEvent: (event) => recordFlowEvent(persisted, event) });
+      completeTaskReview(persisted, result.status === "completed" && result.stepId === "codex_final" && result.steps[3]?.status === "completed");
+      return result;
+    };
+
+    await rerun("codex_draft");
+    expect(reconstructReviewRerunRequest(getTask(task.id)!, "claude_review")).toEqual({ error: "Missing usable upstream data: cursor_review" });
+    await rerun("cursor_review");
+    await rerun("claude_review");
+    const final = await rerun("codex_final");
+
+    expect(final.steps.every((step) => step.status === "completed")).toBe(true);
+    expect(calls).toEqual({ codex: 2, cursor: 1, claude: 1 });
+    expect(getTask(task.id)).toMatchObject({ status: "awaiting_approval", reviewReady: true });
+    reloadTasksFromStoreForTests();
+    expect(getTask(task.id)).toMatchObject({
+      flowId,
+      flowStatus: "completed",
+      status: "awaiting_approval",
+      reviewReady: true,
+      flowSteps: [
+        { id: "codex_draft", status: "completed", output: "draft after restart" },
+        { id: "cursor_review", status: "completed", output: "cursor after restart" },
+        { id: "claude_review", status: "completed", output: "claude after restart" },
+        { id: "codex_final", status: "completed", output: "final after restart" },
+      ],
+    });
+  });
+
+  it("preserves dependency recovery across restart before a new approval creates a PR", async () => {
+    const { allowedRoot, task } = await repositoryTask();
+    await writeFile(join(task.worktreePath, "package.json"), JSON.stringify({ scripts: { lint: "node -e \"process.exit(0)\"" } }));
+    await writeFile(join(task.worktreePath, "README.md"), "initial\nchange\n");
+    beginTaskReview(task, "Recover dependencies after restart");
+    completeTaskReview(task, true);
+    const first = await prepareApproval(task);
+    const dependencyTreeError = new ProcessExecutionError({ stdout: "", stderr: "", code: 1, signal: null, timedOut: false, stdoutTruncated: false, stderrTruncated: false });
+    await expect(approveAndCreatePullRequest(task.id, {
+      approved: true,
+      approvalId: first.approval!.approvalId!,
+      diffHash: first.approval!.diffHash!,
+    }, {
+      checkDependencies: (value) => checkTaskDependencies(value, async () => { throw dependencyTreeError; }),
+    })).rejects.toThrow("dependencies not installed in task worktree");
+    expect(task.dependencyRecovery).toBe("dependency_setup_required");
+
+    reloadTasksFromStoreForTests();
+    const restored = await resumeTask(task.id, { allowedRoot, worktreeRoot: task.worktreeRoot });
+    expect(restored).toMatchObject({
+      dependencyRecovery: "dependency_setup_required",
+      recoveryStatus: "recoverable",
+      worktreeAvailable: true,
+      worktreeStatus: "available",
+    });
+    await prepareApproval(restored!);
+    expect(restored?.dependencyRecovery).toBe("dependency_setup_required");
+
+    await mkdir(join(restored!.worktreePath, "node_modules"));
+    const next = await prepareApproval(restored!);
+    const commit = vi.fn(async (value: RepoTask) => { await runGit(value.worktreePath, ["add", "--all"]); await runGit(value.worktreePath, ["commit", "-m", "dependency recovery"]); });
+    const push = vi.fn(async () => undefined);
+    const createPr = vi.fn(async () => ({ url: "https://github.com/example/project/pull/73", number: 73 }));
+    await expect(approveAndCreatePullRequest(task.id, {
+      approved: true,
+      approvalId: next.approval!.approvalId!,
+      diffHash: next.approval!.diffHash!,
+    }, {
+      stage: async (value) => { await runGit(value.worktreePath, ["add", "--all"]); },
+      commit,
+      push,
+      checkGhAuth: async () => undefined,
+      createPr,
+      checkDependencies: async () => undefined,
+      runValidation: async () => undefined,
+    })).resolves.toMatchObject({ status: "pr_created", prNumber: 73 });
+    expect(restored?.dependencyRecovery).toBeUndefined();
+    expect(commit).toHaveBeenCalledOnce();
+    expect(push).toHaveBeenCalledOnce();
+    expect(createPr).toHaveBeenCalledOnce();
+
+    reloadTasksFromStoreForTests();
+    expect(getTask(task.id)).toMatchObject({
+      status: "pr_created",
+      prNumber: 73,
+      prUrl: "https://github.com/example/project/pull/73",
+      commitSha: expect.any(String),
+      approvalState: "used",
+      dependencyRecovery: undefined,
+    });
   });
 
   it("releases the cleanup lease when cleanup persistence fails", async () => {
