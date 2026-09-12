@@ -33,6 +33,7 @@ import {
   getTaskDiff,
   getTaskHistory,
   publicTask,
+  recordFlowEvent,
   transitionTask,
   type RepoTask,
 } from "./tasks";
@@ -40,6 +41,8 @@ import { getStateStore } from "./state-store";
 import { acquireTaskLock, releaseTaskLock } from "./task-lock";
 import { activeChildProcesses, resetChildProcessRegistryForTests } from "./child-process-registry";
 import { OsSandboxUnavailableError } from "./os-sandbox";
+import { runReviewFlow } from "../flows/review";
+import type { AgentAdapter } from "../agents/types";
 
 const roots: string[] = [];
 
@@ -134,6 +137,83 @@ describe("Phase 5 approval and PR state machine", () => {
     expect(await runGit(task.worktreePath, ["branch", "--show-current"])).toBe(task.branch);
     expect(await runGit(task.worktreePath, ["status", "--porcelain"])).toBe("");
     await expect(approveAndCreatePullRequest(task.id, input, successfulDependencies())).rejects.toThrow("not awaiting approval");
+  });
+
+  it("completes a browserless task review through approval, commit, push, and PR creation", async () => {
+    const { task, repoPath } = await createRepo(undefined, {
+      "package.json": JSON.stringify({ scripts: { test: "node -e \"process.exit(0)\"" } }),
+    });
+    const prompt = "Add a short happy-path note";
+    await writeFile(join(task.worktreePath, "happy-path.md"), "# Happy path\n");
+
+    const codex = vi.fn(async () => ({ agent: "codex" as const, status: "completed" as const, output: "codex completed" }));
+    const cursor = vi.fn(async () => ({ agent: "cursor" as const, status: "completed" as const, output: "cursor completed" }));
+    const claude = vi.fn(async () => ({ agent: "claude" as const, status: "completed" as const, output: "claude completed" }));
+    const adapters: Record<"codex" | "cursor" | "claude", AgentAdapter> = {
+      codex: { id: "codex", name: "codex", run: codex },
+      cursor: { id: "cursor", name: "cursor", run: cursor },
+      claude: { id: "claude", name: "claude", run: claude },
+    };
+
+    beginTaskReview(task, prompt);
+    const flow = await runReviewFlow(prompt, {
+      agents: adapters,
+      cwd: task.worktreePath,
+      repositoryReadOnly: false,
+      getDiff: async () => (await getTaskDiff(task)).patch,
+      fingerprint: async () => (await createDiffSnapshot(task)).hash,
+      onEvent: (event) => recordFlowEvent(task, event),
+    });
+    completeTaskReview(task, flow.status === "completed" && flow.steps[3]?.status === "completed");
+
+    expect(flow.status).toBe("completed");
+    expect(codex).toHaveBeenCalledTimes(2);
+    expect(cursor).toHaveBeenCalledOnce();
+    expect(claude).toHaveBeenCalledOnce();
+    expect(task.status).toBe("awaiting_approval");
+    expect(task.flowSteps).toHaveLength(4);
+
+    const prepared = await prepareApproval(task);
+    const approval = prepared.approval;
+    if (!approval?.approvalId || !approval.diffHash) throw new Error("Approval was not prepared");
+    const push = vi.fn(async (received: RepoTask) => {
+      expect(received.branch).toBe(`multiagents/${received.id}`);
+    });
+    const createPr = vi.fn(async (_received: RepoTask, remote: { owner: string; repo: string }) => ({
+      number: 73,
+      url: `https://github.com/${remote.owner}/${remote.repo}/pull/73`,
+    }));
+    const checkDependencies = vi.fn(async () => undefined);
+    const runValidation = vi.fn(async () => undefined);
+
+    const result = await approveAndCreatePullRequest(task.id, {
+      approved: true,
+      approvalId: approval.approvalId,
+      diffHash: approval.diffHash,
+    }, successfulDependencies({ push, createPr, checkDependencies, runValidation }));
+
+    expect(result).toMatchObject({
+      status: "pr_created",
+      approvalState: "used",
+      prNumber: 73,
+      prUrl: "https://github.com/example/project/pull/73",
+      commitSha: expect.any(String),
+    });
+    expect(checkDependencies).toHaveBeenCalledOnce();
+    expect(runValidation).toHaveBeenCalledOnce();
+    expect(push).toHaveBeenCalledOnce();
+    expect(createPr).toHaveBeenCalledOnce();
+    expect(await runGit(repoPath, ["branch", "--show-current"])).toBe("main");
+    expect(await runGit(task.worktreePath, ["status", "--porcelain"])).toBe("");
+
+    const persisted = getStateStore().loadTasks().find((candidate) => candidate.id === task.id);
+    expect(persisted).toMatchObject({
+      status: "pr_created",
+      approvalState: "used",
+      prNumber: 73,
+      prUrl: "https://github.com/example/project/pull/73",
+      commitSha: result.commitSha,
+    });
   });
 
   it("rejects a changed worktree hash before staging", async () => {
