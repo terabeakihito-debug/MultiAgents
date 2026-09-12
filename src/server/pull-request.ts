@@ -63,6 +63,18 @@ export const VALIDATION_TIMEOUT_MS: Readonly<Record<ValidationScript, number>> =
   build: 120_000,
 };
 
+/** Builds the restricted environment supplied to a validation subprocess. */
+export function validationChildEnvironment(
+  script: ValidationScript,
+  baseEnv: Readonly<Record<string, string | undefined>> = process.env,
+): NodeJS.ProcessEnv {
+  return buildChildProcessEnv({
+    purpose: "validation",
+    baseEnv,
+    overrides: script === "build" ? { NODE_ENV: "production" } : undefined,
+  });
+}
+
 export type FixedProcessResult = {
   stdout: string;
   stderr: string;
@@ -778,11 +790,11 @@ export async function checkTaskDependencies(task: RepoTask) {
 
 export async function runValidationCommand(task: RepoTask, script: ValidationScript, timeoutMs = VALIDATION_TIMEOUT_MS[script]) {
   const npm = npmInvocation(script);
-  const envOverrides: NodeJS.ProcessEnv | undefined = script === "build" ? { NODE_ENV: "production" } : undefined;
+  const environment = validationChildEnvironment(script);
   try {
     await assertOsSandboxAvailable();
     recordValidationSandboxAudit(task, "os_sandbox_created", "enforced");
-    await checkedProcess(npm.binary, npm.args, task.worktreePath, timeoutMs, envOverrides);
+    await checkedProcess(npm.binary, npm.args, task.worktreePath, timeoutMs, undefined, environment);
   } catch (error) {
     if (error instanceof OsSandboxUnavailableError) {
       recordValidationSandboxAudit(task, "os_sandbox_failed", "blocked", error.failureCode);
@@ -1093,8 +1105,8 @@ async function runFixedProcessWithEnv(binary: string, args: readonly string[], c
   });
 }
 
-async function checkedProcess(binary: string, args: readonly string[], cwd: string, timeoutMs: number, envOverrides?: NodeJS.ProcessEnv) {
-  const result = await runFixedProcessWithEnv(binary, args, cwd, timeoutMs, envOverrides);
+async function checkedProcess(binary: string, args: readonly string[], cwd: string, timeoutMs: number, envOverrides?: NodeJS.ProcessEnv, exactEnv?: NodeJS.ProcessEnv) {
+  const result = await runFixedProcessWithEnv(binary, args, cwd, timeoutMs, envOverrides, exactEnv);
   if (result.timedOut || result.code !== 0) throw new ProcessExecutionError(result);
   return result;
 }

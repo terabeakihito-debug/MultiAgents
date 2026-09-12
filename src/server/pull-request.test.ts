@@ -20,6 +20,7 @@ import {
   scanSecrets,
   summarizeStderr,
   validateSnapshotForHumanApproval,
+  validationChildEnvironment,
   VALIDATION_TIMEOUT_MS,
   validateGitHubRemote,
   type ApprovalDependencies,
@@ -37,14 +38,13 @@ import {
 import { getStateStore } from "./state-store";
 import { acquireTaskLock, releaseTaskLock } from "./task-lock";
 import { activeChildProcesses, resetChildProcessRegistryForTests } from "./child-process-registry";
-import { buildChildProcessEnv } from "./child-process-env";
 
 const roots: string[] = [];
 
-function runValidationChild(args: readonly string[], cwd: string, timeoutMs: number, overrides?: NodeJS.ProcessEnv) {
+function runValidationChild(args: readonly string[], cwd: string, timeoutMs: number) {
   return runHardenedProcess({
     binary: process.execPath, args, cwd, timeoutMs, purpose: "validation", terminateOnOutput: false,
-    env: buildChildProcessEnv({ purpose: "validation", overrides }),
+    env: validationChildEnvironment("test"),
   });
 }
 
@@ -402,9 +402,20 @@ describe("Phase 5 approval and PR state machine", () => {
     expect(task.status).toBe("validation_failed");
   });
 
-  it("passes production NODE_ENV to a non-sandbox validation child", async () => {
-    const worktreePath = await createRoot();
-    await expect(runValidationChild(["-e", "if (process.env.NODE_ENV !== 'production') process.exit(23)"], worktreePath, 5_000, { NODE_ENV: "production" })).resolves.toMatchObject({ code: 0, timedOut: false });
+  it("constructs build validation environment with production NODE_ENV", () => {
+    const serverEnvironment = {
+      PATH: "/usr/bin",
+      NODE_ENV: "development",
+      MULTIAGENTS_SLACK_WEBHOOK_URL: "must-not-leak",
+    };
+    expect(validationChildEnvironment("build", serverEnvironment)).toMatchObject({
+      PATH: "/usr/bin",
+      NODE_ENV: "production",
+    });
+    expect(validationChildEnvironment("build", serverEnvironment)).not.toHaveProperty("MULTIAGENTS_SLACK_WEBHOOK_URL");
+    for (const script of ["test", "lint", "typecheck"] as const) {
+      expect(validationChildEnvironment(script, serverEnvironment).NODE_ENV).toBe("development");
+    }
     expect(VALIDATION_TIMEOUT_MS.build).toBe(120_000);
     expect(VALIDATION_TIMEOUT_MS.build).toBeGreaterThan(VALIDATION_TIMEOUT_MS.test);
   });
