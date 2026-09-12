@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { cloneGitSeedFixture, createGitSeedFixture, type GitSeedFixture } from "../../test/git-seed-fixture";
 import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,7 +8,6 @@ import { StateStore, replaceStateStoreForTests } from "./state-store";
 import { createStateBackup } from "./state-backup";
 import { createTask, clearTasksForTests, deleteTask, persistTask, type RepoTask } from "./tasks";
 import { acquireTaskLock, releaseTaskLock } from "./task-lock";
-import { runGit } from "./git";
 import { reconcileUnfinishedOperations } from "./operation-reconciliation";
 import { inspectWorktrees } from "./operational-health";
 import { requireHumanMutation } from "./request-security";
@@ -40,11 +40,12 @@ describe("Phase 20C retention candidates", () => {
   });
 });
 
-let root: string; let repo: string; let worktrees: string; let backups: string;
+let root: string; let repo: string; let worktrees: string; let backups: string; let gitSeed: GitSeedFixture;
+beforeAll(async () => { gitSeed = await createGitSeedFixture({ ".gitignore": "node_modules\n", "README.md": "fixture\n" }); });
+afterAll(async () => { await gitSeed.cleanup(); });
 async function fixture() {
   root = await mkdtemp(join(tmpdir(), "multiagents-retention-")); repo = join(root, "code", "project"); worktrees = join(root, "worktrees"); backups = join(root, "backups");
-  await mkdir(repo, { recursive: true }); await runGit(repo, ["init", "-b", "main"]); await runGit(repo, ["config", "user.email", "test@example.com"]); await runGit(repo, ["config", "user.name", "Test"]);
-  await writeFile(join(repo, ".gitignore"), "node_modules\n"); await writeFile(join(repo, "README.md"), "fixture\n"); await runGit(repo, ["add", "."]); await runGit(repo, ["commit", "-m", "fixture"]);
+  await cloneGitSeedFixture(gitSeed, repo, "https://github.com/example/project.git");
   store = new StateStore(join(root, "state.db")); replaceStateStoreForTests(store); clearTasksForTests();
   return createTask("project", { allowedRoot: join(root, "code"), worktreeRoot: worktrees, prompt: "fixture" });
 }
