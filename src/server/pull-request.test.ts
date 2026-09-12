@@ -15,13 +15,12 @@ import {
   isTaskLockedForTests,
   prepareApproval,
   ProcessExecutionError,
-  runFixedProcess,
   runHardenedProcess,
   runServerGitMutation,
-  runValidationCommand,
   scanSecrets,
   summarizeStderr,
   validateSnapshotForHumanApproval,
+  validationChildEnvironment,
   VALIDATION_TIMEOUT_MS,
   validateGitHubRemote,
   type ApprovalDependencies,
@@ -41,6 +40,13 @@ import { acquireTaskLock, releaseTaskLock } from "./task-lock";
 import { activeChildProcesses, resetChildProcessRegistryForTests } from "./child-process-registry";
 
 const roots: string[] = [];
+
+function runValidationChild(args: readonly string[], cwd: string, timeoutMs: number) {
+  return runHardenedProcess({
+    binary: process.execPath, args, cwd, timeoutMs, purpose: "validation", terminateOnOutput: false,
+    env: validationChildEnvironment("test"),
+  });
+}
 
 async function createRoot() {
   const value = await mkdtemp(join(tmpdir(), "multiagents-phase5-"));
@@ -396,12 +402,20 @@ describe("Phase 5 approval and PR state machine", () => {
     expect(task.status).toBe("validation_failed");
   });
 
-  it("runs build with a production NODE_ENV inherited over the server environment", async () => {
-    const worktreePath = await createRoot();
-    await writeFile(join(worktreePath, "package.json"), JSON.stringify({
-      scripts: { build: "node -e \"if (process.env.NODE_ENV !== 'production') process.exit(23)\"" },
-    }));
-    await expect(runValidationCommand({ worktreePath } as RepoTask, "build")).resolves.toBeUndefined();
+  it("constructs build validation environment with production NODE_ENV", () => {
+    const serverEnvironment = {
+      PATH: "/usr/bin",
+      NODE_ENV: "development",
+      MULTIAGENTS_SLACK_WEBHOOK_URL: "must-not-leak",
+    };
+    expect(validationChildEnvironment("build", serverEnvironment)).toMatchObject({
+      PATH: "/usr/bin",
+      NODE_ENV: "production",
+    });
+    expect(validationChildEnvironment("build", serverEnvironment)).not.toHaveProperty("MULTIAGENTS_SLACK_WEBHOOK_URL");
+    for (const script of ["test", "lint", "typecheck"] as const) {
+      expect(validationChildEnvironment(script, serverEnvironment).NODE_ENV).toBe("development");
+    }
     expect(VALIDATION_TIMEOUT_MS.build).toBe(120_000);
     expect(VALIDATION_TIMEOUT_MS.build).toBeGreaterThan(VALIDATION_TIMEOUT_MS.test);
   });
@@ -438,14 +452,14 @@ describe("Phase 5 approval and PR state machine", () => {
 
   it("bounds captured process output without changing a successful exit", async () => {
     const cwd = await createRoot();
-    const result = await runFixedProcess(process.execPath, ["-e", "require('node:fs').writeSync(1, Buffer.alloc(250000, 'x'))"], cwd, 5_000);
+    const result = await runValidationChild(["-e", "require('node:fs').writeSync(1, Buffer.alloc(250000, 'x'))"], cwd, 5_000);
     expect(result).toMatchObject({ code: 0, timedOut: false, stdoutTruncated: true });
     expect(Buffer.byteLength(result.stdout)).toBe(200_000);
   });
 
   it("terminates a timed-out process and waits for its close state", async () => {
     const cwd = await createRoot();
-    const result = await runFixedProcess(process.execPath, ["-e", "setInterval(() => undefined, 1000)"], cwd, 20);
+    const result = await runValidationChild(["-e", "setInterval(() => undefined, 1000)"], cwd, 20);
     expect(result.timedOut).toBe(true);
     expect(result.signal).toBe("SIGTERM");
   });

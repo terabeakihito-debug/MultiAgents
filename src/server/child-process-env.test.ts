@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildChildProcessEnv, buildServerGitMutationEnv, type ChildProcessPurpose } from "./child-process-env";
-import { runFixedProcess } from "./pull-request";
+import { runHardenedProcess } from "./pull-request";
 
 const fixture = "TEST_SECRET_DO_NOT_LEAK";
 const parent = {
@@ -44,15 +44,12 @@ describe("Phase 16 child process environment isolation", () => {
   });
 
   it("does not expose the Slack secret to a validation subprocess", async () => {
-    const previous = process.env.MULTIAGENTS_SLACK_WEBHOOK_URL;
-    process.env.MULTIAGENTS_SLACK_WEBHOOK_URL = fixture;
-    try {
-      const result = await runFixedProcess(process.execPath, ["-e", "require('node:fs').writeSync(1, process.env.MULTIAGENTS_SLACK_WEBHOOK_URL || 'ABSENT')"], process.cwd(), 5_000);
-      expect(result).toMatchObject({ code: 0, timedOut: false, stdout: "ABSENT" });
-    } finally {
-      if (previous === undefined) delete process.env.MULTIAGENTS_SLACK_WEBHOOK_URL;
-      else process.env.MULTIAGENTS_SLACK_WEBHOOK_URL = previous;
-    }
+    const env = buildChildProcessEnv({ purpose: "validation", baseEnv: { ...process.env, MULTIAGENTS_SLACK_WEBHOOK_URL: fixture } });
+    const result = await runHardenedProcess({
+      binary: process.execPath, args: ["-e", "require('node:fs').writeSync(1, process.env.MULTIAGENTS_SLACK_WEBHOOK_URL || 'ABSENT')"],
+      cwd: process.cwd(), env, purpose: "validation", timeoutMs: 5_000, terminateOnOutput: false,
+    });
+    expect(result).toMatchObject({ code: 0, timedOut: false, stdout: "ABSENT" });
   });
 
   it("cannot reintroduce a secret through overrides", () => {
