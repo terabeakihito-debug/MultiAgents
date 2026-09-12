@@ -1,15 +1,24 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { agents } from "../agents";
 import { claudeAgent } from "../agents/claude";
 import { codexAgent } from "../agents/codex";
 import { cursorAgent } from "../agents/cursor";
-import { buildGenericRuntimePolicy } from "./runtime-policy";
+import { MAX_FLOW_MS, reviewStepActualBudgetMs, runReviewFlow } from "../flows/review";
+import { withRuntimeBindingRootForTests } from "./immutable-executable-binding";
 import { runGit } from "./git";
+import { createDiffSnapshot } from "./pull-request";
+import { providerDiagnostics } from "./provider-diagnostics";
+import { buildGenericRuntimePolicy } from "./runtime-policy";
+import { StateStore, replaceStateStoreForTests } from "./state-store";
+import { prepareTaskRuntime, taskRuntimeExecutor } from "./task-runtime";
+import { beginTaskReview, clearTasksForTests, completeTaskReview, createTask, executionPromptForTask, executionRootForTask, getTaskDiff, getTaskHistory, recordFlowEvent } from "./tasks";
 
 const enabled = process.env.MULTIAGENTS_PROVIDER_ACCEPTANCE === "1";
 const cursorLifecycleEnabled = process.env.MULTIAGENTS_CURSOR_LIFECYCLE_ACCEPTANCE === "1";
+const fullReviewEnabled = enabled && process.env.MULTIAGENTS_FULL_REVIEW_ACCEPTANCE === "1";
 
 describe.runIf(enabled)("Phase 18 provider authentication acceptance", () => {
   let worktree: string;
@@ -95,5 +104,109 @@ describe.runIf(enabled)("Phase 18 provider authentication acceptance", () => {
     const result = await claudeAgent.run("Reply with exactly CLAUDE_PHASE18_OK", { policy: buildGenericRuntimePolicy("claude", worktree) });
     expect(result).toMatchObject({ status: "completed" });
     expect(result.output).toContain("CLAUDE_PHASE18_OK");
+  }, 180_000);
+
+  it.runIf(fullReviewEnabled)("runs the complete production review flow with all three real providers", async (context) => {
+    const root = await mkdtemp(join(tmpdir(), "multiagents-provider-full-review-"));
+    const suppressProviderDiagnostics = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const allowedRoot = join(root, "projects");
+    const repoPath = join(allowedRoot, "provider-review");
+    const worktreeRoot = join(root, "worktrees");
+    replaceStateStoreForTests(new StateStore(join(root, "state.db")));
+    clearTasksForTests();
+    try {
+      await mkdir(repoPath, { recursive: true });
+      await runGit(repoPath, ["init", "-b", "main"]);
+      await runGit(repoPath, ["config", "user.email", "provider-flow@example.com"]);
+      await runGit(repoPath, ["config", "user.name", "Provider Flow Acceptance"]);
+      await writeFile(join(repoPath, "README.md"), "Synthetic provider review fixture.\n");
+      await runGit(repoPath, ["add", "README.md"]);
+      await runGit(repoPath, ["commit", "-m", "provider review fixture"]);
+      await runGit(repoPath, ["remote", "add", "origin", "https://github.com/example/provider-review.git"]);
+
+      const task = await createTask("provider-review", {
+        allowedRoot,
+        worktreeRoot,
+        templateId: "bug_fix",
+        prompt: "Review the synthetic task and return a concise result. Do not commit, push, create a pull request, or access credentials.",
+      });
+      const diagnostics = await providerDiagnostics({ cwd: task.worktreePath, force: true });
+      const unavailable = diagnostics.filter((diagnostic) => diagnostic.status === "missing" || diagnostic.status === "credential_unavailable");
+      if (unavailable.length) {
+        context.skip(`Provider acceptance unavailable: ${unavailable.map((diagnostic) => diagnostic.provider).join(",")}`);
+        return;
+      }
+      for (const diagnostic of diagnostics) {
+        expect(["supported", "supported_with_warning"]).toContain(diagnostic.status);
+      }
+
+      const prompt = task.prompt;
+      beginTaskReview(task, prompt);
+      const startedAt = Date.now();
+      const result = await withRuntimeBindingRootForTests(join(root, "provider-bindings"), async () => {
+        const runtime = await prepareTaskRuntime(task);
+        expect(runtime.policies.codex).toMatchObject({ role: "implement", allowWrite: true, osSandboxProfile: "agent_implement" });
+        expect(runtime.policies.cursor).toMatchObject({ role: "review_only", allowWrite: false, osSandboxProfile: "agent_read_only" });
+        expect(runtime.policies.claude).toMatchObject({ role: "review_only", allowWrite: false, osSandboxProfile: "agent_read_only" });
+        return runReviewFlow(executionPromptForTask(task, prompt), {
+          cwd: executionRootForTask(task),
+          roles: task.template!.roles,
+          repositoryReadOnly: task.template!.readOnly,
+          runtimePolicies: runtime.policies,
+          executeAgent: taskRuntimeExecutor(runtime, agents),
+          fingerprint: async () => (await createDiffSnapshot(task)).hash,
+          getDiff: async () => {
+            const diff = await getTaskDiff(task);
+            return [diff.patch, diff.untrackedPatch].filter(Boolean).join("\n\n");
+          },
+          onEvent: (event) => recordFlowEvent(task, event),
+        });
+      });
+      const totalDurationMs = Date.now() - startedAt;
+      const failures = result.steps
+        .filter((step) => step.status !== "completed")
+        .map((step) => `${step.id}:${step.status}:${step.durationMs ?? 0}:${step.terminationReason ?? "none"}`);
+      if (result.status !== "completed" || failures.length) {
+        throw new Error(`Provider full review flow failed (${failures.join(",") || "flow_not_completed"})`);
+      }
+      expect(result.steps.map((step) => step.id)).toEqual(["codex_draft", "cursor_review", "claude_review", "codex_final"]);
+      expect(result.finalOutput.length).toBeGreaterThan(0);
+      expect(totalDurationMs).toBeLessThan(MAX_FLOW_MS);
+
+      const lifecycle = getTaskHistory(task.id).events.filter((event) => event.type === "agent_lifecycle_recorded");
+      expect(lifecycle.map((event) => event.stepId)).toEqual(["codex_draft", "cursor_review", "claude_review", "codex_final"]);
+      const flowStartedAt = Math.min(...result.steps.map((step) => Date.parse(step.startedAt!)));
+      const stepTelemetry: Array<{ stepId: string; provider: string; durationMs: number; workDurationMs: number; workBudgetMs: number; terminationReason?: string; spawnedAt: string; childClosedAt: string }> = [];
+      for (const step of result.steps) {
+        const entry = lifecycle.find((event) => event.stepId === step.id);
+        const telemetry = entry?.metadata?.lifecycle;
+        if (!telemetry?.childClosedAt || !step.startedAt) throw new Error(`Provider lifecycle metadata missing for ${step.id}`);
+        const workDurationMs = Date.parse(telemetry.childClosedAt) - Date.parse(step.startedAt);
+        const budgetMs = reviewStepActualBudgetMs(step.id, flowStartedAt + MAX_FLOW_MS, Date.parse(step.startedAt));
+        if (workDurationMs < 0 || workDurationMs > budgetMs) {
+          throw new Error(`Provider step work budget failed (${step.id}:${workDurationMs}:${budgetMs}:${telemetry.terminationReason ?? "none"})`);
+        }
+        expect(telemetry.terminationReason).toBeUndefined();
+        expect(telemetry.exitSignal).toBeUndefined();
+        stepTelemetry.push({
+          stepId: step.id,
+          provider: step.agent,
+          durationMs: step.durationMs ?? 0,
+          workDurationMs,
+          workBudgetMs: budgetMs,
+          terminationReason: telemetry.terminationReason,
+          spawnedAt: telemetry.spawnedAt,
+          childClosedAt: telemetry.childClosedAt,
+        });
+      }
+      completeTaskReview(task, result.steps[3]?.status === "completed");
+      expect(task).toMatchObject({ status: "awaiting_approval", reviewReady: true, flowStatus: "completed" });
+      console.info("provider_full_review_acceptance", JSON.stringify({ status: result.status, totalDurationMs, steps: stepTelemetry }));
+    } finally {
+      suppressProviderDiagnostics.mockRestore();
+      clearTasksForTests();
+      replaceStateStoreForTests(new StateStore(":memory:"));
+      await rm(root, { recursive: true, force: true });
+    }
   }, 180_000);
 });
