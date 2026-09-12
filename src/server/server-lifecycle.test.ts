@@ -1,5 +1,13 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { lifecycleState } from "./operation-registry";
+const ownershipSocketName = vi.hoisted(() => `\0multiagents-test-ownership-server-lifecycle-${process.pid}-${crypto.randomUUID()}`);
+vi.mock("./server-ownership-socket.mjs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./server-ownership-socket.mjs")>();
+  return {
+    ...actual,
+    getServerOwnershipSocketName: (processRef?: NodeJS.Process) => processRef === undefined ? ownershipSocketName : actual.getServerOwnershipSocketName(processRef),
+  };
+});
 import { abortServerStartup, hasActiveServerOwnershipLease, installServerLifecycle } from "./server-lifecycle";
 import { probeAbstractUnixSocketCapability, reportUnavailableAbstractUnixSocketCapability } from "../../test/abstract-unix-socket-capability";
 

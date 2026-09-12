@@ -2,9 +2,18 @@ import { fork } from "node:child_process";
 import { mkdtemp, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { probeAbstractUnixSocketCapability, reportUnavailableAbstractUnixSocketCapability } from "../../test/abstract-unix-socket-capability";
 import { getEffectiveUid, getServerOwnershipSocketName } from "./server-ownership-socket.mjs";
+
+const ownershipSocketName = vi.hoisted(() => `\0multiagents-test-ownership-server-instance-lock-${process.pid}-${crypto.randomUUID()}`);
+vi.mock("./server-ownership-socket.mjs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./server-ownership-socket.mjs")>();
+  return {
+    ...actual,
+    getServerOwnershipSocketName: (processRef?: NodeJS.Process) => processRef === undefined ? ownershipSocketName : actual.getServerOwnershipSocketName(processRef),
+  };
+});
 import { acquireServerInstanceLock, SERVER_INSTANCE_SOCKET_NAME, ServerInstanceLockedError } from "./server-instance-lock";
 
 const children: ReturnType<typeof fork>[] = [], directories: string[] = [];
