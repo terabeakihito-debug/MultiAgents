@@ -8,7 +8,7 @@
     "start": "NODE_ENV=production node server.mjs",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "vitest run --config vitest.heavy.config.ts && vitest run --config vitest.light.config.ts",
     "state:restore": "node scripts/state-restore.mjs"
   },
   "dependencies": {
