@@ -24,7 +24,7 @@ let store: StateStore;
 const execFile = promisify(execFileCallback);
 const abstractUnixSocketCapability = await probeAbstractUnixSocketCapability();
 reportUnavailableAbstractUnixSocketCapability(abstractUnixSocketCapability);
-const ownershipIntegrationIt = abstractUnixSocketCapability.available ? it : it.skip;
+const ownershipIntegrationIt = it;
 
 beforeEach(async () => {
   fixtureRoot = await mkdtemp(join(tmpdir(), "multiagents-phase19-"));
@@ -217,7 +217,7 @@ describe("Phase 19 backup, compatibility, diagnostics, disk and drain", () => {
     migrated.close();
   });
 
-  ownershipIntegrationIt(abstractUnixSocketCapability.available ? "restores a verified backup only while the server is offline" : `restores a verified backup only while the server is offline [host capability unavailable: ${abstractUnixSocketCapability.reason}]`, async () => {
+  ownershipIntegrationIt("restores a verified backup only while the server is offline", async () => {
     const restoreHome = join(fixtureRoot, "restore-home");
     const restoreStateDirectory = join(restoreHome, ".multiagents");
     const restorePath = join(restoreStateDirectory, "state.db");
@@ -233,7 +233,12 @@ describe("Phase 19 backup, compatibility, diagnostics, disk and drain", () => {
     restoreStore.close();
 
     await expect(execFile(process.execPath, ["scripts/state-restore.mjs", backup.backupId], {
-      cwd: process.cwd(), env: { ...process.env, HOME: restoreHome },
+      cwd: process.cwd(), env: {
+        ...process.env,
+        HOME: restoreHome,
+        NODE_ENV: "test",
+        MULTIAGENTS_TEST_OWNERSHIP_SOCKET: `/tmp/multiagents-test-ownership-restore-${crypto.randomUUID()}.sock`,
+      },
     })).resolves.toBeDefined();
     const restored = new StateStore(restorePath);
     expect(restored.loadNotification(saved.notificationId)).toMatchObject({ title: "Saved" });
