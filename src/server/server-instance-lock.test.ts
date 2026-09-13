@@ -6,13 +6,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { probeAbstractUnixSocketCapability, reportUnavailableAbstractUnixSocketCapability } from "../../test/abstract-unix-socket-capability";
 import { getEffectiveUid, getServerOwnershipSocketName } from "./server-ownership-socket.mjs";
 
-const ownershipSocketName = vi.hoisted(() => `\0multiagents-test-ownership-server-instance-lock-${process.pid}-${crypto.randomUUID()}`);
-vi.mock("./server-ownership-socket.mjs", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("./server-ownership-socket.mjs")>();
-  return {
-    ...actual,
-    getServerOwnershipSocketName: (processRef?: NodeJS.Process) => processRef === undefined ? ownershipSocketName : actual.getServerOwnershipSocketName(processRef),
-  };
+const ownershipSocketName = vi.hoisted(() => {
+  const namespace = `multiagents-test-ownership-server-instance-lock-${process.pid}-${crypto.randomUUID()}`;
+  Object.assign(process.env, { NODE_ENV: "test", MULTIAGENTS_TEST_OWNERSHIP_SOCKET: namespace });
+  return `\0${namespace}`;
 });
 import { acquireServerInstanceLock, SERVER_INSTANCE_SOCKET_NAME, ServerInstanceLockedError } from "./server-instance-lock";
 
@@ -64,5 +61,6 @@ it("uses one effective-UID socket identity shared with offline restore", async (
   const identity = { geteuid: () => 4242, getuid: () => 1 };
   expect(getEffectiveUid(identity)).toBe(4242);
   expect(getServerOwnershipSocketName(identity)).toBe("\0multiagents-server-v1-4242");
-  expect(SERVER_INSTANCE_SOCKET_NAME).toBe(getServerOwnershipSocketName());
+  expect(SERVER_INSTANCE_SOCKET_NAME).toBe(ownershipSocketName);
+  expect(getServerOwnershipSocketName({ geteuid: () => 4242, env: { NODE_ENV: "test", MULTIAGENTS_TEST_OWNERSHIP_SOCKET: "malformed" } })).toBe("\0multiagents-server-v1-4242");
 });
