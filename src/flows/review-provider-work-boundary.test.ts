@@ -86,4 +86,33 @@ describe("review provider-work budget boundary", () => {
       vi.useRealTimers();
     }
   });
+
+  it("rejects provider work synchronously when preflight consumes the remaining reservation", async () => {
+    vi.useFakeTimers();
+    let providerWorkEntered = false;
+    try {
+      const result = await runReviewFlow("request", {
+        executeAgent: async (agent, _prompt, signal, stepId, onProviderWorkStart) => {
+          if (stepId !== "codex_draft") return completed(agent, "unused");
+          await vi.advanceTimersByTimeAsync(106_000);
+          const allowed = onProviderWorkStart?.();
+          if (allowed === false) return { agent, status: "error", output: "", error: "rejected before provider work" };
+          providerWorkEntered = true;
+          return signal.aborted
+            ? { agent, status: "error", output: "", error: "aborted" }
+            : completed(agent, "unexpected");
+        },
+      });
+
+      expect(providerWorkEntered).toBe(false);
+      expect(result.status).toBe("error");
+      expect(result.steps[0]).toMatchObject({
+        status: "error",
+        terminationReason: "step_budget_exhausted",
+        error: "Review step budget exhausted.",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
