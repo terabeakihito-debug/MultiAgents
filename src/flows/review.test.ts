@@ -26,12 +26,13 @@ describe("runReviewFlow", () => {
     expect(reviewStepActualBudgetMs("codex_draft", deadline, 0)).toBe(90_000);
     expect(reviewStepActualBudgetMs("cursor_review", deadline, 100_000)).toBeGreaterThanOrEqual(45_000);
     expect(reviewStepActualBudgetMs("claude_review", deadline, 155_000)).toBeGreaterThanOrEqual(45_000);
-    expect(reviewStepActualBudgetMs("codex_final", deadline, 210_000)).toBeGreaterThanOrEqual(60_000);
+    expect(reviewStepActualBudgetMs("codex_final", deadline, 210_000)).toBeGreaterThanOrEqual(45_000);
   });
 
-  it("reuses unused cleanup reserve and never exceeds the work ceiling", () => {
+  it("rebalances recovered time toward review steps without exceeding the work ceiling", () => {
     const deadline = 300_000;
-    expect(reviewStepActualBudgetMs("cursor_review", deadline, 90_000)).toBe(55_000);
+    expect(reviewStepActualBudgetMs("cursor_review", deadline, 90_000)).toBe(70_000);
+    expect(reviewStepActualBudgetMs("claude_review", deadline, 150_000)).toBe(65_000);
     expect(reviewStepActualBudgetMs("cursor_review", deadline, 0)).toBe(STEP_WORK_CEILING_MS);
     expect(reviewStepActualBudgetMs("codex_final", deadline, 271_000)).toBeLessThanOrEqual(0);
   });
@@ -77,6 +78,7 @@ describe("runReviewFlow", () => {
   it("continues without an unavailable Cursor review", async () => {
     const { adapters, calls } = setup({ codex: [ok("codex", "draft"), ok("codex", "final")], cursor: [fail("cursor")], claude: [ok("claude", "second")] });
     const result = await runReviewFlow("request", { agents: adapters });
+    expect(result.status).toBe("error");
     expect(result.steps.map((step) => step.status)).toEqual(["completed", "error", "completed", "completed"]);
     expect(calls.claude[0]).toContain("Cursor review unavailable due to execution error.");
     expect(calls.codex[1]).toContain("Cursor review unavailable due to execution error.");
@@ -93,6 +95,7 @@ describe("runReviewFlow", () => {
   it("continues to final after a Claude failure", async () => {
     const { adapters, calls } = setup({ codex: [ok("codex", "draft"), ok("codex", "final")], cursor: [ok("cursor", "first")], claude: [fail("claude")] });
     const result = await runReviewFlow("request", { agents: adapters });
+    expect(result.status).toBe("error");
     expect(result.steps.map((step) => step.status)).toEqual(["completed", "completed", "error", "completed"]);
     expect(calls.codex[1]).toContain("Claude review unavailable due to execution error.");
   });
