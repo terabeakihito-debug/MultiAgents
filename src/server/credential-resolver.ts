@@ -6,7 +6,7 @@ import {
   type CredentialStatusView,
 } from "../credentials/types";
 
-type EnvironmentRegistryEntry = { source: "environment"; envName: string };
+type EnvironmentRegistryEntry = { source: "environment"; envName: string; redactMinLength?: number };
 type ExternalRegistryEntry = { source: "external_cli" };
 type CredentialRegistryEntry = EnvironmentRegistryEntry | ExternalRegistryEntry;
 
@@ -15,7 +15,7 @@ const CREDENTIAL_REGISTRY: Readonly<Record<CredentialCapability, CredentialRegis
   github_cli: { source: "external_cli" },
   agent_codex: { source: "external_cli" },
   agent_cursor: { source: "external_cli" },
-  agent_claude: { source: "environment", envName: "ANTHROPIC_API_KEY" },
+  agent_claude: { source: "environment", envName: "ANTHROPIC_API_KEY", redactMinLength: 1 },
 });
 
 const REDACTED = "[REDACTED_SECRET]";
@@ -98,8 +98,12 @@ export function registeredServerSecretEnvironmentNames(): ReadonlySet<string> {
 
 function knownSecretValues(environment: EnvironmentValues = process.env) {
   return Object.values(CREDENTIAL_REGISTRY)
-    .flatMap((entry) => entry.source === "environment" ? [environment[entry.envName]?.trim()] : [])
-    .filter((value): value is string => Boolean(value));
+    .flatMap((entry) => {
+      if (entry.source !== "environment") return [];
+      const value = environment[entry.envName]?.trim();
+      const minLength = entry.redactMinLength ?? 8;
+      return value && value.length >= minLength ? [value] : [];
+    });
 }
 
 export function containsKnownSecret(value: string | Buffer, environment: EnvironmentValues = process.env) {
