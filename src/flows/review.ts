@@ -42,7 +42,14 @@ const definitions: Array<{ id: FlowStepId; agent: AgentId; role: FlowRole }> = [
 const downstreamMinimumWorkMs: Partial<Record<FlowStepId, number>> = {
   cursor_review: 45_000,
   claude_review: 45_000,
-  codex_final: 60_000,
+  codex_final: 45_000,
+};
+
+// Keep the initial implementation step at the established 90s ceiling so the
+// final-step reserve reduction benefits the two independent review steps rather
+// than letting the draft consume the recovered time.
+const stepWorkCeilingMs: Partial<Record<FlowStepId, number>> = {
+  codex_draft: 90_000,
 };
 
 /**
@@ -59,7 +66,7 @@ export function reviewStepActualBudgetMs(stepId: FlowStepId, flowDeadlineMs: num
   );
   const remaining = flowDeadlineMs - nowMs;
   return Math.min(
-    STEP_WORK_CEILING_MS,
+    stepWorkCeilingMs[stepId] ?? STEP_WORK_CEILING_MS,
     remaining - STEP_CLEANUP_RESERVE_MS - FLOW_TERMINAL_RESERVE_MS - downstreamReservation,
   );
 }
@@ -217,9 +224,10 @@ function emit(onEvent: FlowOptions["onEvent"], event: FlowEvent) { onEvent?.(eve
 
 function result(flowId: string, steps: FlowStep[], timedOut: boolean, aborted: boolean): ReviewFlowResult {
   const final = steps[3];
+  const hasStepError = steps.some((step) => step.status === "error");
   return {
     flowId,
-    status: timedOut ? "timed_out" : aborted ? "aborted" : final.status === "completed" ? "completed" : "error",
+    status: timedOut ? "timed_out" : aborted ? "aborted" : hasStepError ? "error" : final.status === "completed" ? "completed" : "error",
     steps,
     finalOutput: final.status === "completed" ? final.output : "",
   };

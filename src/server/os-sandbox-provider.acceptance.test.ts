@@ -216,5 +216,5 @@ describe.runIf(enabled)("Phase 18 provider authentication acceptance", () => {
       replaceStateStoreForTests(new StateStore(":memory:"));
       await rm(root, { recursive: true, force: true });
     }
-  }, 180_000);
+  }, MAX_FLOW_MS + 60_000);
 });
