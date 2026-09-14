@@ -43,7 +43,10 @@ const definitions: Array<{ id: FlowStepId; agent: AgentId; role: FlowRole }> = [
 const downstreamMinimumWorkMs: Partial<Record<FlowStepId, number>> = {
   cursor_review: 45_000,
   claude_review: 45_000,
-  codex_final: 45_000,
+  // Finalization also has its own cleanup and terminal reserves below. A 30s
+  // provider-work floor preserves a 60s end-of-flow envelope while returning
+  // 15s to the two independent review stages when the flow reaches them late.
+  codex_final: 30_000,
 };
 
 // Keep the initial implementation step at the established 90s ceiling so the
