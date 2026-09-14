@@ -26,7 +26,11 @@ export async function prepareTaskRuntime(task: RepoTask) {
         onLifecycleTelemetry: (telemetry) => recordAgentLifecycle(task, policy.agent, telemetry, stepId),
         onChildClose,
       });
-      return onProviderWorkStart ? withProviderWorkBoundary(onProviderWorkStart, operation) : operation();
+      if (!onProviderWorkStart) return operation();
+      return withProviderWorkBoundary(() => {
+        onProviderWorkStart();
+        return signal?.aborted ? false : true;
+      }, operation);
   }
 }
 
