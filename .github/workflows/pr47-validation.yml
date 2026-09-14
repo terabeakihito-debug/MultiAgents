@@ -1,0 +1,28 @@
+name: PR47 validation
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    if: github.head_ref == 'fix/provider-work-budget-boundary'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Focused review-flow tests
+        run: npx vitest run src/flows/review.test.ts src/flows/review-provider-work-boundary.test.ts src/server/provider-work-boundary.test.ts --maxWorkers=1
+      - run: npm run typecheck
+      - run: npm run lint
+      - name: Diff check
+        run: git diff --check origin/main...HEAD
