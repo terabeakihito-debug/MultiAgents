@@ -19,6 +19,10 @@ import { beginTaskReview, clearTasksForTests, completeTaskReview, createTask, ex
 const enabled = process.env.MULTIAGENTS_PROVIDER_ACCEPTANCE === "1";
 const cursorLifecycleEnabled = process.env.MULTIAGENTS_CURSOR_LIFECYCLE_ACCEPTANCE === "1";
 const fullReviewEnabled = enabled && process.env.MULTIAGENTS_FULL_REVIEW_ACCEPTANCE === "1";
+// MAX_FLOW_MS is the production flow deadline. The outer acceptance timeout
+// must exceed it for diagnostics, setup, runtime preparation, and cleanup;
+// it is not a provider work-budget.
+const ACCEPTANCE_TEST_TIMEOUT_MS = MAX_FLOW_MS + 60_000;
 
 function requireAvailableFullReviewProviders(diagnostics: Awaited<ReturnType<typeof providerDiagnostics>>) {
   const unavailable = diagnostics.filter((diagnostic) => diagnostic.status === "missing" || diagnostic.status === "credential_unavailable");
@@ -26,6 +30,10 @@ function requireAvailableFullReviewProviders(diagnostics: Awaited<ReturnType<typ
 }
 
 describe("Phase 18 full provider review acceptance gate", () => {
+  it("keeps the full-review outer timeout above the production flow deadline", () => {
+    expect(ACCEPTANCE_TEST_TIMEOUT_MS).toBeGreaterThan(MAX_FLOW_MS);
+  });
+
   it("fails an opted-in full review when diagnostics report an unavailable provider", () => {
     const diagnostics = [{ provider: "claude", status: "credential_unavailable" }] as Awaited<ReturnType<typeof providerDiagnostics>>;
     expect(() => requireAvailableFullReviewProviders(diagnostics)).toThrow("claude");
@@ -216,5 +224,5 @@ describe.runIf(enabled)("Phase 18 provider authentication acceptance", () => {
       replaceStateStoreForTests(new StateStore(":memory:"));
       await rm(root, { recursive: true, force: true });
     }
-  }, 180_000);
+  }, ACCEPTANCE_TEST_TIMEOUT_MS);
 });

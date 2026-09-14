@@ -15,7 +15,7 @@ const CREDENTIAL_REGISTRY: Readonly<Record<CredentialCapability, CredentialRegis
   github_cli: { source: "external_cli" },
   agent_codex: { source: "external_cli" },
   agent_cursor: { source: "external_cli" },
-  agent_claude: { source: "external_cli" },
+  agent_claude: { source: "environment", envName: "ANTHROPIC_API_KEY" },
 });
 
 const REDACTED = "[REDACTED_SECRET]";
@@ -99,7 +99,7 @@ export function registeredServerSecretEnvironmentNames(): ReadonlySet<string> {
 function knownSecretValues(environment: EnvironmentValues = process.env) {
   return Object.values(CREDENTIAL_REGISTRY)
     .flatMap((entry) => entry.source === "environment" ? [environment[entry.envName]?.trim()] : [])
-    .filter((value): value is string => Boolean(value && value.length >= 8));
+    .filter((value): value is string => Boolean(value));
 }
 
 export function containsKnownSecret(value: string | Buffer, environment: EnvironmentValues = process.env) {

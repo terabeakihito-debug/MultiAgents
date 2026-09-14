@@ -9,7 +9,7 @@ import { runtimeBindingDirectory } from "../server/immutable-executable-binding"
 import { assertProviderExecutionAllowed, assertProviderExecutionIdentity, prepareProviderImmutableBinding } from "../server/provider-diagnostics";
 import { buildChildProcessEnv } from "../server/child-process-env";
 import { registerChildProcess } from "../server/child-process-registry";
-import { redactKnownSecrets } from "../server/credential-resolver";
+import { credentialResolver, CredentialAccessError, redactKnownSecrets } from "../server/credential-resolver";
 import { buildGenericRuntimePolicy } from "../server/runtime-policy";
 import {
   BWRAP_BINARY,
@@ -102,6 +102,15 @@ function runProcess(
     async function launch() {
       try { assertAgentExecutionAdmissible(); }
       catch (error) { settle(errorResult(definition.id, error)); return; }
+      let claudeApiKey: string | undefined;
+      if (!testBypass && definition.id === "claude") {
+        try {
+          claudeApiKey = await credentialResolver.withCredential("agent_claude", (credential) => credential.revealForCapability("agent_claude"));
+        } catch {
+          settle(errorResult(definition.id, new Error("Claude API key is not configured")));
+          return;
+        }
+      }
       let diagnostic;
       if (!testBypass) try {
         diagnostic = await assertProviderExecutionAllowed(definition.id);
@@ -127,7 +136,7 @@ function runProcess(
         innerArgs = definition.args(safePrompt, SANDBOX_PROJECT_ROOT, policy.source === "task_snapshots", policy.allowWrite);
         executionBinding = !testBypass ? await assertProviderExecutionIdentity(definition.id, diagnostic!) : undefined;
         immutableRuntime = !testBypass && executionBinding ? await prepareProviderImmutableBinding(definition.id, executionBinding) : undefined;
-        command = testBypass
+        const buildCommand = (claudeApiKey?: string) => testBypass
           ? testSandboxCommand(definition.binary, innerArgs)
           : buildSandboxCommand({
               profile,
@@ -138,13 +147,15 @@ function runProcess(
               codexRuntime: immutableRuntime?.codexRuntime,
               cursorRuntime: immutableRuntime?.cursorRuntime,
               claudeRuntime: immutableRuntime?.claudeRuntime,
+              claudeApiKey,
               command: { binary: definition.binary, args: innerArgs },
               env: buildChildProcessEnv({ purpose: "agent", baseEnv: options.env ?? process.env }),
             });
+        command = buildCommand(claudeApiKey);
       } catch (error) {
         await immutableRuntime?.cleanup().catch(() => undefined);
         await safePreLaunchAudit({ type: "os_sandbox_failed", profile, provider: definition.id, capabilityClass: policy.policyClass, failureCode: "invalid_sandbox_configuration" });
-        settle(errorResult(definition.id, error));
+        settle(errorResult(definition.id, error instanceof CredentialAccessError ? new Error("Claude API key is not configured") : error));
         return;
       }
 

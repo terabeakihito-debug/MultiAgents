@@ -95,6 +95,8 @@ export type SandboxCommandInput = {
   codexRuntime?: StagedCodexRuntimeBinding;
   cursorRuntime?: StagedCursorRuntimeBinding;
   claudeRuntime?: StagedClaudeRuntimeBinding;
+  /** Resolved only by the server credential resolver for a managed Claude child. */
+  claudeApiKey?: string;
 };
 
 export function buildSandboxCommand(input: SandboxCommandInput): SandboxCommand {
@@ -166,7 +168,7 @@ function buildSandboxCommandWithCredentialResolver(input: SandboxCommandInput, r
   const gitLink = join(cwd, ".git");
   if (input.profile !== "agent_read_only" && isRegularKnown(gitLink)) args.push("--ro-bind", gitLink, `${SANDBOX_PROJECT_ROOT}/.git`);
 
-  const innerEnv = sandboxEnvironment(input.profile, input.provider, input.env);
+  const innerEnv = sandboxEnvironment(input.profile, input.provider, input.env, input.claudeApiKey);
   for (const [name, value] of Object.entries(innerEnv)) args.push("--setenv", name, value);
   const executable = input.pseudoTty ? "/usr/bin/script" : mappedCommand.binary;
   const executableArgs = input.pseudoTty ? ["-qefc", shellCommand(mappedCommand.binary, mappedCommand.args), "/dev/null"] : mappedCommand.args;
@@ -247,7 +249,6 @@ function addProviderRuntime(args: string[], provider: AgentId, command: { binary
   if (command.binary !== expected) invalid("Claude provider command is not fixed");
   if (!runtimes.claude?.stagedExecutable.startsWith("/")) invalid("Claude sandbox requires an immutable runtime binding");
   args.push("--ro-bind", runtimes.claude.stagedExecutable, "/opt/multiagents/claude");
-  addCredentialFile(args, resolveCredentialFile(join(hostHome, ".claude", ".credentials.json")), join(SANDBOX_HOME, ".claude", ".credentials.json"));
   return { binary: "/opt/multiagents/claude", args: [...command.args] };
 }
 
@@ -292,7 +293,7 @@ function addNodeRuntime(args: string[], includeNpm: boolean) {
   );
 }
 
-function sandboxEnvironment(profile: OsSandboxProfile, provider: AgentId | undefined, source: Readonly<Record<string, string | undefined>> = process.env) {
+function sandboxEnvironment(profile: OsSandboxProfile, provider: AgentId | undefined, source: Readonly<Record<string, string | undefined>> = process.env, claudeApiKey?: string) {
   const env: Record<string, string> = {
     HOME: SANDBOX_HOME,
     PATH: SANDBOX_PATH,
@@ -307,7 +308,11 @@ function sandboxEnvironment(profile: OsSandboxProfile, provider: AgentId | undef
   };
   if (source.NODE_ENV === "production") env.NODE_ENV = "production";
   if (provider === "codex") env.CODEX_HOME = `${SANDBOX_HOME}/.codex`;
-  if (provider === "claude") env.CLAUDE_CONFIG_DIR = `${SANDBOX_HOME}/.claude`;
+  if (provider === "claude") {
+    env.CLAUDE_CONFIG_DIR = `${SANDBOX_HOME}/.claude`;
+    env.DISABLE_AUTOUPDATER = "1";
+    if (claudeApiKey) env.ANTHROPIC_API_KEY = claudeApiKey;
+  }
   if (provider === "cursor") {
     env.XDG_CONFIG_HOME = `${SANDBOX_HOME}/.config`;
     env.XDG_CACHE_HOME = `${SANDBOX_HOME}/.cache`;

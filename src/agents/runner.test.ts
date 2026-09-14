@@ -48,6 +48,7 @@ describe("createAgentAdapter", () => {
   });
 
   it("replaces the host environment and absolute provider launcher with the fixed bwrap launcher", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "TEST_CLAUDE_KEY");
     const child = fakeChild();
     const spawnProcess = vi.fn(() => child);
     const env = {
@@ -70,6 +71,7 @@ describe("createAgentAdapter", () => {
     child.stdout.write("CLAUDE_OK\n");
     child.emit("close", 0, null);
     await expect(promise).resolves.toEqual({ agent: "claude", status: "completed", output: "CLAUDE_OK" });
+    vi.unstubAllEnvs();
     expect(spawnProcess).toHaveBeenCalledWith(
       "/usr/bin/bwrap",
       ["--", CLAUDE_BINARY, "-p", "Reply with exactly: CLAUDE_OK"],
@@ -316,6 +318,7 @@ describe("createAgentAdapter", () => {
   });
 
   it("does not inject Codex write settings into review-only adapters", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "TEST_CLAUDE_KEY");
     const cases = [
       { id: "cursor" as const, binary: "agent", args: (prompt: string, cwd: string) => ["--trust", "--workspace", cwd, "-p", prompt] },
       { id: "claude" as const, binary: CLAUDE_BINARY, args: (prompt: string) => ["-p", prompt] },
@@ -334,6 +337,16 @@ describe("createAgentAdapter", () => {
       expect(invokedArgs[1]).not.toContain("--sandbox");
       expect(invokedArgs[1]).not.toContain("workspace-write");
     }
+    vi.unstubAllEnvs();
+  });
+
+  it("fails closed before spawning Claude when the server API key is missing", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+    const spawnProcess = vi.fn(() => fakeChild());
+    const adapter = createAgentAdapter({ id: "claude", name: "Claude", binary: CLAUDE_BINARY, args: (prompt) => ["-p", prompt] }, { spawnProcess: spawnProcess as never });
+    await expect(adapter.run("review")).resolves.toMatchObject({ status: "error", error: "Claude API key is not configured" });
+    expect(spawnProcess).not.toHaveBeenCalled();
+    vi.unstubAllEnvs();
   });
 
   it("uses fixed CLI read-only modes for repository reviewers", () => {
@@ -387,6 +400,7 @@ describe("createAgentAdapter", () => {
   });
 
   it("terminates a timed-out process", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "TEST_CLAUDE_KEY");
     vi.useFakeTimers();
     const child = fakeChild();
     const adapter = createAgentAdapter(
@@ -409,6 +423,7 @@ describe("createAgentAdapter", () => {
       terminationReason: "agent_deadline_exceeded",
       lifecycleTelemetry: { stdoutBytes: 0, stderrBytes: 0, terminationMethod: "term_only" },
     });
+    vi.unstubAllEnvs();
     expect(child.kill).toHaveBeenCalledWith("SIGTERM");
     vi.useRealTimers();
   });

@@ -11,9 +11,10 @@ import { aggregateRuntimeArtifactIdentity, executableContentIdentity, prepareImm
 import { buildChildProcessEnv } from "./child-process-env";
 import { getStateStore } from "./state-store";
 import { runHardenedProcess } from "./pull-request";
+import { credentialResolver } from "./credential-resolver";
 
 const DIAGNOSTIC_TTL_MS = 24 * 60 * 60 * 1_000;
-const PARSER_AND_SANDBOX_POLICY_VERSION = "provider-parser-sandbox-21c8-cursor-runtime-manifest-nested-deps";
+const PARSER_AND_SANDBOX_POLICY_VERSION = "provider-parser-sandbox-22-claude-api-key-auth";
 const CODEX_RUNTIME_RESOLVER = join(process.cwd(), "src", "server", "codex-runtime-resolver.mjs");
 const CODEX_RUNTIME_RESOLUTION_TIMEOUT_MS = 2_000;
 const MAX_CODEX_RUNTIME_RESOLUTION_BYTES = 64 * 1024;
@@ -22,7 +23,7 @@ export const PROVIDER_COMPATIBILITY_POLICY_VERSION = createHash("sha256")
   .digest("hex").slice(0, 24);
 export const MAX_IDENTITY_DIAGNOSTIC_RETRIES = 1;
 let cache: { expiresAt: number; value: ProviderDiagnostic[] } | undefined;
-const credentialPaths: Record<AgentId, string> = { codex: join(homedir(), ".codex", "auth.json"), cursor: join(homedir(), ".config", "cursor", "auth.json"), claude: join(homedir(), ".claude", ".credentials.json") };
+const credentialPaths: Record<Exclude<AgentId, "claude">, string> = { codex: join(homedir(), ".codex", "auth.json"), cursor: join(homedir(), ".config", "cursor", "auth.json") };
 type IdentityContext = { home: string; nodePath: string; nodeRoot: string };
 export type CursorRuntimeManifestArtifact = Pick<RuntimeArtifact, "name" | "identity" | "executable">;
 export type CursorRuntimeManifest = { runtimeRoot: string; artifacts: readonly CursorRuntimeManifestArtifact[]; aggregateDigest: string; sourceSecurityDigest: string };
@@ -136,8 +137,9 @@ async function pathIdentity(path: string, executable = false) {
   } catch { return "missing"; }
 }
 async function captureProviderExecutionIdentity(provider: AgentId, context = currentIdentityContext()): Promise<ProviderIdentityCapture> {
-  const credentials: Record<AgentId, string> = { codex: join(context.home, ".codex", "auth.json"), cursor: join(context.home, ".config", "cursor", "auth.json"), claude: join(context.home, ".claude", ".credentials.json") };
-  const parts = [`policy=${PROVIDER_COMPATIBILITY_POLICY_VERSION}`, `launcher=${await pathIdentity(providerBinaryPath(provider, context), true)}`, `credential=${await pathIdentity(credentials[provider])}`];
+  const credentials: Record<Exclude<AgentId, "claude">, string> = { codex: join(context.home, ".codex", "auth.json"), cursor: join(context.home, ".config", "cursor", "auth.json") };
+  const parts = [`policy=${PROVIDER_COMPATIBILITY_POLICY_VERSION}`, `launcher=${await pathIdentity(providerBinaryPath(provider, context), true)}`];
+  if (provider !== "claude") parts.push(`credential=${await pathIdentity(credentials[provider])}`);
   let codexRuntime: CodexRuntimeBinding | undefined;
   let cursorRuntime: CursorRuntimeBinding | undefined;
   let claudeRuntime: ClaudeRuntimeBinding | undefined;
@@ -391,6 +393,7 @@ async function validateResolutionPath(path: string, kind: "directory" | "file" |
 }
 function within(path: string, root: string) { const value = relative(root, path); return value === "" || (value !== ".." && !value.startsWith(`..${sep}`)); }
 async function credentialDiagnostic(provider: AgentId): Promise<ProviderCredentialStatus> {
+  if (provider === "claude") return credentialResolver.status("agent_claude").status === "configured" ? "available" : "missing";
   try {
     const info = await lstat(credentialPaths[provider]);
     if (!info.isFile() || info.isSymbolicLink()) return "unsupported_layout";

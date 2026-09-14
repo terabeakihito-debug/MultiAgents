@@ -43,7 +43,7 @@ describe("Phase 16 credential resolver", () => {
   it("reports missing and externally managed credentials without extracting CLI tokens", async () => {
     const resolver = createCredentialResolver({});
     expect(resolver.status("slack_outbound").status).toBe("not_configured");
-    expect(resolver.statuses().filter((item) => item.source === "external_cli")).toHaveLength(4);
+    expect(resolver.statuses().filter((item) => item.source === "external_cli")).toHaveLength(3);
     await expect(resolver.withCredential("slack_outbound", () => undefined)).rejects.toBeInstanceOf(CredentialAccessError);
     await expect(resolver.withCredential("github_cli", () => undefined)).rejects.toThrow("managed externally");
   });
@@ -68,6 +68,13 @@ describe("Phase 16 credential resolver", () => {
     expect(redactKnownSecretsInValue({ task: { prompt: fixture }, history: [fixture], count: 1 }, environment)).toEqual({
       task: { prompt: "[REDACTED_SECRET]" }, history: ["[REDACTED_SECRET]"], count: 1,
     });
+  });
+
+  it("uses the Claude API key only through the Claude capability and redacts even a short value", async () => {
+    const resolver = createCredentialResolver({ ANTHROPIC_API_KEY: "short" });
+    expect(resolver.status("agent_claude")).toEqual({ capability: "agent_claude", status: "configured", source: "environment" });
+    await expect(resolver.withCredential("agent_claude", (secret) => secret.revealForCapability("agent_claude"))).resolves.toBe("short");
+    expect(redactKnownSecrets("key=short", { ANTHROPIC_API_KEY: "short" })).toBe("key=[REDACTED_SECRET]");
   });
 });
 

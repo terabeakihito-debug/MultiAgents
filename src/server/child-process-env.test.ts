@@ -20,6 +20,7 @@ const parent = {
   SERVICE_TOKEN: fixture,
   DATABASE_PASSWORD: fixture,
   AUTHORIZATION: fixture,
+  ANTHROPIC_API_KEY: fixture,
 };
 
 describe("Phase 16 child process environment isolation", () => {
@@ -56,6 +57,12 @@ describe("Phase 16 child process environment isolation", () => {
     const env = buildChildProcessEnv({ purpose: "validation", baseEnv: parent, overrides: { SERVICE_TOKEN: fixture, NODE_ENV: "production" } });
     expect(env.NODE_ENV).toBe("production");
     expect(env.SERVICE_TOKEN).toBeUndefined();
+  });
+
+  it("never inherits or accepts a caller-provided Claude API key", () => {
+    const env = buildChildProcessEnv({ purpose: "agent", baseEnv: parent, overrides: { ANTHROPIC_API_KEY: fixture } });
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(JSON.stringify(env)).not.toContain(fixture);
   });
 
   it("isolates server Git mutations from config and repository path injection", () => {
