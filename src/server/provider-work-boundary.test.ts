@@ -50,4 +50,21 @@ describe("provider work boundary", () => {
     expect(spawnProcess).toHaveBeenCalledTimes(1);
     expect(result).toMatchObject({ status: "error", error: "intentional spawn stop" });
   });
+
+  it("does not spawn when the provider-work boundary rejects execution", async () => {
+    const spawnProcess = vi.fn(() => { throw new Error("must not spawn"); });
+    const adapter = createAgentAdapter({
+      id: "codex",
+      name: "Codex",
+      binary: "codex",
+      args: () => ["exec", "prompt"],
+    }, { spawnProcess, unsafeTestOnlyBypassOsSandbox: true });
+
+    const result = await withProviderWorkBoundary(() => false, () => adapter.run("prompt", {
+      policy: buildGenericRuntimePolicy("codex", "/tmp/provider-work-boundary"),
+    }));
+
+    expect(spawnProcess).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ status: "error", error: "Provider work budget exhausted before spawn" });
+  });
 });
