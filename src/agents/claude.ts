@@ -15,9 +15,12 @@ export function claudeArgs(prompt: string, _cwd: string, _repositoryTask: boolea
   ];
 }
 
-export const claudeAgent = createAgentAdapter({
-  id: "claude",
-  name: "Claude",
-  binary: CLAUDE_BINARY,
-  args: claudeArgs,
-}, { cwd: workspaceDirectory });
+export const claudeAgent = {
+  ...createAgentAdapter({
+    id: "claude",
+    name: "Claude",
+    binary: CLAUDE_BINARY,
+    args: claudeArgs,
+  }, { cwd: workspaceDirectory }),
+  supportsProviderWorkBoundary: true as const,
+};

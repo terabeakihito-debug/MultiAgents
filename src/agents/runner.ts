@@ -11,6 +11,7 @@ import { buildChildProcessEnv } from "../server/child-process-env";
 import { registerChildProcess } from "../server/child-process-registry";
 import { redactKnownSecrets } from "../server/credential-resolver";
 import { buildGenericRuntimePolicy } from "../server/runtime-policy";
+import { notifyProviderWorkStart } from "../server/provider-work-boundary";
 import {
   BWRAP_BINARY,
   SANDBOX_PROJECT_ROOT,
@@ -162,6 +163,11 @@ function runProcess(
       let child;
       let endAgentExecution: (() => void) | undefined;
       try {
+        // Provider-work accounting begins only after compatibility, identity,
+        // immutable binding, and sandbox command construction have succeeded.
+        // The callback is synchronous, so this preserves the no-await admission
+        // boundary immediately before lease acquisition and child creation.
+        notifyProviderWorkStart();
         endAgentExecution = beginAgentExecution();
         child = spawnProcess(command.binary, command.args, spawnOptions);
       } catch (error) {

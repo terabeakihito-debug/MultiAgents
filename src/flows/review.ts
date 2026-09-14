@@ -5,6 +5,7 @@ import type { AgentAdapter, AgentId, FlowEvent, FlowRole, FlowStep, FlowStepId, 
 import type { RolePolicy } from "../profiles/policy";
 import type { RuntimePolicy } from "../runtime/types";
 import { buildGenericRuntimePolicy } from "../server/runtime-policy";
+import { withProviderWorkBoundary } from "../server/provider-work-boundary";
 
 export const MAX_FLOW_MS = 5 * 60 * 1_000;
 export const MAX_HANDOFF_CHARS = 30_000;
@@ -28,7 +29,7 @@ type FlowOptions = {
   roles?: RolePolicy;
   repositoryReadOnly?: boolean;
   runtimePolicies?: Record<AgentId, RuntimePolicy>;
-  executeAgent?: (agent: AgentId, prompt: string, signal: AbortSignal, stepId: FlowStepId, onChildClose?: () => void) => Promise<import("../agents/types").AgentResult>;
+  executeAgent?: (agent: AgentId, prompt: string, signal: AbortSignal, stepId: FlowStepId, onProviderWorkStart?: () => boolean | void, onChildClose?: () => void) => Promise<import("../agents/types").AgentResult>;
 };
 type FlowLogEntry = { flowId: string; stepId: FlowStepId; agent: AgentId; status: FlowStep["status"]; durationMs?: number };
 
@@ -143,8 +144,8 @@ async function executeStep(step: FlowStep, input: string, adapters: AgentSet, si
   step.inputSummary = `${input.length.toLocaleString("en-US")} characters`;
   log?.({ flowId, stepId: step.id, agent: step.agent, status: step.status });
   emit(onEvent, { type: "step_started", flowId, step: snapshot(step) });
-  const budgetMs = reviewStepActualBudgetMs(step.id, flowDeadlineMs, start);
-  if (budgetMs <= 0) {
+  const initialBudgetMs = reviewStepActualBudgetMs(step.id, flowDeadlineMs, start);
+  if (initialBudgetMs <= 0) {
     step.status = "error";
     step.error = "Review step budget exhausted before execution.";
     step.terminationReason = "step_budget_exhausted";
@@ -158,18 +159,36 @@ async function executeStep(step: FlowStep, input: string, adapters: AgentSet, si
   const abortFromParent = () => stepController.abort(signal.reason);
   signal.addEventListener("abort", abortFromParent, { once: true });
   if (signal.aborted) abortFromParent();
-  const budgetTimer = setTimeout(() => stepController.abort(reviewStepBudgetAbortReason()), budgetMs);
-  budgetTimer.unref();
+  let budgetTimer: NodeJS.Timeout | undefined;
+  let workStarted = false;
   let childClosed = false;
+  const startWorkBudget = () => {
+    if (workStarted || stepController.signal.aborted) return !stepController.signal.aborted;
+    workStarted = true;
+    const budgetMs = reviewStepActualBudgetMs(step.id, flowDeadlineMs, now());
+    if (budgetMs <= 0) {
+      stepController.abort(reviewStepBudgetAbortReason());
+      return false;
+    }
+    budgetTimer = setTimeout(() => stepController.abort(reviewStepBudgetAbortReason()), budgetMs);
+    budgetTimer.unref();
+    return true;
+  };
   const stopWorkBudgetAtChildClose = () => {
     if (childClosed) return;
     childClosed = true;
-    clearTimeout(budgetTimer);
+    if (budgetTimer) clearTimeout(budgetTimer);
   };
+  // Lightweight test/third-party adapters without the production work-boundary
+  // capability keep the historical step-start budget instead of running unbounded.
+  if (!options.executeAgent && adapters[step.agent].supportsProviderWorkBoundary !== true) startWorkBudget();
   try {
+    const operation = () => options.executeAgent
+      ? options.executeAgent(step.agent, input, stepController.signal, step.id, startWorkBudget, stopWorkBudgetAtChildClose)
+      : adapters[step.agent].run(input, { signal: stepController.signal, policy, onChildClose: stopWorkBudgetAtChildClose });
     const run = options.executeAgent
-      ? await options.executeAgent(step.agent, input, stepController.signal, step.id, stopWorkBudgetAtChildClose)
-      : await adapters[step.agent].run(input, { signal: stepController.signal, policy, onChildClose: stopWorkBudgetAtChildClose });
+      ? await operation()
+      : await withProviderWorkBoundary(startWorkBudget, operation);
     step.status = run.status;
     step.output = run.output;
     step.error = run.error;
@@ -180,7 +199,7 @@ async function executeStep(step: FlowStep, input: string, adapters: AgentSet, si
     step.error = error instanceof Error ? error.message : "Agent execution failed";
     step.terminationReason = abortTerminationReason(stepController.signal);
   } finally {
-    clearTimeout(budgetTimer);
+    if (budgetTimer) clearTimeout(budgetTimer);
     signal.removeEventListener("abort", abortFromParent);
   }
   if (step.terminationReason === "step_budget_exhausted") {

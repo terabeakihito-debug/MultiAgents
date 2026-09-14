@@ -188,9 +188,10 @@ describe.runIf(enabled)("Phase 18 provider authentication acceptance", () => {
       for (const step of result.steps) {
         const entry = lifecycle.find((event) => event.stepId === step.id);
         const telemetry = entry?.metadata?.lifecycle;
-        if (!telemetry?.childClosedAt || !step.startedAt) throw new Error(`Provider lifecycle metadata missing for ${step.id}`);
-        const workDurationMs = Date.parse(telemetry.childClosedAt) - Date.parse(step.startedAt);
-        const budgetMs = reviewStepActualBudgetMs(step.id, flowStartedAt + MAX_FLOW_MS, Date.parse(step.startedAt));
+        if (!telemetry?.spawnedAt || !telemetry.childClosedAt || !step.startedAt) throw new Error(`Provider lifecycle metadata missing for ${step.id}`);
+        const workStartedAt = Date.parse(telemetry.spawnedAt);
+        const workDurationMs = Date.parse(telemetry.childClosedAt) - workStartedAt;
+        const budgetMs = reviewStepActualBudgetMs(step.id, flowStartedAt + MAX_FLOW_MS, workStartedAt);
         if (workDurationMs < 0 || workDurationMs > budgetMs) {
           throw new Error(`Provider step work budget failed (${step.id}:${workDurationMs}:${budgetMs}:${telemetry.terminationReason ?? "none"})`);
         }
