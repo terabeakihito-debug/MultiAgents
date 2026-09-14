@@ -34,6 +34,33 @@ describe("review provider-work budget boundary", () => {
     }
   });
 
+  it("allows an approximately 92s draft when provider work remains under the 90s work cap", async () => {
+    vi.useFakeTimers();
+    try {
+      const result = await runReviewFlow("request", {
+        executeAgent: async (agent, _prompt, signal, stepId, onProviderWorkStart, onChildClose) => {
+          if (stepId === "codex_draft") {
+            await vi.advanceTimersByTimeAsync(3_000);
+            onProviderWorkStart?.();
+            await vi.advanceTimersByTimeAsync(89_000);
+            if (signal.aborted) return { agent, status: "error", output: "", error: "aborted" };
+            onChildClose?.();
+            return completed(agent, "draft");
+          }
+          onProviderWorkStart?.();
+          onChildClose?.();
+          return completed(agent, `${stepId}-ok`);
+        },
+      });
+
+      expect(result.status).toBe("completed");
+      expect(result.steps[0]).toMatchObject({ status: "completed", durationMs: 92_000 });
+      expect(result.steps[0].terminationReason).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("recomputes available work time at the provider boundary after slow preflight", async () => {
     vi.useFakeTimers();
     try {
