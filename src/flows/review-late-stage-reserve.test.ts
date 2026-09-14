@@ -18,6 +18,8 @@ describe("late-stage review reserve", () => {
   it("completes an end-to-end UI-shaped schedule inside the fixed 300s deadline", async () => {
     vi.useFakeTimers();
     try {
+      // The profile mirrors the latest UI ordering and keeps enough headroom
+      // for all four stages without increasing the fixed flow deadline.
       const result = await runReviewFlow("request", {
         executeAgent: async (agent, _prompt, signal, stepId, onProviderWorkStart, onChildClose) => {
           const profile = {
