@@ -6,7 +6,7 @@ const BASE_KEYS = new Set([
   "PATH", "HOME", "USER", "USERNAME", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TERM",
   "TMPDIR", "TMP", "TEMP", "SystemRoot", "SYSTEMROOT", "COMSPEC", "PATHEXT", "NODE_ENV",
 ]);
-const AUTH_STORE_PATH_KEYS = new Set(["CODEX_HOME", "CLAUDE_CONFIG_DIR", "CURSOR_CONFIG_DIR"]);
+const AUTH_STORE_PATH_KEYS = new Set(["CODEX_HOME", "CURSOR_CONFIG_DIR"]);
 const GIT_AUTH_BROKER_KEYS = new Set(["SSH_AUTH_SOCK", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_ASKPASS", "SSH_ASKPASS"]);
 const GITHUB_CONFIG_KEYS = new Set(["GH_CONFIG_DIR"]);
 const SECRET_NAME = /(?:^|_)(?:API_?KEY|TOKEN|SECRET|PASSWORD)(?:$|_)/i;
@@ -32,6 +32,7 @@ export function buildChildProcessEnv(input: {
   for (const key of Object.keys(output)) {
     if (registered.has(key) || SECRET_NAME.test(key) || key.toUpperCase() === "AUTHORIZATION") delete output[key];
   }
+  for (const key of ["CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"]) delete output[key];
   return output as NodeJS.ProcessEnv;
 }
 

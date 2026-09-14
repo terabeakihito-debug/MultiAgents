@@ -11,7 +11,6 @@ const parent = {
   LANG: "C.UTF-8",
   XDG_CONFIG_HOME: "/home/test/.config",
   CODEX_HOME: "/home/test/.codex",
-  CLAUDE_CONFIG_DIR: "/home/test/.claude",
   CURSOR_CONFIG_DIR: "/home/test/.cursor",
   GH_CONFIG_DIR: "/home/test/.config/gh",
   SSH_AUTH_SOCK: "/tmp/agent.sock",
@@ -32,7 +31,8 @@ describe("Phase 16 child process environment isolation", () => {
 
   it("preserves filesystem-backed CLI authentication paths only for agents", () => {
     const agent = buildChildProcessEnv({ purpose: "agent", baseEnv: parent });
-    expect(agent).toMatchObject({ HOME: parent.HOME, PATH: parent.PATH, XDG_CONFIG_HOME: parent.XDG_CONFIG_HOME, CODEX_HOME: parent.CODEX_HOME, CLAUDE_CONFIG_DIR: parent.CLAUDE_CONFIG_DIR, CURSOR_CONFIG_DIR: parent.CURSOR_CONFIG_DIR });
+    expect(agent).toMatchObject({ HOME: parent.HOME, PATH: parent.PATH, XDG_CONFIG_HOME: parent.XDG_CONFIG_HOME, CODEX_HOME: parent.CODEX_HOME, CURSOR_CONFIG_DIR: parent.CURSOR_CONFIG_DIR });
+    expect(agent).not.toHaveProperty("CLAUDE_CONFIG_DIR");
     expect(agent).not.toHaveProperty("GH_CONFIG_DIR");
   });
 

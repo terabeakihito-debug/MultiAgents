@@ -10,6 +10,7 @@ import { buildSandboxCommand, type CodexRuntimeBinding, type CodexRuntimeResolut
 import { aggregateRuntimeArtifactIdentity, executableContentIdentity, prepareImmutableExecutableBinding, prepareImmutableRuntimeBinding, type ExecutableContentIdentity, type RuntimeArtifact } from "./immutable-executable-binding";
 import { buildChildProcessEnv } from "./child-process-env";
 import { getStateStore } from "./state-store";
+import { ClaudeConfigRootError, validateClaudeConfigRoot } from "./claude-config-root";
 import { runHardenedProcess } from "./pull-request";
 
 const DIAGNOSTIC_TTL_MS = 24 * 60 * 60 * 1_000;
@@ -71,6 +72,10 @@ export async function diagnoseProvider(provider: AgentId, options: {
   if (!options.execute && provider === "cursor") {
     try { const sandboxProbe = await executeInSandbox(provider, ["--version"], options.cwd ?? process.cwd(), capture); if (sandboxProbe.code !== 0) return persist({ ...base(provider, "sandbox_incompatible"), version, credentialStatus }, options, identity); }
     catch { return persist({ ...base(provider, "sandbox_incompatible"), version, credentialStatus }, options, identity); }
+  }
+  if (!options.execute && provider === "claude") {
+    try { const probe = await execute(["-p", "Reply with exactly: READY"]); if (probe.code !== 0) return persist({ ...base(provider, "credential_unavailable"), version, credentialStatus: "missing", sandboxCompatible: true }, options, identity); }
+    catch { return persist({ ...base(provider, "credential_unavailable"), version, credentialStatus: "missing", sandboxCompatible: true }, options, identity); }
   }
   return persist({ ...base(provider, versionStatus), version, credentialStatus, flagsCompatible: true, sandboxCompatible: true, launchCompatible: true }, options, identity);
 }
@@ -136,8 +141,9 @@ async function pathIdentity(path: string, executable = false) {
   } catch { return "missing"; }
 }
 async function captureProviderExecutionIdentity(provider: AgentId, context = currentIdentityContext()): Promise<ProviderIdentityCapture> {
-  const credentials: Record<AgentId, string> = { codex: join(context.home, ".codex", "auth.json"), cursor: join(context.home, ".config", "cursor", "auth.json"), claude: join(context.home, ".claude", ".credentials.json") };
-  const parts = [`policy=${PROVIDER_COMPATIBILITY_POLICY_VERSION}`, `launcher=${await pathIdentity(providerBinaryPath(provider, context), true)}`, `credential=${await pathIdentity(credentials[provider])}`];
+  const credentials: Record<Exclude<AgentId, "claude">, string> = { codex: join(context.home, ".codex", "auth.json"), cursor: join(context.home, ".config", "cursor", "auth.json") };
+  const parts = [`policy=${PROVIDER_COMPATIBILITY_POLICY_VERSION}`, `launcher=${await pathIdentity(providerBinaryPath(provider, context), true)}`];
+  if (provider !== "claude") parts.push(`credential=${await pathIdentity(credentials[provider])}`);
   let codexRuntime: CodexRuntimeBinding | undefined;
   let cursorRuntime: CursorRuntimeBinding | undefined;
   let claudeRuntime: ClaudeRuntimeBinding | undefined;
@@ -391,6 +397,10 @@ async function validateResolutionPath(path: string, kind: "directory" | "file" |
 }
 function within(path: string, root: string) { const value = relative(root, path); return value === "" || (value !== ".." && !value.startsWith(`..${sep}`)); }
 async function credentialDiagnostic(provider: AgentId): Promise<ProviderCredentialStatus> {
+  if (provider === "claude") {
+    try { validateClaudeConfigRoot(); return "available"; }
+    catch (error) { return error instanceof ClaudeConfigRootError && error.status === "setup_required" ? "missing" : "unsupported_layout"; }
+  }
   try {
     const info = await lstat(credentialPaths[provider]);
     if (!info.isFile() || info.isSymbolicLink()) return "unsupported_layout";
