@@ -106,10 +106,12 @@ describe("Phase 18 OS sandbox command policy", () => {
         buildSandboxCommandForTests({ profile: "agent_read_only", cwd: "/tmp/task", provider: "claude", claudeRuntime: CLAUDE_RUNTIME_FIXTURE, command: { binary: join(homedir(), ".local", "bin", "claude"), args: [] } }, resolver),
       ];
       const serialized = cases.map((item) => item.args.join("\0")).join("\n");
-      for (const fixture of fixtures) expect(serialized).toContain(fixture);
+      for (const fixture of fixtures.slice(0, 2)) expect(serialized).toContain(fixture);
       expect(serialized).toContain("/home/runtime/.codex/auth.json");
       expect(serialized).toContain("/home/runtime/.config/cursor/auth.json");
-      expect(serialized).toContain("/home/runtime/.claude/.credentials.json");
+      expect(serialized).toContain("/fixture/claude");
+      expect(serialized).toContain("/run/multiagents/claude");
+      expect(serialized).not.toContain("/home/runtime/.claude/.credentials.json");
       for (const forbidden of ["history.jsonl", "/plugins", "/projects", ".multiagents", "state.db"]) expect(serialized).not.toContain(forbidden);
     } finally { await rm(fixtureRoot, { recursive: true, force: true }); }
   });

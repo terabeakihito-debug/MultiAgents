@@ -7,6 +7,7 @@ import type { AgentId } from "../agents/types";
 import type { RuntimePolicy } from "../runtime/types";
 import { registerChildProcess } from "./child-process-registry";
 import type { ExecutableContentIdentity } from "./immutable-executable-binding";
+import { SANDBOX_CLAUDE_CONFIG_ROOT, validateClaudeConfigRoot } from "./claude-config-root";
 
 export const BWRAP_BINARY = "/usr/bin/bwrap" as const;
 export const SANDBOX_PROJECT_ROOT = "/project" as const;
@@ -98,7 +99,7 @@ export type SandboxCommandInput = {
 };
 
 export function buildSandboxCommand(input: SandboxCommandInput): SandboxCommand {
-  return buildSandboxCommandWithCredentialResolver(input, (source) => isRegularKnown(source) ? source : undefined);
+  return buildSandboxCommandWithCredentialResolver(input, (source) => isRegularKnown(source) ? source : undefined, false);
 }
 
 /** Test-only deterministic credential fixture seam; production callers use buildSandboxCommand. */
@@ -106,10 +107,10 @@ export function buildSandboxCommandForTests(input: SandboxCommandInput, resolveC
   return buildSandboxCommandWithCredentialResolver(input, (source) => {
     const fixture = resolveCredentialFile(source);
     return fixture && isRegularKnown(fixture) ? fixture : undefined;
-  });
+  }, true);
 }
 
-function buildSandboxCommandWithCredentialResolver(input: SandboxCommandInput, resolveCredentialFile: (source: string) => string | undefined): SandboxCommand {
+function buildSandboxCommandWithCredentialResolver(input: SandboxCommandInput, resolveCredentialFile: (source: string) => string | undefined, testFixture: boolean): SandboxCommand {
   const cwd = requireAbsoluteSafePath(input.cwd, "sandbox cwd");
   if (input.profile === "agent_implement") {
     if (!input.writableRoot || resolve(input.writableRoot) !== cwd) invalid("Implement sandbox requires the task worktree as its only writable root");
@@ -146,7 +147,7 @@ function buildSandboxCommandWithCredentialResolver(input: SandboxCommandInput, r
 
   addOptionalSystemFiles(args);
   const mappedCommand = input.provider
-    ? addProviderRuntime(args, input.provider, input.command, { codex: input.codexRuntime, cursor: input.cursorRuntime, claude: input.claudeRuntime }, resolveCredentialFile)
+    ? addProviderRuntime(args, input.provider, input.command, { codex: input.codexRuntime, cursor: input.cursorRuntime, claude: input.claudeRuntime }, resolveCredentialFile, testFixture)
     : addValidationRuntime(args, input.command);
 
   if (input.profile === "agent_implement") {
@@ -225,7 +226,7 @@ function runProbe(binary: string) {
   });
 }
 
-function addProviderRuntime(args: string[], provider: AgentId, command: { binary: string; args: readonly string[] }, runtimes: { codex?: StagedCodexRuntimeBinding; cursor?: StagedCursorRuntimeBinding; claude?: StagedClaudeRuntimeBinding }, resolveCredentialFile: (source: string) => string | undefined) {
+function addProviderRuntime(args: string[], provider: AgentId, command: { binary: string; args: readonly string[] }, runtimes: { codex?: StagedCodexRuntimeBinding; cursor?: StagedCursorRuntimeBinding; claude?: StagedClaudeRuntimeBinding }, resolveCredentialFile: (source: string) => string | undefined, testFixture: boolean) {
   const hostHome = homedir();
   if (provider === "codex") {
     if (command.binary !== "codex") invalid("Codex provider command is not fixed");
@@ -247,7 +248,9 @@ function addProviderRuntime(args: string[], provider: AgentId, command: { binary
   if (command.binary !== expected) invalid("Claude provider command is not fixed");
   if (!runtimes.claude?.stagedExecutable.startsWith("/")) invalid("Claude sandbox requires an immutable runtime binding");
   args.push("--ro-bind", runtimes.claude.stagedExecutable, "/opt/multiagents/claude");
-  addCredentialFile(args, resolveCredentialFile(join(hostHome, ".claude", ".credentials.json")), join(SANDBOX_HOME, ".claude", ".credentials.json"));
+  const configRoot = testFixture ? "/fixture/claude" : validateClaudeConfigRoot();
+  addParentDirectories(args, SANDBOX_CLAUDE_CONFIG_ROOT);
+  args.push("--bind", configRoot, SANDBOX_CLAUDE_CONFIG_ROOT);
   return { binary: "/opt/multiagents/claude", args: [...command.args] };
 }
 
@@ -307,7 +310,7 @@ function sandboxEnvironment(profile: OsSandboxProfile, provider: AgentId | undef
   };
   if (source.NODE_ENV === "production") env.NODE_ENV = "production";
   if (provider === "codex") env.CODEX_HOME = `${SANDBOX_HOME}/.codex`;
-  if (provider === "claude") env.CLAUDE_CONFIG_DIR = `${SANDBOX_HOME}/.claude`;
+  if (provider === "claude") { env.CLAUDE_CONFIG_DIR = SANDBOX_CLAUDE_CONFIG_ROOT; env.DISABLE_AUTOUPDATER = "1"; }
   if (provider === "cursor") {
     env.XDG_CONFIG_HOME = `${SANDBOX_HOME}/.config`;
     env.XDG_CACHE_HOME = `${SANDBOX_HOME}/.cache`;
