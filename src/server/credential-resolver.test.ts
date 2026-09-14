@@ -76,6 +76,12 @@ describe("Phase 16 credential resolver", () => {
     await expect(resolver.withCredential("agent_claude", (secret) => secret.revealForCapability("agent_claude"))).resolves.toBe("short");
     expect(redactKnownSecrets("key=short", { ANTHROPIC_API_KEY: "short" })).toBe("key=[REDACTED_SECRET]");
   });
+
+  it("keeps the existing minimum length for other registered environment secrets", () => {
+    const environment = { MULTIAGENTS_SLACK_WEBHOOK_URL: "short" };
+    expect(containsKnownSecret("value=short", environment)).toBe(false);
+    expect(redactKnownSecrets("value=short", environment)).toBe("value=short");
+  });
 });
 
 describe("Phase 16 status and persistence boundary", () => {
