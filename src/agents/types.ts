@@ -62,6 +62,8 @@ export type AgentRunOptions = {
 export type AgentAdapter = {
   id: AgentId;
   name: string;
+  /** True when this adapter reaches the production provider-work boundary hook before launch. */
+  supportsProviderWorkBoundary?: true;
   /** True only when this adapter executes AgentRunOptions.afterClose itself. */
   supportsPostCloseFinalization?: true;
   run: (prompt: string, options?: AgentRunOptions) => Promise<AgentResult>;

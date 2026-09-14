@@ -10,9 +10,12 @@ export function cursorArgs(prompt: string, cwd: string, _repositoryTask: boolean
   ];
 }
 
-export const cursorAgent = createAgentAdapter({
-  id: "cursor",
-  name: "Cursor",
-  binary: "agent",
-  args: cursorArgs,
-}, { cwd: workspaceDirectory });
+export const cursorAgent = {
+  ...createAgentAdapter({
+    id: "cursor",
+    name: "Cursor",
+    binary: "agent",
+    args: cursorArgs,
+  }, { cwd: workspaceDirectory }),
+  supportsProviderWorkBoundary: true as const,
+};

@@ -11,9 +11,12 @@ export function codexArgs(prompt: string, cwd: string, repositoryTask: boolean, 
   return ["exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", ...(implement ? ["--dangerously-bypass-approvals-and-sandbox"] : ["--sandbox", "read-only"]), "--cd", cwd, prompt];
 }
 
-export const codexAgent = createAgentAdapter({
-  id: "codex",
-  name: "Codex",
-  binary: "codex",
-  args: codexArgs,
-}, { cwd: workspaceDirectory });
+export const codexAgent = {
+  ...createAgentAdapter({
+    id: "codex",
+    name: "Codex",
+    binary: "codex",
+    args: codexArgs,
+  }, { cwd: workspaceDirectory }),
+  supportsProviderWorkBoundary: true as const,
+};
