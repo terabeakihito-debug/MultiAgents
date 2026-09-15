@@ -13,6 +13,7 @@ describe("task service", () => {
       prompt: "do work",
     });
     expect(() => parseTaskCreateRequest({})).toThrowError(TaskRequestError);
+    expect(() => parseTaskCreateRequest({ forbidden: true })).toThrow("Repository is required");
     expect(() => parseTaskCreateRequest({ repoId: "repo", forbidden: true })).toThrow("Task creation contains a forbidden field");
     expect(() => parseTaskCreateRequest({ repoId: "repo", prompt: "x".repeat(MAX_TASK_PROMPT_LENGTH + 1) })).toThrow(
       "Task prompt must be 1 to 20000 characters",
