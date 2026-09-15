@@ -29,11 +29,11 @@ export function parseTaskCreateRequest(input: unknown): TaskCreateRequest {
     throw new TaskRequestError("repository_required", "Repository is required");
   }
   const body = input as Record<string, unknown>;
-  if (Object.keys(body).some((key) => !["repoId", "templateId", "prompt"].includes(key))) {
-    throw new TaskRequestError("forbidden_field", "Task creation contains a forbidden field");
-  }
   if (typeof body.repoId !== "string") {
     throw new TaskRequestError("repository_required", "Repository is required");
+  }
+  if (Object.keys(body).some((key) => !["repoId", "templateId", "prompt"].includes(key))) {
+    throw new TaskRequestError("forbidden_field", "Task creation contains a forbidden field");
   }
   if (body.templateId !== undefined && typeof body.templateId !== "string") {
     throw new TaskRequestError("template_invalid", "Task template is invalid");
@@ -66,6 +66,7 @@ export function createTaskService(dependencies: TaskDependencies = {
 }) {
   return {
     parseCreateRequest: parseTaskCreateRequest,
+    initialize: () => dependencies.initializeRecovery(),
     async list() {
       await dependencies.initializeRecovery();
       return dependencies.list().map(dependencies.toPublic);
