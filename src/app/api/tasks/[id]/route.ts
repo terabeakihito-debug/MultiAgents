@@ -1,18 +1,19 @@
-import { deleteTask, getTask, getTaskDiff, initializeTaskRecovery, publicTask } from "@/server/tasks";
+import { taskDetailService, TaskDetailNotFoundError } from "@/core/task-detail-service";
+import { deleteTask, initializeTaskRecovery } from "@/server/tasks";
 import { rejectNonLocalRequest, requireHumanMutation } from "@/server/request-security";
 
 export const runtime = "nodejs";
 export async function GET(request: Request, context: { params: Promise<{ id: string }> }) {
   const rejection = rejectNonLocalRequest(request); if (rejection) return rejection;
-  await initializeTaskRecovery();
-  const task = getTask((await context.params).id); if (!task) return Response.json({ error: "Task not found" }, { status: 404 });
-  if (!task.worktreeAvailable) return Response.json({
-    diff: { trackedFiles: [], untrackedFiles: [], stat: "", patch: "", untrackedPatch: "", truncated: false, approvable: false, blockedReason: "Managed task worktree is unavailable in this review-only session." },
-    task: publicTask(task),
-  });
-  try { return Response.json({ diff: await getTaskDiff(task), task: publicTask(task) }); }
-  catch (error) {
-    return Response.json({ diff: await getTaskDiff(task), task: publicTask(task), error: error instanceof Error ? error.message : "Could not load task diff" }, { status: 409 });
+  try {
+    const detail = await taskDetailService.load((await context.params).id);
+    const body = detail.error
+      ? { diff: detail.diff, task: detail.task, error: detail.error }
+      : { diff: detail.diff, task: detail.task };
+    return Response.json(body, detail.conflict ? { status: 409 } : undefined);
+  } catch (error) {
+    if (error instanceof TaskDetailNotFoundError) return Response.json({ error: "Task not found" }, { status: 404 });
+    throw error;
   }
 }
 export async function DELETE(request: Request, context: { params: Promise<{ id: string }> }) {
