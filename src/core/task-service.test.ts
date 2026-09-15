@@ -1,9 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import type { RepoTask } from "../server/tasks";
+import { publicTask as projectTask, type RepoTask } from "../server/tasks";
 import { createTaskService, MAX_TASK_PROMPT_LENGTH, parseTaskCreateRequest, TaskRequestError } from "./task-service";
 
 const task = { id: "task-1" } as unknown as RepoTask;
-const publicTask = { id: "task-1", status: "draft" };
+const projectedTask = {} as ReturnType<typeof projectTask>;
 
 describe("task service", () => {
   it("validates task creation without depending on HTTP", () => {
@@ -22,11 +22,11 @@ describe("task service", () => {
   it("initializes recovery before listing and projects public tasks", async () => {
     const initializeRecovery = vi.fn(async () => undefined);
     const list = vi.fn(() => [task]);
-    const toPublic = vi.fn(() => publicTask);
+    const toPublic = vi.fn((value: RepoTask) => { void value; return projectedTask; });
     const create = vi.fn(async () => task);
-    const service = createTaskService({ initializeRecovery, list, create, toPublic } as Parameters<typeof createTaskService>[0]);
+    const service = createTaskService({ initializeRecovery, list, create, toPublic } as unknown as Parameters<typeof createTaskService>[0]);
 
-    await expect(service.list()).resolves.toEqual([publicTask]);
+    await expect(service.list()).resolves.toEqual([projectedTask]);
     expect(initializeRecovery).toHaveBeenCalledTimes(1);
     expect(list).toHaveBeenCalledTimes(1);
     expect(toPublic).toHaveBeenCalledTimes(1);
@@ -35,12 +35,12 @@ describe("task service", () => {
 
   it("initializes recovery before creation and preserves task options", async () => {
     const initializeRecovery = vi.fn(async () => undefined);
-    const list = vi.fn(() => []);
+    const list = vi.fn(() => [] as RepoTask[]);
     const create = vi.fn(async () => task);
-    const toPublic = vi.fn(() => publicTask);
-    const service = createTaskService({ initializeRecovery, list, create, toPublic } as Parameters<typeof createTaskService>[0]);
+    const toPublic = vi.fn((value: RepoTask) => { void value; return projectedTask; });
+    const service = createTaskService({ initializeRecovery, list, create, toPublic } as unknown as Parameters<typeof createTaskService>[0]);
 
-    await expect(service.create({ repoId: "repo", templateId: "template", prompt: "do work" })).resolves.toEqual(publicTask);
+    await expect(service.create({ repoId: "repo", templateId: "template", prompt: "do work" })).resolves.toEqual(projectedTask);
     expect(initializeRecovery).toHaveBeenCalledTimes(1);
     expect(create).toHaveBeenCalledWith("repo", { templateId: "template", prompt: "do work" });
     expect(toPublic).toHaveBeenCalledWith(task);
