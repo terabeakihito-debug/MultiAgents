@@ -29,7 +29,8 @@ describe("task service", () => {
     await expect(service.list()).resolves.toEqual([publicTask]);
     expect(initializeRecovery).toHaveBeenCalledTimes(1);
     expect(list).toHaveBeenCalledTimes(1);
-    expect(toPublic).toHaveBeenCalledWith(task);
+    expect(toPublic).toHaveBeenCalledTimes(1);
+    expect(toPublic.mock.calls[0][0]).toBe(task);
   });
 
   it("initializes recovery before creation and preserves task options", async () => {
