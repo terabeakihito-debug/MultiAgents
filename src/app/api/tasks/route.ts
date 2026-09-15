@@ -13,6 +13,10 @@ export async function POST(request: Request) {
   const rejection = requireHumanMutation(request, "task-create", { label: "Task creation" });
   if (rejection) return rejection;
 
+  // Preserve the pre-existing recovery timing: task recovery is initialized
+  // before request-body validation, while the operation itself now lives in core.
+  await taskService.initialize();
+
   let body: unknown;
   try {
     body = await request.json();
