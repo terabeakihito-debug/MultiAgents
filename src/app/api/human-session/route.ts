@@ -1,7 +1,7 @@
-import { issueHumanMutationNonce } from "@/server/request-security";
+import { humanSessionService } from "@/core/human-session-service";
 
 export const runtime = "nodejs";
 
 export function GET(request: Request) {
-  return issueHumanMutationNonce(request);
+  return humanSessionService.issue(request);
 }
