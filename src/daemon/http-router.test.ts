@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { Readable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { TaskCiNotFoundError } from "../core/task-ci-service";
 import { DashboardQueryError } from "../core/dashboard-tasks-service";
@@ -26,7 +27,12 @@ import {
   TaskSandboxPolicyNotFoundError,
   TaskSandboxPolicyUnavailableError,
 } from "../core/task-sandbox-policy-service";
+import { humanMutationGateService } from "../core/human-mutation-gate-service";
 import { createDaemonHttpHandler } from "./http-router";
+import {
+  clearHumanMutationSessionsForTests,
+  issueHumanMutationNonce,
+} from "../server/request-security";
 
 function request(
   method: string,
@@ -183,7 +189,48 @@ function dependencies(
     loadStateBackupValidate: vi.fn((backupId: string) => ({
       backup: { backupId, verified: true },
     })) as never,
+    rejectHumanMutation: (webRequest, action, options) =>
+      humanMutationGateService.reject(webRequest, action, options),
+    applyMaintenanceMutation: vi.fn(async () => ({
+      state: "RUNNING",
+    })) as never,
     ...overrides,
+  };
+}
+
+const MAINTENANCE_ORIGIN = "http://127.0.0.1:3000";
+
+function postMaintenanceRequest(
+  headers: Record<string, string>,
+  jsonBody = '{"enabled":false}',
+): IncomingMessage {
+  const stream = Readable.from([Buffer.from(jsonBody)]);
+  return Object.assign(stream, {
+    method: "POST",
+    url: "/maintenance",
+    headers: {
+      host: "127.0.0.1:3000",
+      "content-type": "application/json",
+      ...headers,
+    },
+  }) as unknown as IncomingMessage;
+}
+
+async function issuedMaintenanceNonce(now = Date.now()) {
+  const nonceResponse = issueHumanMutationNonce(
+    new Request(`${MAINTENANCE_ORIGIN}/human-session`, {
+      headers: {
+        host: "127.0.0.1:3000",
+        referer: `${MAINTENANCE_ORIGIN}/`,
+        "sec-fetch-site": "same-origin",
+      },
+    }),
+    now,
+  );
+  const payload = (await nonceResponse.json()) as { nonce: string };
+  return {
+    nonce: payload.nonce,
+    cookie: nonceResponse.headers.get("set-cookie")!.split(";")[0],
   };
 }
 
@@ -293,18 +340,46 @@ describe("daemon HTTP router", () => {
     expect(output.json()).toEqual({ error: "maintenance_state_failed" });
   });
 
-  it("does not expose maintenance mutations on the daemon", async () => {
-    const loadMaintenanceState = vi.fn() as never;
+  it("rejects maintenance POST without the human mutation gate", async () => {
+    const applyMaintenanceMutation = vi.fn(async () => ({
+      state: "RUNNING",
+    })) as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ loadMaintenanceState }),
+      dependencies({ applyMaintenanceMutation }),
     );
     const output = response();
 
-    await handler(request("POST", "/maintenance"), output.value);
+    await handler(postMaintenanceRequest({}), output.value);
 
-    expect(output.status()).toBe(404);
-    expect(output.json()).toEqual({ error: "Not found" });
-    expect(loadMaintenanceState).not.toHaveBeenCalled();
+    expect(output.status()).toBe(403);
+    expect(applyMaintenanceMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts maintenance POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedMaintenanceNonce();
+    const applyMaintenanceMutation = vi.fn(async () => ({
+      state: "RUNNING",
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyMaintenanceMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postMaintenanceRequest({
+        origin: MAINTENANCE_ORIGIN,
+        "sec-fetch-site": "same-origin",
+        "x-multiagents-human-action": "maintenance-mode",
+        "x-multiagents-human-nonce": nonce,
+        cookie,
+      }),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual({ state: "RUNNING" });
+    expect(applyMaintenanceMutation).toHaveBeenCalledWith({ enabled: false });
   });
 
   it("serves state backups through the core state-backups boundary", async () => {

@@ -68,7 +68,13 @@ import {
   RepoTemplatesNotFoundError,
 } from "../core/repo-templates-service";
 import { humanSessionService } from "../core/human-session-service";
+import { humanMutationGateService } from "../core/human-mutation-gate-service";
+import {
+  maintenanceMutationErrorStatus,
+  maintenanceMutationService,
+} from "../core/maintenance-mutation-service";
 import { maintenanceStateService } from "../core/maintenance-state-service";
+import { toWebRequestWithBody } from "./incoming-request";
 import { retentionPolicyService } from "../core/retention-policy-service";
 import { stateBackupsService } from "../core/state-backups-service";
 import {
@@ -107,6 +113,8 @@ type DaemonHttpDependencies = {
   loadRepoTemplates: typeof repoTemplatesService.load;
   loadRepoPulls: typeof repoPullsService.load;
   issueHumanSession: typeof humanSessionService.issue;
+  rejectHumanMutation: typeof humanMutationGateService.reject;
+  applyMaintenanceMutation: typeof maintenanceMutationService.apply;
   loadOutboundSlackSettings: typeof outboundSlackSettingsService.load;
   loadMaintenanceState: typeof maintenanceStateService.load;
   loadStateBackups: typeof stateBackupsService.load;
@@ -140,6 +148,9 @@ export function createDaemonHttpHandler(
     loadRepoTemplates: (repoId) => repoTemplatesService.load(repoId),
     loadRepoPulls: (repoId) => repoPullsService.load(repoId),
     issueHumanSession: (webRequest) => humanSessionService.issue(webRequest),
+    rejectHumanMutation: (webRequest, action, options) =>
+      humanMutationGateService.reject(webRequest, action, options),
+    applyMaintenanceMutation: (body) => maintenanceMutationService.apply(body),
     loadOutboundSlackSettings: () => outboundSlackSettingsService.load(),
     loadMaintenanceState: () => maintenanceStateService.load(),
     loadStateBackups: () => stateBackupsService.load(),
@@ -192,16 +203,61 @@ export function createDaemonHttpHandler(
       return;
     }
 
-    if (request.method === "GET" && url.pathname === "/maintenance") {
-      try {
-        writeJson(response, 200, dependencies.loadMaintenanceState());
-      } catch (error) {
-        console.error(
-          "daemon_maintenance_state_failed",
-          error instanceof Error ? error.message : "unknown",
-        );
-        writeJson(response, 500, { error: "maintenance_state_failed" });
+    if (url.pathname === "/maintenance") {
+      if (request.method === "GET") {
+        try {
+          writeJson(response, 200, dependencies.loadMaintenanceState());
+        } catch (error) {
+          console.error(
+            "daemon_maintenance_state_failed",
+            error instanceof Error ? error.message : "unknown",
+          );
+          writeJson(response, 500, { error: "maintenance_state_failed" });
+        }
+        return;
       }
+
+      if (request.method === "POST") {
+        const webRequest = await toWebRequestWithBody(request);
+        const rejection = dependencies.rejectHumanMutation(
+          webRequest,
+          "maintenance-mode",
+          { label: "Maintenance mode" },
+        );
+        if (rejection) {
+          await writeWebResponse(response, rejection);
+          return;
+        }
+
+        let body: unknown;
+        try {
+          body = await webRequest.json();
+        } catch {
+          writeJson(response, 400, {
+            error: "Request body must be valid JSON",
+          });
+          return;
+        }
+
+        try {
+          writeJson(
+            response,
+            200,
+            await dependencies.applyMaintenanceMutation(body),
+          );
+        } catch (error) {
+          const status = maintenanceMutationErrorStatus(error);
+          writeJson(response, status, {
+            error:
+              error instanceof Error
+                ? error.message
+                : "Maintenance mode update failed",
+          });
+        }
+        return;
+      }
+
+      writeJson(response, 404, { error: "Not found" });
       return;
     }
 
