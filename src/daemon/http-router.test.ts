@@ -96,6 +96,36 @@ describe("daemon HTTP router", () => {
     expect(listTasks).not.toHaveBeenCalled();
   });
 
+
+  it("rejects a non-loopback Host header", async () => {
+    const handler = createDaemonHttpHandler(dependencies());
+    const output = response();
+    const incoming = request("GET", "/tasks");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+  });
+
+  it("rejects a mismatched loopback Origin", async () => {
+    const handler = createDaemonHttpHandler(dependencies());
+    const output = response();
+    const incoming = request("GET", "/tasks");
+    incoming.headers.host = "127.0.0.1:3000";
+    incoming.headers.origin = "http://127.0.0.1:4000";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "Cross-origin requests are not allowed",
+    });
+  });
+
   it("returns 404 for unknown routes", async () => {
     const handler = createDaemonHttpHandler(dependencies());
     const output = response();
