@@ -16,6 +16,11 @@ import {
   TaskHistoryNotFoundError,
 } from "../core/task-history-service";
 import {
+  taskPrService,
+  TaskPrConflictError,
+  TaskPrNotFoundError,
+} from "../core/task-pr-service";
+import {
   taskProfileService,
   TaskProfileInvalidError,
   TaskProfileNotFoundError,
@@ -44,6 +49,7 @@ type DaemonHttpDependencies = {
   loadTaskProfile: typeof taskProfileService.load;
   loadTaskFindings: typeof taskFindingsService.load;
   loadTaskCi: typeof taskCiService.load;
+  loadTaskPr: typeof taskPrService.load;
   loadTaskSandboxPolicy: typeof taskSandboxPolicyService.load;
   loadTaskRuntimePolicy: typeof taskRuntimePolicyService.load;
 };
@@ -57,6 +63,7 @@ export function createDaemonHttpHandler(
     loadTaskProfile: (id) => taskProfileService.load(id),
     loadTaskFindings: (id) => taskFindingsService.load(id),
     loadTaskCi: (id) => taskCiService.load(id),
+    loadTaskPr: (id) => taskPrService.load(id),
     loadTaskSandboxPolicy: (id) => taskSandboxPolicyService.load(id),
     loadTaskRuntimePolicy: (id) => taskRuntimePolicyService.load(id),
   },
@@ -188,6 +195,33 @@ export function createDaemonHttpHandler(
           error instanceof Error ? error.message : "unknown",
         );
         writeJson(response, 500, { error: "task_findings_failed" });
+      }
+      return;
+    }
+
+    const prTaskId = matchTaskLeafPath(url.pathname, "pr");
+    if (prTaskId) {
+      if (request.method !== "GET") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      try {
+        writeJson(response, 200, await dependencies.loadTaskPr(prTaskId));
+      } catch (error) {
+        if (error instanceof TaskPrNotFoundError) {
+          writeJson(response, 404, { error: "Task not found" });
+          return;
+        }
+        if (error instanceof TaskPrConflictError) {
+          writeJson(response, 409, { error: error.message });
+          return;
+        }
+        console.error(
+          "daemon_task_pr_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "task_pr_failed" });
       }
       return;
     }
@@ -362,7 +396,14 @@ function matchTaskIdPath(pathname: string) {
 
 function matchTaskLeafPath(
   pathname: string,
-  leaf: "history" | "profile" | "findings" | "ci" | "sandbox-policy" | "runtime-policy",
+  leaf:
+    | "history"
+    | "profile"
+    | "findings"
+    | "pr"
+    | "ci"
+    | "sandbox-policy"
+    | "runtime-policy",
 ) {
   const match = /^\/tasks\/([^/]+)\/([^/]+)$/.exec(pathname);
   if (!match || match[2] !== leaf) return;

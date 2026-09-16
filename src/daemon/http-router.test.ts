@@ -1,6 +1,10 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { describe, expect, it, vi } from "vitest";
 import { TaskCiNotFoundError } from "../core/task-ci-service";
+import {
+  TaskPrConflictError,
+  TaskPrNotFoundError,
+} from "../core/task-pr-service";
 import { TaskDetailNotFoundError } from "../core/task-detail-service";
 import { TaskFindingsLoadError } from "../core/task-findings-service";
 import { TaskHistoryNotFoundError } from "../core/task-history-service";
@@ -79,6 +83,11 @@ function dependencies(
       task: { id: "task-1" },
       checks: [],
       message: undefined,
+    })) as never,
+    loadTaskPr: vi.fn(async () => ({
+      task: { id: "task-1" },
+      pullRequest: { title: "Fix" },
+      intake: undefined,
     })) as never,
     loadTaskSandboxPolicy: vi.fn(async () => ({
       status: "enforced",
@@ -317,11 +326,17 @@ describe("daemon HTTP router", () => {
   });
 
   it("does not treat nested task paths as task detail", async () => {
+    const payload = {
+      task: { id: "task-1" },
+      pullRequest: { title: "Fix" },
+      intake: undefined,
+    };
     const loadTaskDetail = vi.fn() as never;
     const loadTaskHistory = vi.fn() as never;
     const loadTaskProfile = vi.fn() as never;
     const loadTaskFindings = vi.fn() as never;
     const loadTaskCi = vi.fn() as never;
+    const loadTaskPr = vi.fn(async () => payload) as never;
     const loadTaskSandboxPolicy = vi.fn() as never;
     const loadTaskRuntimePolicy = vi.fn() as never;
     const handler = createDaemonHttpHandler(
@@ -331,6 +346,7 @@ describe("daemon HTTP router", () => {
         loadTaskProfile,
         loadTaskFindings,
         loadTaskCi,
+        loadTaskPr,
         loadTaskSandboxPolicy,
         loadTaskRuntimePolicy,
       }),
@@ -339,8 +355,9 @@ describe("daemon HTTP router", () => {
 
     await handler(request("GET", "/tasks/task-1/pr"), output.value);
 
-    expect(output.status()).toBe(404);
-    expect(output.json()).toEqual({ error: "Not found" });
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(loadTaskPr).toHaveBeenCalledWith("task-1");
     expect(loadTaskDetail).not.toHaveBeenCalled();
     expect(loadTaskHistory).not.toHaveBeenCalled();
     expect(loadTaskProfile).not.toHaveBeenCalled();
@@ -842,6 +859,136 @@ describe("daemon HTTP router", () => {
     expect(loadTaskCi).not.toHaveBeenCalled();
   });
 
+  it("serves task PR through the core task-pr boundary", async () => {
+    const payload = {
+      task: { id: "task-1" },
+      pullRequest: { title: "Fix bug" },
+      intake: { status: "pending" },
+    };
+    const loadTaskPr = vi.fn(async () => payload) as never;
+    const loadTaskDetail = vi.fn() as never;
+    const loadTaskCi = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({
+        loadTaskPr,
+        loadTaskDetail,
+        loadTaskCi,
+      }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/task-1/pr"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadTaskPr).toHaveBeenCalledTimes(1);
+    expect(loadTaskPr).toHaveBeenCalledWith("task-1");
+    expect(loadTaskDetail).not.toHaveBeenCalled();
+    expect(loadTaskCi).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 when the PR task does not exist", async () => {
+    const loadTaskPr = vi.fn(async () => {
+      throw new TaskPrNotFoundError();
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskPr }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/missing/pr"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Task not found" });
+  });
+
+  it("returns 409 when the task has no existing pull request", async () => {
+    const loadTaskPr = vi.fn(async () => {
+      throw new TaskPrConflictError();
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskPr }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/task-1/pr"), output.value);
+
+    expect(output.status()).toBe(409);
+    expect(output.json()).toEqual({
+      error: "Task does not have an existing pull request",
+    });
+  });
+
+  it("returns a stable error when task PR loading fails unexpectedly", async () => {
+    const loadTaskPr = vi.fn(async () => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskPr }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/task-1/pr"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "task_pr_failed" });
+  });
+
+  it("does not expose task PR mutations", async () => {
+    const loadTaskPr = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskPr }),
+    );
+
+    for (const method of ["POST", "DELETE"] as const) {
+      const output = response();
+      await handler(request(method, "/tasks/task-1/pr"), output.value);
+      expect(output.status()).toBe(404);
+      expect(output.json()).toEqual({ error: "Not found" });
+    }
+
+    expect(loadTaskPr).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on task PR", async () => {
+    const loadTaskPr = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskPr }),
+    );
+    const output = response();
+    const incoming = request("GET", "/tasks/task-1/pr");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadTaskPr).not.toHaveBeenCalled();
+  });
+
+  it("rejects a mismatched loopback Origin on task PR", async () => {
+    const loadTaskPr = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskPr }),
+    );
+    const output = response();
+    const incoming = request("GET", "/tasks/task-1/pr");
+    incoming.headers.host = "127.0.0.1:3000";
+    incoming.headers.origin = "http://127.0.0.1:4000";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "Cross-origin requests are not allowed",
+    });
+    expect(loadTaskPr).not.toHaveBeenCalled();
+  });
+
   it("serves task sandbox policy through the core sandbox-policy boundary", async () => {
     const payload = {
       status: "enforced" as const,
@@ -944,16 +1091,21 @@ describe("daemon HTTP router", () => {
 
   it("does not treat pr as sandbox policy", async () => {
     const loadTaskSandboxPolicy = vi.fn() as never;
+    const loadTaskPr = vi.fn(async () => ({
+      task: { id: "task-1" },
+      pullRequest: {},
+      intake: undefined,
+    })) as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ loadTaskSandboxPolicy }),
+      dependencies({ loadTaskSandboxPolicy, loadTaskPr }),
     );
     const output = response();
 
     await handler(request("GET", "/tasks/task-1/pr"), output.value);
 
-    expect(output.status()).toBe(404);
-    expect(output.json()).toEqual({ error: "Not found" });
+    expect(output.status()).toBe(200);
     expect(loadTaskSandboxPolicy).not.toHaveBeenCalled();
+    expect(loadTaskPr).toHaveBeenCalledWith("task-1");
   });
 
   it("rejects a non-loopback Host header on sandbox policy", async () => {
@@ -1090,16 +1242,21 @@ describe("daemon HTTP router", () => {
 
   it("does not treat pr as runtime policy", async () => {
     const loadTaskRuntimePolicy = vi.fn() as never;
+    const loadTaskPr = vi.fn(async () => ({
+      task: { id: "task-1" },
+      pullRequest: {},
+      intake: undefined,
+    })) as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ loadTaskRuntimePolicy }),
+      dependencies({ loadTaskRuntimePolicy, loadTaskPr }),
     );
     const output = response();
 
     await handler(request("GET", "/tasks/task-1/pr"), output.value);
 
-    expect(output.status()).toBe(404);
-    expect(output.json()).toEqual({ error: "Not found" });
+    expect(output.status()).toBe(200);
     expect(loadTaskRuntimePolicy).not.toHaveBeenCalled();
+    expect(loadTaskPr).toHaveBeenCalledWith("task-1");
   });
 
   it("rejects a non-loopback Host header on runtime policy", async () => {
