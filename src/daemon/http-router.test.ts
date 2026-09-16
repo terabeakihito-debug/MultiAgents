@@ -202,6 +202,10 @@ function dependencies(
     parseTaskDeleteBody: vi.fn(() => ({})) as never,
     removeTask: vi.fn(async () => undefined) as never,
     applyRetentionPolicyMutation: vi.fn(() => ({ preset: "balanced" })) as never,
+    applyCleanupPreviewMutation: vi.fn(async () => ({
+      selected: [],
+      estimatedBytes: 0,
+    })) as never,
     ...overrides,
   };
 }
@@ -1156,6 +1160,71 @@ describe("daemon HTTP router", () => {
     }
 
     expect(loadCleanupCandidates).not.toHaveBeenCalled();
+  });
+
+  it("rejects cleanup preview POST without the human mutation gate", async () => {
+    const applyCleanupPreviewMutation = vi.fn(async () => ({
+      selected: [],
+      estimatedBytes: 0,
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyCleanupPreviewMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/cleanup/preview", {}, '{"candidateIds":[]}'),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyCleanupPreviewMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts cleanup preview POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("cleanup-preview");
+    const previewPayload = {
+      selected: [{ id: "notification:n-1" }],
+      estimatedBytes: 10,
+    };
+    const applyCleanupPreviewMutation = vi.fn(async () => previewPayload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyCleanupPreviewMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/cleanup/preview",
+        authorizedHumanHeaders(nonce, cookie, "cleanup-preview"),
+        '{"candidateIds":["notification:n-1"]}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(previewPayload);
+    expect(applyCleanupPreviewMutation).toHaveBeenCalledWith({
+      candidateIds: ["notification:n-1"],
+    });
+  });
+
+  it("does not expose cleanup execute on the daemon", async () => {
+    const applyCleanupPreviewMutation = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyCleanupPreviewMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/cleanup/execute", {}, '{"candidateIds":[]}'),
+      output.value,
+    );
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(applyCleanupPreviewMutation).not.toHaveBeenCalled();
   });
 
   it("rejects a non-loopback Host header on cleanup candidates", async () => {
