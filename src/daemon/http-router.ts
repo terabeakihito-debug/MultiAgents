@@ -151,6 +151,10 @@ import {
   ApprovalError as TaskFetchReviewApprovalError,
   taskFetchReviewMutationService,
 } from "../core/task-fetch-review-mutation-service";
+import {
+  ApprovalError as TaskRefreshPrApprovalError,
+  taskRefreshPrMutationService,
+} from "../core/task-refresh-pr-mutation-service";
 import { taskPrepareApprovalMutationService } from "../core/task-prepare-approval-mutation-service";
 import {
   TaskCleanupRequestError,
@@ -252,6 +256,7 @@ type DaemonHttpDependencies = {
   applyTaskPrepareApprovalMutation: typeof taskPrepareApprovalMutationService.apply;
   applyTaskCreatePrMutation: typeof taskCreatePrMutationService.apply;
   applyTaskFetchReviewMutation: typeof taskFetchReviewMutationService.apply;
+  applyTaskRefreshPrMutation: typeof taskRefreshPrMutationService.apply;
   loadOutboundSlackSettings: typeof outboundSlackSettingsService.load;
   applyOutboundSlackSettingsMutation: typeof outboundSlackSettingsMutationService.apply;
   loadMaintenanceState: typeof maintenanceStateService.load;
@@ -355,6 +360,8 @@ export function createDaemonHttpHandler(
       taskCreatePrMutationService.apply(taskId),
     applyTaskFetchReviewMutation: (taskId) =>
       taskFetchReviewMutationService.apply(taskId),
+    applyTaskRefreshPrMutation: (taskId) =>
+      taskRefreshPrMutationService.apply(taskId),
     loadOutboundSlackSettings: () => outboundSlackSettingsService.load(),
     applyOutboundSlackSettingsMutation: (body) =>
       outboundSlackSettingsMutationService.apply(body),
@@ -2142,6 +2149,43 @@ export function createDaemonHttpHandler(
       return;
     }
 
+    const taskRefreshPrId = matchTaskRefreshPrPath(url.pathname);
+    if (taskRefreshPrId) {
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "task-refresh-pr",
+        { label: "PR status refresh" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          await dependencies.applyTaskRefreshPrMutation(taskRefreshPrId),
+        );
+      } catch (error) {
+        writeJson(
+          response,
+          error instanceof TaskRefreshPrApprovalError ? error.statusCode : 409,
+          {
+            error:
+              error instanceof Error ? error.message : "PR status refresh failed",
+          },
+        );
+      }
+      return;
+    }
+
     const taskFetchReviewId = matchTaskFetchReviewPath(url.pathname);
     if (taskFetchReviewId) {
       if (request.method !== "POST") {
@@ -2616,6 +2660,11 @@ function matchTaskCreatePrPath(pathname: string) {
 
 function matchTaskFetchReviewPath(pathname: string) {
   const match = /^\/tasks\/([^/]+)\/fetch-review$/.exec(pathname);
+  return decodePathSegment(match?.[1]);
+}
+
+function matchTaskRefreshPrPath(pathname: string) {
+  const match = /^\/tasks\/([^/]+)\/refresh-pr$/.exec(pathname);
   return decodePathSegment(match?.[1]);
 }
 
