@@ -238,6 +238,9 @@ function dependencies(
       status: 200,
       body: { diff: {}, task: { id: "task-1" } },
     })) as never,
+    applyTaskCreatePrMutation: vi.fn(async () => ({
+      task: { id: "task-1", prNumber: 42 },
+    })) as never,
     applyRetentionPolicyMutation: vi.fn(() => ({ preset: "balanced" })) as never,
     applyCleanupPreviewMutation: vi.fn(async () => ({
       selected: [],
@@ -3037,6 +3040,48 @@ describe("daemon HTTP router", () => {
 
     expect(output.status()).toBe(500);
     expect(output.json()).toEqual({ error: "task_detail_failed" });
+  });
+
+  it("rejects task create-pr POST without the human mutation gate", async () => {
+    const applyTaskCreatePrMutation = vi.fn(async () => ({
+      task: { id: "task-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskCreatePrMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/tasks/task-1/create-pr", {}, ""),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyTaskCreatePrMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts task create-pr POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("task-create-pr");
+    const payload = { task: { id: "task-1", prNumber: 42 } };
+    const applyTaskCreatePrMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskCreatePrMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/create-pr",
+        authorizedHumanHeaders(nonce, cookie, "task-create-pr"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyTaskCreatePrMutation).toHaveBeenCalledWith("task-1");
   });
 
   it("rejects task prepare-approval POST without the human mutation gate", async () => {

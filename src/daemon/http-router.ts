@@ -143,6 +143,10 @@ import {
   TaskApplyReviewInputError,
   taskApplyReviewMutationService,
 } from "../core/task-apply-review-mutation-service";
+import {
+  ApprovalError as TaskCreatePrApprovalError,
+  taskCreatePrMutationService,
+} from "../core/task-create-pr-mutation-service";
 import { taskPrepareApprovalMutationService } from "../core/task-prepare-approval-mutation-service";
 import {
   TaskCleanupRequestError,
@@ -242,6 +246,7 @@ type DaemonHttpDependencies = {
   applyTaskApproveReworkMutation: typeof taskApproveReworkMutationService.apply;
   applyTaskApplyReviewMutation: typeof taskApplyReviewMutationService.apply;
   applyTaskPrepareApprovalMutation: typeof taskPrepareApprovalMutationService.apply;
+  applyTaskCreatePrMutation: typeof taskCreatePrMutationService.apply;
   loadOutboundSlackSettings: typeof outboundSlackSettingsService.load;
   applyOutboundSlackSettingsMutation: typeof outboundSlackSettingsMutationService.apply;
   loadMaintenanceState: typeof maintenanceStateService.load;
@@ -341,6 +346,8 @@ export function createDaemonHttpHandler(
       taskApplyReviewMutationService.apply(taskId, body),
     applyTaskPrepareApprovalMutation: (taskId) =>
       taskPrepareApprovalMutationService.apply(taskId),
+    applyTaskCreatePrMutation: (taskId) =>
+      taskCreatePrMutationService.apply(taskId),
     loadOutboundSlackSettings: () => outboundSlackSettingsService.load(),
     applyOutboundSlackSettingsMutation: (body) =>
       outboundSlackSettingsMutationService.apply(body),
@@ -2128,6 +2135,38 @@ export function createDaemonHttpHandler(
       return;
     }
 
+    const taskCreatePrId = matchTaskCreatePrPath(url.pathname);
+    if (taskCreatePrId) {
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "task-create-pr",
+        { label: "PR creation" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          await dependencies.applyTaskCreatePrMutation(taskCreatePrId),
+        );
+      } catch (error) {
+        writeJson(response, error instanceof TaskCreatePrApprovalError ? error.statusCode : 409, {
+          error: error instanceof Error ? error.message : "PR retry failed",
+        });
+      }
+      return;
+    }
+
     const taskPrepareApprovalId = matchTaskPrepareApprovalPath(url.pathname);
     if (taskPrepareApprovalId) {
       if (request.method !== "POST") {
@@ -2523,6 +2562,11 @@ function matchTaskApplyReviewPath(pathname: string) {
 
 function matchTaskPrepareApprovalPath(pathname: string) {
   const match = /^\/tasks\/([^/]+)\/prepare-approval$/.exec(pathname);
+  return decodePathSegment(match?.[1]);
+}
+
+function matchTaskCreatePrPath(pathname: string) {
+  const match = /^\/tasks\/([^/]+)\/create-pr$/.exec(pathname);
   return decodePathSegment(match?.[1]);
 }
 
