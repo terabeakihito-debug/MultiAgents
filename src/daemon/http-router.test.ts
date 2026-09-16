@@ -8,6 +8,10 @@ import {
   TaskProfileInvalidError,
   TaskProfileNotFoundError,
 } from "../core/task-profile-service";
+import {
+  TaskSandboxPolicyNotFoundError,
+  TaskSandboxPolicyUnavailableError,
+} from "../core/task-sandbox-policy-service";
 import { createDaemonHttpHandler } from "./http-router";
 
 function request(
@@ -71,6 +75,11 @@ function dependencies(
       task: { id: "task-1" },
       checks: [],
       message: undefined,
+    })) as never,
+    loadTaskSandboxPolicy: vi.fn(async () => ({
+      status: "enforced",
+      validation: { profile: "validation" },
+      agents: [],
     })) as never,
     ...overrides,
   };
@@ -304,6 +313,7 @@ describe("daemon HTTP router", () => {
     const loadTaskProfile = vi.fn() as never;
     const loadTaskFindings = vi.fn() as never;
     const loadTaskCi = vi.fn() as never;
+    const loadTaskSandboxPolicy = vi.fn() as never;
     const handler = createDaemonHttpHandler(
       dependencies({
         loadTaskDetail,
@@ -311,11 +321,12 @@ describe("daemon HTTP router", () => {
         loadTaskProfile,
         loadTaskFindings,
         loadTaskCi,
+        loadTaskSandboxPolicy,
       }),
     );
     const output = response();
 
-    await handler(request("GET", "/tasks/task-1/sandbox-policy"), output.value);
+    await handler(request("GET", "/tasks/task-1/runtime-policy"), output.value);
 
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Not found" });
@@ -324,6 +335,7 @@ describe("daemon HTTP router", () => {
     expect(loadTaskProfile).not.toHaveBeenCalled();
     expect(loadTaskFindings).not.toHaveBeenCalled();
     expect(loadTaskCi).not.toHaveBeenCalled();
+    expect(loadTaskSandboxPolicy).not.toHaveBeenCalled();
   });
 
   it("serves task history through the core task-history boundary", async () => {
@@ -816,5 +828,158 @@ describe("daemon HTTP router", () => {
       error: "Cross-origin requests are not allowed",
     });
     expect(loadTaskCi).not.toHaveBeenCalled();
+  });
+
+  it("serves task sandbox policy through the core sandbox-policy boundary", async () => {
+    const payload = {
+      status: "enforced" as const,
+      validation: { profile: "validation" },
+      agents: [{ agent: "codex", profile: "agent_read_only" }],
+    };
+    const loadTaskSandboxPolicy = vi.fn(async () => payload) as never;
+    const loadTaskDetail = vi.fn() as never;
+    const loadTaskHistory = vi.fn() as never;
+    const loadTaskProfile = vi.fn() as never;
+    const loadTaskFindings = vi.fn() as never;
+    const loadTaskCi = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({
+        loadTaskSandboxPolicy,
+        loadTaskDetail,
+        loadTaskHistory,
+        loadTaskProfile,
+        loadTaskFindings,
+        loadTaskCi,
+      }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/task-1/sandbox-policy"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadTaskSandboxPolicy).toHaveBeenCalledTimes(1);
+    expect(loadTaskSandboxPolicy).toHaveBeenCalledWith("task-1");
+    expect(loadTaskDetail).not.toHaveBeenCalled();
+    expect(loadTaskHistory).not.toHaveBeenCalled();
+    expect(loadTaskProfile).not.toHaveBeenCalled();
+    expect(loadTaskFindings).not.toHaveBeenCalled();
+    expect(loadTaskCi).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 when the sandbox-policy task does not exist", async () => {
+    const loadTaskSandboxPolicy = vi.fn(async () => {
+      throw new TaskSandboxPolicyNotFoundError();
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskSandboxPolicy }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/missing/sandbox-policy"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Task not found" });
+  });
+
+  it("returns 409 when the sandbox policy is unavailable", async () => {
+    const loadTaskSandboxPolicy = vi.fn(async () => {
+      throw new TaskSandboxPolicyUnavailableError("OS sandbox unavailable");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskSandboxPolicy }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/task-1/sandbox-policy"), output.value);
+
+    expect(output.status()).toBe(409);
+    expect(output.json()).toEqual({ error: "OS sandbox unavailable" });
+  });
+
+  it("returns a stable error when sandbox policy loading fails unexpectedly", async () => {
+    const loadTaskSandboxPolicy = vi.fn(async () => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskSandboxPolicy }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/task-1/sandbox-policy"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "task_sandbox_policy_failed" });
+  });
+
+  it("does not expose sandbox policy mutations", async () => {
+    const loadTaskSandboxPolicy = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskSandboxPolicy }),
+    );
+
+    for (const method of ["POST", "DELETE"] as const) {
+      const output = response();
+      await handler(request(method, "/tasks/task-1/sandbox-policy"), output.value);
+      expect(output.status()).toBe(404);
+      expect(output.json()).toEqual({ error: "Not found" });
+    }
+
+    expect(loadTaskSandboxPolicy).not.toHaveBeenCalled();
+  });
+
+  it("does not treat runtime-policy or pr as sandbox policy", async () => {
+    const loadTaskSandboxPolicy = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskSandboxPolicy }),
+    );
+
+    for (const path of ["/tasks/task-1/runtime-policy", "/tasks/task-1/pr"] as const) {
+      const output = response();
+      await handler(request("GET", path), output.value);
+      expect(output.status()).toBe(404);
+      expect(output.json()).toEqual({ error: "Not found" });
+    }
+
+    expect(loadTaskSandboxPolicy).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on sandbox policy", async () => {
+    const loadTaskSandboxPolicy = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskSandboxPolicy }),
+    );
+    const output = response();
+    const incoming = request("GET", "/tasks/task-1/sandbox-policy");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadTaskSandboxPolicy).not.toHaveBeenCalled();
+  });
+
+  it("rejects a mismatched loopback Origin on sandbox policy", async () => {
+    const loadTaskSandboxPolicy = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskSandboxPolicy }),
+    );
+    const output = response();
+    const incoming = request("GET", "/tasks/task-1/sandbox-policy");
+    incoming.headers.host = "127.0.0.1:3000";
+    incoming.headers.origin = "http://127.0.0.1:4000";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "Cross-origin requests are not allowed",
+    });
+    expect(loadTaskSandboxPolicy).not.toHaveBeenCalled();
   });
 });

@@ -20,6 +20,11 @@ import {
   TaskProfileInvalidError,
   TaskProfileNotFoundError,
 } from "../core/task-profile-service";
+import {
+  taskSandboxPolicyService,
+  TaskSandboxPolicyNotFoundError,
+  TaskSandboxPolicyUnavailableError,
+} from "../core/task-sandbox-policy-service";
 import { taskService } from "../core/task-service";
 import {
   healthReadiness,
@@ -34,6 +39,7 @@ type DaemonHttpDependencies = {
   loadTaskProfile: typeof taskProfileService.load;
   loadTaskFindings: typeof taskFindingsService.load;
   loadTaskCi: typeof taskCiService.load;
+  loadTaskSandboxPolicy: typeof taskSandboxPolicyService.load;
 };
 
 export function createDaemonHttpHandler(
@@ -45,6 +51,7 @@ export function createDaemonHttpHandler(
     loadTaskProfile: (id) => taskProfileService.load(id),
     loadTaskFindings: (id) => taskFindingsService.load(id),
     loadTaskCi: (id) => taskCiService.load(id),
+    loadTaskSandboxPolicy: (id) => taskSandboxPolicyService.load(id),
   },
 ) {
   return async function handleDaemonHttp(
@@ -201,6 +208,37 @@ export function createDaemonHttpHandler(
       return;
     }
 
+    const sandboxPolicyTaskId = matchTaskLeafPath(url.pathname, "sandbox-policy");
+    if (sandboxPolicyTaskId) {
+      if (request.method !== "GET") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          await dependencies.loadTaskSandboxPolicy(sandboxPolicyTaskId),
+        );
+      } catch (error) {
+        if (error instanceof TaskSandboxPolicyNotFoundError) {
+          writeJson(response, 404, { error: "Task not found" });
+          return;
+        }
+        if (error instanceof TaskSandboxPolicyUnavailableError) {
+          writeJson(response, 409, { error: error.message });
+          return;
+        }
+        console.error(
+          "daemon_task_sandbox_policy_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "task_sandbox_policy_failed" });
+      }
+      return;
+    }
+
     const taskId = matchTaskIdPath(url.pathname);
     if (taskId) {
       if (request.method !== "GET") {
@@ -286,7 +324,7 @@ function matchTaskIdPath(pathname: string) {
 
 function matchTaskLeafPath(
   pathname: string,
-  leaf: "history" | "profile" | "findings" | "ci",
+  leaf: "history" | "profile" | "findings" | "ci" | "sandbox-policy",
 ) {
   const match = /^\/tasks\/([^/]+)\/([^/]+)$/.exec(pathname);
   if (!match || match[2] !== leaf) return;
