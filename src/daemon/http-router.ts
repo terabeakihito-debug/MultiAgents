@@ -4,6 +4,10 @@ import {
   TaskDetailNotFoundError,
 } from "../core/task-detail-service";
 import {
+  taskFindingsService,
+  TaskFindingsLoadError,
+} from "../core/task-findings-service";
+import {
   taskHistoryService,
   TaskHistoryNotFoundError,
 } from "../core/task-history-service";
@@ -24,6 +28,7 @@ type DaemonHttpDependencies = {
   loadTaskDetail: typeof taskDetailService.load;
   loadTaskHistory: typeof taskHistoryService.load;
   loadTaskProfile: typeof taskProfileService.load;
+  loadTaskFindings: typeof taskFindingsService.load;
 };
 
 export function createDaemonHttpHandler(
@@ -33,6 +38,7 @@ export function createDaemonHttpHandler(
     loadTaskDetail: (id) => taskDetailService.load(id),
     loadTaskHistory: (id) => taskHistoryService.load(id),
     loadTaskProfile: (id) => taskProfileService.load(id),
+    loadTaskFindings: (id) => taskFindingsService.load(id),
   },
 ) {
   return async function handleDaemonHttp(
@@ -139,6 +145,33 @@ export function createDaemonHttpHandler(
       return;
     }
 
+    const findingsTaskId = matchTaskLeafPath(url.pathname, "findings");
+    if (findingsTaskId) {
+      if (request.method !== "GET") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          await dependencies.loadTaskFindings(findingsTaskId),
+        );
+      } catch (error) {
+        if (error instanceof TaskFindingsLoadError) {
+          writeJson(response, 404, { error: error.message });
+          return;
+        }
+        console.error(
+          "daemon_task_findings_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "task_findings_failed" });
+      }
+      return;
+    }
+
     const taskId = matchTaskIdPath(url.pathname);
     if (taskId) {
       if (request.method !== "GET") {
@@ -222,7 +255,10 @@ function matchTaskIdPath(pathname: string) {
   return decodeTaskIdSegment(/^\/tasks\/([^/]+)$/.exec(pathname)?.[1]);
 }
 
-function matchTaskLeafPath(pathname: string, leaf: "history" | "profile") {
+function matchTaskLeafPath(
+  pathname: string,
+  leaf: "history" | "profile" | "findings",
+) {
   const match = /^\/tasks\/([^/]+)\/([^/]+)$/.exec(pathname);
   if (!match || match[2] !== leaf) return;
   return decodeTaskIdSegment(match[1]);

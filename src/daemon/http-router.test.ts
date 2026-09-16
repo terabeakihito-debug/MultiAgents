@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { describe, expect, it, vi } from "vitest";
 import { TaskDetailNotFoundError } from "../core/task-detail-service";
+import { TaskFindingsLoadError } from "../core/task-findings-service";
 import { TaskHistoryNotFoundError } from "../core/task-history-service";
 import {
   TaskProfileInvalidError,
@@ -61,6 +62,9 @@ function dependencies(
     })) as never,
     loadTaskProfile: vi.fn(async () => ({
       profile: { id: "default" },
+    })) as never,
+    loadTaskFindings: vi.fn(async () => ({
+      findings: [],
     })) as never,
     ...overrides,
   };
@@ -292,18 +296,25 @@ describe("daemon HTTP router", () => {
     const loadTaskDetail = vi.fn() as never;
     const loadTaskHistory = vi.fn() as never;
     const loadTaskProfile = vi.fn() as never;
+    const loadTaskFindings = vi.fn() as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ loadTaskDetail, loadTaskHistory, loadTaskProfile }),
+      dependencies({
+        loadTaskDetail,
+        loadTaskHistory,
+        loadTaskProfile,
+        loadTaskFindings,
+      }),
     );
     const output = response();
 
-    await handler(request("GET", "/tasks/task-1/findings"), output.value);
+    await handler(request("GET", "/tasks/task-1/ci"), output.value);
 
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Not found" });
     expect(loadTaskDetail).not.toHaveBeenCalled();
     expect(loadTaskHistory).not.toHaveBeenCalled();
     expect(loadTaskProfile).not.toHaveBeenCalled();
+    expect(loadTaskFindings).not.toHaveBeenCalled();
   });
 
   it("serves task history through the core task-history boundary", async () => {
@@ -316,8 +327,14 @@ describe("daemon HTTP router", () => {
     const loadTaskHistory = vi.fn(async () => ({ history })) as never;
     const loadTaskDetail = vi.fn() as never;
     const loadTaskProfile = vi.fn() as never;
+    const loadTaskFindings = vi.fn() as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ loadTaskHistory, loadTaskDetail, loadTaskProfile }),
+      dependencies({
+        loadTaskHistory,
+        loadTaskDetail,
+        loadTaskProfile,
+        loadTaskFindings,
+      }),
     );
     const output = response();
 
@@ -331,6 +348,7 @@ describe("daemon HTTP router", () => {
     expect(loadTaskHistory).toHaveBeenCalledWith("task-1");
     expect(loadTaskDetail).not.toHaveBeenCalled();
     expect(loadTaskProfile).not.toHaveBeenCalled();
+    expect(loadTaskFindings).not.toHaveBeenCalled();
   });
 
   it("returns 404 when task history does not exist", async () => {
@@ -421,8 +439,14 @@ describe("daemon HTTP router", () => {
     const loadTaskProfile = vi.fn(async () => ({ profile })) as never;
     const loadTaskDetail = vi.fn() as never;
     const loadTaskHistory = vi.fn() as never;
+    const loadTaskFindings = vi.fn() as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ loadTaskProfile, loadTaskDetail, loadTaskHistory }),
+      dependencies({
+        loadTaskProfile,
+        loadTaskDetail,
+        loadTaskHistory,
+        loadTaskFindings,
+      }),
     );
     const output = response();
 
@@ -436,6 +460,7 @@ describe("daemon HTTP router", () => {
     expect(loadTaskProfile).toHaveBeenCalledWith("task-1");
     expect(loadTaskDetail).not.toHaveBeenCalled();
     expect(loadTaskHistory).not.toHaveBeenCalled();
+    expect(loadTaskFindings).not.toHaveBeenCalled();
   });
 
   it("returns 404 when task profile does not exist", async () => {
@@ -534,5 +559,131 @@ describe("daemon HTTP router", () => {
       error: "Cross-origin requests are not allowed",
     });
     expect(loadTaskProfile).not.toHaveBeenCalled();
+  });
+
+  it("serves task findings through the core task-findings boundary", async () => {
+    const findings = [{ findingId: "finding-1", history: [], remediation: { stage: "open" } }];
+    const loadTaskFindings = vi.fn(async () => ({ findings })) as never;
+    const loadTaskDetail = vi.fn() as never;
+    const loadTaskHistory = vi.fn() as never;
+    const loadTaskProfile = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({
+        loadTaskFindings,
+        loadTaskDetail,
+        loadTaskHistory,
+        loadTaskProfile,
+      }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/task-1/findings"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual({ findings });
+    expect(loadTaskFindings).toHaveBeenCalledTimes(1);
+    expect(loadTaskFindings).toHaveBeenCalledWith("task-1");
+    expect(loadTaskDetail).not.toHaveBeenCalled();
+    expect(loadTaskHistory).not.toHaveBeenCalled();
+    expect(loadTaskProfile).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 when task findings cannot be loaded", async () => {
+    const loadTaskFindings = vi.fn(async () => {
+      throw new TaskFindingsLoadError("Source task not found");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskFindings }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/missing/findings"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Source task not found" });
+  });
+
+  it("returns a stable error when task findings loading fails unexpectedly", async () => {
+    const loadTaskFindings = vi.fn(async () => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskFindings }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/task-1/findings"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "task_findings_failed" });
+  });
+
+  it("does not expose task findings mutations", async () => {
+    const loadTaskFindings = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskFindings }),
+    );
+
+    for (const method of ["POST", "DELETE"] as const) {
+      const output = response();
+      await handler(request(method, "/tasks/task-1/findings"), output.value);
+      expect(output.status()).toBe(404);
+      expect(output.json()).toEqual({ error: "Not found" });
+    }
+
+    expect(loadTaskFindings).not.toHaveBeenCalled();
+  });
+
+  it("does not treat findings extract as the findings read", async () => {
+    const loadTaskFindings = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskFindings }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/task-1/findings/extract"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadTaskFindings).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on task findings", async () => {
+    const loadTaskFindings = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskFindings }),
+    );
+    const output = response();
+    const incoming = request("GET", "/tasks/task-1/findings");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadTaskFindings).not.toHaveBeenCalled();
+  });
+
+  it("rejects a mismatched loopback Origin on task findings", async () => {
+    const loadTaskFindings = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskFindings }),
+    );
+    const output = response();
+    const incoming = request("GET", "/tasks/task-1/findings");
+    incoming.headers.host = "127.0.0.1:3000";
+    incoming.headers.origin = "http://127.0.0.1:4000";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "Cross-origin requests are not allowed",
+    });
+    expect(loadTaskFindings).not.toHaveBeenCalled();
   });
 });
