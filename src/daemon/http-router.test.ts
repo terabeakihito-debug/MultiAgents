@@ -247,6 +247,10 @@ function dependencies(
     applyTaskRefreshPrMutation: vi.fn(async () => ({
       task: { id: "task-1", prNumber: 42 },
     })) as never,
+    applyTaskResumeMutation: vi.fn(async () => ({
+      status: 200,
+      body: { task: { id: "task-1" } },
+    })) as never,
     applyRetentionPolicyMutation: vi.fn(() => ({ preset: "balanced" })) as never,
     applyCleanupPreviewMutation: vi.fn(async () => ({
       selected: [],
@@ -3046,6 +3050,52 @@ describe("daemon HTTP router", () => {
 
     expect(output.status()).toBe(500);
     expect(output.json()).toEqual({ error: "task_detail_failed" });
+  });
+
+  it("rejects task resume POST without the human mutation gate", async () => {
+    const applyTaskResumeMutation = vi.fn(async () => ({
+      status: 200,
+      body: {},
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskResumeMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/tasks/task-1/resume", {}, ""),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyTaskResumeMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts task resume POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("task-resume");
+    const payload = {
+      status: 200,
+      body: { diff: {}, task: { id: "task-1" } },
+    };
+    const applyTaskResumeMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskResumeMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/resume",
+        authorizedHumanHeaders(nonce, cookie, "task-resume"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload.body);
+    expect(applyTaskResumeMutation).toHaveBeenCalledWith("task-1");
   });
 
   it("rejects task refresh-pr POST without the human mutation gate", async () => {

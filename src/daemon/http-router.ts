@@ -155,6 +155,7 @@ import {
   ApprovalError as TaskRefreshPrApprovalError,
   taskRefreshPrMutationService,
 } from "../core/task-refresh-pr-mutation-service";
+import { taskResumeMutationService } from "../core/task-resume-mutation-service";
 import { taskPrepareApprovalMutationService } from "../core/task-prepare-approval-mutation-service";
 import {
   TaskCleanupRequestError,
@@ -257,6 +258,7 @@ type DaemonHttpDependencies = {
   applyTaskCreatePrMutation: typeof taskCreatePrMutationService.apply;
   applyTaskFetchReviewMutation: typeof taskFetchReviewMutationService.apply;
   applyTaskRefreshPrMutation: typeof taskRefreshPrMutationService.apply;
+  applyTaskResumeMutation: typeof taskResumeMutationService.apply;
   loadOutboundSlackSettings: typeof outboundSlackSettingsService.load;
   applyOutboundSlackSettingsMutation: typeof outboundSlackSettingsMutationService.apply;
   loadMaintenanceState: typeof maintenanceStateService.load;
@@ -362,6 +364,8 @@ export function createDaemonHttpHandler(
       taskFetchReviewMutationService.apply(taskId),
     applyTaskRefreshPrMutation: (taskId) =>
       taskRefreshPrMutationService.apply(taskId),
+    applyTaskResumeMutation: (taskId) =>
+      taskResumeMutationService.apply(taskId),
     loadOutboundSlackSettings: () => outboundSlackSettingsService.load(),
     applyOutboundSlackSettingsMutation: (body) =>
       outboundSlackSettingsMutationService.apply(body),
@@ -2149,6 +2153,29 @@ export function createDaemonHttpHandler(
       return;
     }
 
+    const taskResumeId = matchTaskResumePath(url.pathname);
+    if (taskResumeId) {
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "task-resume",
+        { label: "Task resume" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      const result = await dependencies.applyTaskResumeMutation(taskResumeId);
+      writeJson(response, result.status, result.body);
+      return;
+    }
+
     const taskRefreshPrId = matchTaskRefreshPrPath(url.pathname);
     if (taskRefreshPrId) {
       if (request.method !== "POST") {
@@ -2665,6 +2692,11 @@ function matchTaskFetchReviewPath(pathname: string) {
 
 function matchTaskRefreshPrPath(pathname: string) {
   const match = /^\/tasks\/([^/]+)\/refresh-pr$/.exec(pathname);
+  return decodePathSegment(match?.[1]);
+}
+
+function matchTaskResumePath(pathname: string) {
+  const match = /^\/tasks\/([^/]+)\/resume$/.exec(pathname);
   return decodePathSegment(match?.[1]);
 }
 
