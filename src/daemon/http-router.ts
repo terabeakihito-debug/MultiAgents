@@ -87,6 +87,7 @@ import {
   NotificationInputError as NotificationPreferencesInputError,
   notificationPreferencesMutationService,
 } from "../core/notification-preferences-mutation-service";
+import { notificationReadMutationService } from "../core/notification-read-mutation-service";
 import { profileListService } from "../core/profile-list-service";
 import { repoListService } from "../core/repo-list-service";
 import {
@@ -172,6 +173,7 @@ type DaemonHttpDependencies = {
   loadRepoList: typeof repoListService.load;
   loadCredentialStatus: typeof credentialStatusService.load;
   loadNotifications: typeof notificationListService.load;
+  applyNotificationReadMutation: typeof notificationReadMutationService.apply;
   loadFindingsQueue: typeof findingsQueueService.load;
   loadOperationsOverview: typeof operationsOverviewService.load;
   loadDashboardTasks: typeof dashboardTasksService.load;
@@ -237,6 +239,8 @@ export function createDaemonHttpHandler(
     loadRepoList: () => repoListService.load(),
     loadCredentialStatus: () => credentialStatusService.load(),
     loadNotifications: (url) => notificationListService.load(url),
+    applyNotificationReadMutation: (notificationId) =>
+      notificationReadMutationService.apply(notificationId),
     loadFindingsQueue: (url) => findingsQueueService.load(url),
     loadOperationsOverview: () => operationsOverviewService.load(),
     loadDashboardTasks: (url) => dashboardTasksService.load(url),
@@ -1201,6 +1205,42 @@ export function createDaemonHttpHandler(
       return;
     }
 
+    const notificationReadId = matchNotificationReadPath(url.pathname);
+    if (notificationReadId) {
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "notification-read",
+        { label: "Notification" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      try {
+        const notification = dependencies.applyNotificationReadMutation(
+          notificationReadId,
+        );
+        if (!notification) {
+          writeJson(response, 404, { error: "Notification not found" });
+          return;
+        }
+        writeJson(response, 200, { notification });
+      } catch (error) {
+        writeJson(response, 400, {
+          error:
+            error instanceof Error ? error.message : "Notification update failed",
+        });
+      }
+      return;
+    }
+
     if (request.method === "GET" && url.pathname === "/notifications") {
       try {
         writeJson(response, 200, dependencies.loadNotifications(url));
@@ -2077,6 +2117,11 @@ function matchFindingResolvePath(pathname: string) {
 
 function matchFindingPriorityPath(pathname: string) {
   const match = /^\/findings\/([^/]+)\/priority$/.exec(pathname);
+  return decodePathSegment(match?.[1]);
+}
+
+function matchNotificationReadPath(pathname: string) {
+  const match = /^\/notifications\/([^/]+)\/read$/.exec(pathname);
   return decodePathSegment(match?.[1]);
 }
 

@@ -132,6 +132,10 @@ function dependencies(
       notifications: [{ id: "n-1" }],
       unreadCount: 1,
     })) as never,
+    applyNotificationReadMutation: vi.fn(() => ({
+      notificationId: "n-1",
+      status: "read",
+    })) as never,
     loadFindingsQueue: vi.fn(() => ({
       findings: [{ findingId: "f-1" }],
       counts: { total: 1 },
@@ -2044,6 +2048,67 @@ describe("daemon HTTP router", () => {
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Not found" });
     expect(loadNotifications).not.toHaveBeenCalled();
+  });
+
+  it("rejects notification read POST without the human mutation gate", async () => {
+    const applyNotificationReadMutation = vi.fn(() => ({
+      notificationId: "n-1",
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationReadMutation }),
+    );
+    const output = response();
+
+    await handler(postJsonRequest("/notifications/n-1/read", {}, ""), output.value);
+
+    expect(output.status()).toBe(403);
+    expect(applyNotificationReadMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts notification read POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("notification-read");
+    const notification = { notificationId: "n-1", status: "read" };
+    const applyNotificationReadMutation = vi.fn(() => notification) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationReadMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/notifications/n-1/read",
+        authorizedHumanHeaders(nonce, cookie, "notification-read"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual({ notification });
+    expect(applyNotificationReadMutation).toHaveBeenCalledWith("n-1");
+  });
+
+  it("returns not found when notification read misses", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("notification-read");
+    const applyNotificationReadMutation = vi.fn(() => undefined);
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationReadMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/notifications/n-1/read",
+        authorizedHumanHeaders(nonce, cookie, "notification-read"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Notification not found" });
   });
 
   it("rejects a non-loopback Host header on notification listing", async () => {
