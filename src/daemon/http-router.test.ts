@@ -104,6 +104,9 @@ function dependencies(
       profiles: [],
       versions: [],
     })) as never,
+    loadRepoList: vi.fn(async () => ({
+      repos: [{ id: "repo-1", templates: [], settings: {} }],
+    })) as never,
     ...overrides,
   };
 }
@@ -175,6 +178,72 @@ describe("daemon HTTP router", () => {
       error: "This API is available only on localhost",
     });
     expect(loadProfileList).not.toHaveBeenCalled();
+  });
+
+  it("serves the repository catalog through the core repo-list boundary", async () => {
+    const payload = {
+      repos: [{ id: "repo-1", name: "Repo One", templates: [], settings: {} }],
+    };
+    const loadRepoList = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoList }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/repos"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadRepoList).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a stable error when repository listing fails", async () => {
+    const loadRepoList = vi.fn(async () => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoList }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/repos"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "repo_list_failed" });
+  });
+
+  it("does not expose repository listing on unsupported methods", async () => {
+    const loadRepoList = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoList }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/repos"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadRepoList).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on repository listing", async () => {
+    const loadRepoList = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoList }),
+    );
+    const output = response();
+    const incoming = request("GET", "/repos");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadRepoList).not.toHaveBeenCalled();
   });
 
   it("serves the task list through the core task boundary", async () => {

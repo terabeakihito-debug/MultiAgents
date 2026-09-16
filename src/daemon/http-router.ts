@@ -36,6 +36,7 @@ import {
   TaskSandboxPolicyUnavailableError,
 } from "../core/task-sandbox-policy-service";
 import { profileListService } from "../core/profile-list-service";
+import { repoListService } from "../core/repo-list-service";
 import { taskService } from "../core/task-service";
 import {
   healthReadiness,
@@ -54,6 +55,7 @@ type DaemonHttpDependencies = {
   loadTaskSandboxPolicy: typeof taskSandboxPolicyService.load;
   loadTaskRuntimePolicy: typeof taskRuntimePolicyService.load;
   loadProfileList: typeof profileListService.load;
+  loadRepoList: typeof repoListService.load;
 };
 
 export function createDaemonHttpHandler(
@@ -69,6 +71,7 @@ export function createDaemonHttpHandler(
     loadTaskSandboxPolicy: (id) => taskSandboxPolicyService.load(id),
     loadTaskRuntimePolicy: (id) => taskRuntimePolicyService.load(id),
     loadProfileList: () => profileListService.load(),
+    loadRepoList: () => repoListService.load(),
   },
 ) {
   return async function handleDaemonHttp(
@@ -112,6 +115,19 @@ export function createDaemonHttpHandler(
           error instanceof Error ? error.message : "unknown",
         );
         writeJson(response, 500, { error: "profile_list_failed" });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/repos") {
+      try {
+        writeJson(response, 200, await dependencies.loadRepoList());
+      } catch (error) {
+        console.error(
+          "daemon_repo_list_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "repo_list_failed" });
       }
       return;
     }
