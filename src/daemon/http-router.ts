@@ -35,6 +35,10 @@ import {
   TaskSandboxPolicyNotFoundError,
   TaskSandboxPolicyUnavailableError,
 } from "../core/task-sandbox-policy-service";
+import {
+  dashboardTasksService,
+  DashboardQueryError,
+} from "../core/dashboard-tasks-service";
 import { credentialStatusService } from "../core/credential-status-service";
 import {
   findingsQueueService,
@@ -70,6 +74,7 @@ type DaemonHttpDependencies = {
   loadNotifications: typeof notificationListService.load;
   loadFindingsQueue: typeof findingsQueueService.load;
   loadOperationsOverview: typeof operationsOverviewService.load;
+  loadDashboardTasks: typeof dashboardTasksService.load;
 };
 
 export function createDaemonHttpHandler(
@@ -90,6 +95,7 @@ export function createDaemonHttpHandler(
     loadNotifications: (url) => notificationListService.load(url),
     loadFindingsQueue: (url) => findingsQueueService.load(url),
     loadOperationsOverview: () => operationsOverviewService.load(),
+    loadDashboardTasks: (url) => dashboardTasksService.load(url),
   },
 ) {
   return async function handleDaemonHttp(
@@ -206,6 +212,23 @@ export function createDaemonHttpHandler(
           error instanceof Error ? error.message : "unknown",
         );
         writeJson(response, 500, { error: "operations_overview_failed" });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/dashboard/tasks") {
+      try {
+        writeJson(response, 200, await dependencies.loadDashboardTasks(url));
+      } catch (error) {
+        if (error instanceof DashboardQueryError) {
+          writeJson(response, 400, { error: error.message });
+          return;
+        }
+        console.error(
+          "daemon_dashboard_tasks_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "dashboard_tasks_failed" });
       }
       return;
     }

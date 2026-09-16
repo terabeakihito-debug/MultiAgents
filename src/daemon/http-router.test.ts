@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { describe, expect, it, vi } from "vitest";
 import { TaskCiNotFoundError } from "../core/task-ci-service";
+import { DashboardQueryError } from "../core/dashboard-tasks-service";
 import { RemediationQueueQueryError } from "../core/findings-queue-service";
 import { NotificationInputError } from "../core/notification-list-service";
 import {
@@ -125,6 +126,10 @@ function dependencies(
     loadOperationsOverview: vi.fn(async () => ({
       overall: "ok",
       database: { status: "ok" },
+    })) as never,
+    loadDashboardTasks: vi.fn(async () => ({
+      tasks: [{ id: "task-1" }],
+      counts: {},
     })) as never,
     ...overrides,
   };
@@ -565,6 +570,88 @@ describe("daemon HTTP router", () => {
       error: "This API is available only on localhost",
     });
     expect(loadOperationsOverview).not.toHaveBeenCalled();
+  });
+
+  it("serves dashboard tasks through the core dashboard-tasks boundary", async () => {
+    const payload = { tasks: [{ id: "task-1" }], counts: { active: 1 } };
+    const loadDashboardTasks = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadDashboardTasks }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/dashboard/tasks?limit=25"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadDashboardTasks).toHaveBeenCalledTimes(1);
+    const calledUrl = (loadDashboardTasks as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as URL;
+    expect(calledUrl.pathname).toBe("/dashboard/tasks");
+    expect(calledUrl.searchParams.get("limit")).toBe("25");
+  });
+
+  it("returns 400 when dashboard task query parameters are invalid", async () => {
+    const loadDashboardTasks = vi.fn(async () => {
+      throw new DashboardQueryError("Invalid bucket");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadDashboardTasks }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/dashboard/tasks?bucket=bad"), output.value);
+
+    expect(output.status()).toBe(400);
+    expect(output.json()).toEqual({ error: "Invalid bucket" });
+  });
+
+  it("returns a stable error when dashboard task loading fails unexpectedly", async () => {
+    const loadDashboardTasks = vi.fn(async () => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadDashboardTasks }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/dashboard/tasks"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "dashboard_tasks_failed" });
+  });
+
+  it("does not expose dashboard tasks on unsupported methods", async () => {
+    const loadDashboardTasks = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadDashboardTasks }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/dashboard/tasks"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadDashboardTasks).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on dashboard tasks", async () => {
+    const loadDashboardTasks = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadDashboardTasks }),
+    );
+    const output = response();
+    const incoming = request("GET", "/dashboard/tasks");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadDashboardTasks).not.toHaveBeenCalled();
   });
 
   it("serves the task list through the core task boundary", async () => {
