@@ -91,6 +91,10 @@ import { notificationDismissMutationService } from "../core/notification-dismiss
 import { notificationReadAllMutationService } from "../core/notification-read-all-mutation-service";
 import { notificationReadMutationService } from "../core/notification-read-mutation-service";
 import {
+  OutboundInputError as NotificationSlackMarkDeliveredInputError,
+  notificationSlackMarkDeliveredMutationService,
+} from "../core/notification-slack-mark-delivered-mutation-service";
+import {
   OutboundInputError as NotificationSlackRetryInputError,
   notificationSlackRetryMutationService,
 } from "../core/notification-slack-retry-mutation-service";
@@ -183,6 +187,7 @@ type DaemonHttpDependencies = {
   applyNotificationDismissMutation: typeof notificationDismissMutationService.apply;
   applyNotificationReadAllMutation: typeof notificationReadAllMutationService.apply;
   applyNotificationSlackRetryMutation: typeof notificationSlackRetryMutationService.apply;
+  applyNotificationSlackMarkDeliveredMutation: typeof notificationSlackMarkDeliveredMutationService.apply;
   loadFindingsQueue: typeof findingsQueueService.load;
   loadOperationsOverview: typeof operationsOverviewService.load;
   loadDashboardTasks: typeof dashboardTasksService.load;
@@ -256,6 +261,8 @@ export function createDaemonHttpHandler(
       notificationReadAllMutationService.apply(),
     applyNotificationSlackRetryMutation: (notificationId) =>
       notificationSlackRetryMutationService.apply(notificationId),
+    applyNotificationSlackMarkDeliveredMutation: (notificationId) =>
+      notificationSlackMarkDeliveredMutationService.apply(notificationId),
     loadFindingsQueue: (url) => findingsQueueService.load(url),
     loadOperationsOverview: () => operationsOverviewService.load(),
     loadDashboardTasks: (url) => dashboardTasksService.load(url),
@@ -1217,6 +1224,48 @@ export function createDaemonHttpHandler(
       }
 
       writeJson(response, 404, { error: "Not found" });
+      return;
+    }
+
+    const notificationSlackMarkDeliveredId =
+      matchNotificationSlackMarkDeliveredPath(url.pathname);
+    if (notificationSlackMarkDeliveredId) {
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "outbound-mark-delivered",
+        { label: "External notification" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          dependencies.applyNotificationSlackMarkDeliveredMutation(
+            notificationSlackMarkDeliveredId,
+          ),
+        );
+      } catch (error) {
+        writeJson(
+          response,
+          error instanceof NotificationSlackMarkDeliveredInputError ? 400 : 500,
+          {
+            error:
+              error instanceof Error
+                ? error.message
+                : "Slack delivery update failed",
+          },
+        );
+      }
       return;
     }
 
@@ -2242,6 +2291,14 @@ function matchNotificationDismissPath(pathname: string) {
 function matchNotificationSlackRetryPath(pathname: string) {
   const match =
     /^\/notifications\/([^/]+)\/deliveries\/slack\/retry$/.exec(pathname);
+  return decodePathSegment(match?.[1]);
+}
+
+function matchNotificationSlackMarkDeliveredPath(pathname: string) {
+  const match =
+    /^\/notifications\/([^/]+)\/deliveries\/slack\/mark-delivered$/.exec(
+      pathname,
+    );
   return decodePathSegment(match?.[1]);
 }
 

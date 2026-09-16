@@ -144,6 +144,9 @@ function dependencies(
     applyNotificationSlackRetryMutation: vi.fn(async () => ({
       delivery: { deliveryId: "d-1", status: "pending" },
     })) as never,
+    applyNotificationSlackMarkDeliveredMutation: vi.fn(() => ({
+      delivery: { deliveryId: "d-1", status: "delivered" },
+    })) as never,
     loadFindingsQueue: vi.fn(() => ({
       findings: [{ findingId: "f-1" }],
       counts: { total: 1 },
@@ -2117,6 +2120,58 @@ describe("daemon HTTP router", () => {
 
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Notification not found" });
+  });
+
+  it("rejects notification slack mark-delivered POST without the human mutation gate", async () => {
+    const applyNotificationSlackMarkDeliveredMutation = vi.fn(() => ({
+      delivery: { deliveryId: "d-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationSlackMarkDeliveredMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/notifications/n-1/deliveries/slack/mark-delivered",
+        {},
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyNotificationSlackMarkDeliveredMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts notification slack mark-delivered POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce(
+      "outbound-mark-delivered",
+    );
+    const payload = { delivery: { deliveryId: "d-1", status: "delivered" } };
+    const applyNotificationSlackMarkDeliveredMutation = vi.fn(
+      () => payload,
+    ) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationSlackMarkDeliveredMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/notifications/n-1/deliveries/slack/mark-delivered",
+        authorizedHumanHeaders(nonce, cookie, "outbound-mark-delivered"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyNotificationSlackMarkDeliveredMutation).toHaveBeenCalledWith(
+      "n-1",
+    );
   });
 
   it("rejects notification slack retry POST without the human mutation gate", async () => {
