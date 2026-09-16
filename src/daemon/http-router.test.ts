@@ -278,6 +278,11 @@ function dependencies(
       remediation: null,
       history: [],
     })) as never,
+    applyFindingPriorityMutation: vi.fn(async () => ({
+      finding: { findingId: "f-1", humanPriority: "urgent" },
+      remediation: null,
+      history: [],
+    })) as never,
     ...overrides,
   };
 }
@@ -3434,6 +3439,59 @@ describe("daemon HTTP router", () => {
     expect(output.json()).toEqual(payload);
     expect(applyFindingResolveMutation).toHaveBeenCalledWith("f-1", {
       confirmed: true,
+    });
+  });
+
+  it("rejects finding priority POST without the human mutation gate", async () => {
+    const applyFindingPriorityMutation = vi.fn(async () => ({
+      finding: { findingId: "f-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyFindingPriorityMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/findings/f-1/priority",
+        {},
+        '{"confirmed":true,"priority":"urgent"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyFindingPriorityMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts finding priority POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("finding-priority");
+    const payload = {
+      finding: { findingId: "f-1", humanPriority: "urgent" },
+      remediation: { findingId: "f-1" },
+      history: [{ type: "finding_priority_changed" }],
+    };
+    const applyFindingPriorityMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyFindingPriorityMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/findings/f-1/priority",
+        authorizedHumanHeaders(nonce, cookie, "finding-priority"),
+        '{"confirmed":true,"priority":"urgent"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyFindingPriorityMutation).toHaveBeenCalledWith("f-1", {
+      confirmed: true,
+      priority: "urgent",
     });
   });
 
