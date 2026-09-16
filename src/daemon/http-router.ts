@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { taskService } from "../core/task-service";
 import {
   healthReadiness,
   ReadinessError,
@@ -6,11 +7,13 @@ import {
 
 type DaemonHttpDependencies = {
   health: typeof healthReadiness;
+  listTasks: typeof taskService.list;
 };
 
 export function createDaemonHttpHandler(
   dependencies: DaemonHttpDependencies = {
     health: healthReadiness,
+    listTasks: () => taskService.list(),
   },
 ) {
   return async function handleDaemonHttp(
@@ -35,6 +38,20 @@ export function createDaemonHttpHandler(
               ? error.message
               : "readiness_failed",
         });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/tasks") {
+      try {
+        const tasks = await dependencies.listTasks();
+        writeJson(response, 200, { tasks });
+      } catch (error) {
+        console.error(
+          "daemon_task_list_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "task_list_failed" });
       }
       return;
     }
