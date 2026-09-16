@@ -9,6 +9,10 @@ import {
   TaskProfileNotFoundError,
 } from "../core/task-profile-service";
 import {
+  TaskRuntimePolicyNotFoundError,
+  TaskRuntimePolicyUnavailableError,
+} from "../core/task-runtime-policy-service";
+import {
   TaskSandboxPolicyNotFoundError,
   TaskSandboxPolicyUnavailableError,
 } from "../core/task-sandbox-policy-service";
@@ -80,6 +84,11 @@ function dependencies(
       status: "enforced",
       validation: { profile: "validation" },
       agents: [],
+    })) as never,
+    loadTaskRuntimePolicy: vi.fn(async () => ({
+      runtimePolicyVersion: 2,
+      taskType: "bug_fix",
+      policies: [],
     })) as never,
     ...overrides,
   };
@@ -314,6 +323,7 @@ describe("daemon HTTP router", () => {
     const loadTaskFindings = vi.fn() as never;
     const loadTaskCi = vi.fn() as never;
     const loadTaskSandboxPolicy = vi.fn() as never;
+    const loadTaskRuntimePolicy = vi.fn() as never;
     const handler = createDaemonHttpHandler(
       dependencies({
         loadTaskDetail,
@@ -322,11 +332,12 @@ describe("daemon HTTP router", () => {
         loadTaskFindings,
         loadTaskCi,
         loadTaskSandboxPolicy,
+        loadTaskRuntimePolicy,
       }),
     );
     const output = response();
 
-    await handler(request("GET", "/tasks/task-1/runtime-policy"), output.value);
+    await handler(request("GET", "/tasks/task-1/pr"), output.value);
 
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Not found" });
@@ -336,6 +347,7 @@ describe("daemon HTTP router", () => {
     expect(loadTaskFindings).not.toHaveBeenCalled();
     expect(loadTaskCi).not.toHaveBeenCalled();
     expect(loadTaskSandboxPolicy).not.toHaveBeenCalled();
+    expect(loadTaskRuntimePolicy).not.toHaveBeenCalled();
   });
 
   it("serves task history through the core task-history boundary", async () => {
@@ -930,19 +942,17 @@ describe("daemon HTTP router", () => {
     expect(loadTaskSandboxPolicy).not.toHaveBeenCalled();
   });
 
-  it("does not treat runtime-policy or pr as sandbox policy", async () => {
+  it("does not treat pr as sandbox policy", async () => {
     const loadTaskSandboxPolicy = vi.fn() as never;
     const handler = createDaemonHttpHandler(
       dependencies({ loadTaskSandboxPolicy }),
     );
+    const output = response();
 
-    for (const path of ["/tasks/task-1/runtime-policy", "/tasks/task-1/pr"] as const) {
-      const output = response();
-      await handler(request("GET", path), output.value);
-      expect(output.status()).toBe(404);
-      expect(output.json()).toEqual({ error: "Not found" });
-    }
+    await handler(request("GET", "/tasks/task-1/pr"), output.value);
 
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
     expect(loadTaskSandboxPolicy).not.toHaveBeenCalled();
   });
 
@@ -981,5 +991,151 @@ describe("daemon HTTP router", () => {
       error: "Cross-origin requests are not allowed",
     });
     expect(loadTaskSandboxPolicy).not.toHaveBeenCalled();
+  });
+
+  it("serves task runtime policy through the core runtime-policy boundary", async () => {
+    const payload = {
+      runtimePolicyVersion: 2,
+      taskType: "bug_fix",
+      allAgentsReadOnly: false,
+      policies: [{ agent: "codex" }],
+    };
+    const loadTaskRuntimePolicy = vi.fn(async () => payload) as never;
+    const loadTaskDetail = vi.fn() as never;
+    const loadTaskSandboxPolicy = vi.fn() as never;
+    const loadTaskCi = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({
+        loadTaskRuntimePolicy,
+        loadTaskDetail,
+        loadTaskSandboxPolicy,
+        loadTaskCi,
+      }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/task-1/runtime-policy"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadTaskRuntimePolicy).toHaveBeenCalledTimes(1);
+    expect(loadTaskRuntimePolicy).toHaveBeenCalledWith("task-1");
+    expect(loadTaskDetail).not.toHaveBeenCalled();
+    expect(loadTaskSandboxPolicy).not.toHaveBeenCalled();
+    expect(loadTaskCi).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 when the runtime-policy task does not exist", async () => {
+    const loadTaskRuntimePolicy = vi.fn(async () => {
+      throw new TaskRuntimePolicyNotFoundError();
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskRuntimePolicy }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/missing/runtime-policy"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Task not found" });
+  });
+
+  it("returns 409 when the runtime policy is unavailable", async () => {
+    const loadTaskRuntimePolicy = vi.fn(async () => {
+      throw new TaskRuntimePolicyUnavailableError("Runtime policy is unavailable");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskRuntimePolicy }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/task-1/runtime-policy"), output.value);
+
+    expect(output.status()).toBe(409);
+    expect(output.json()).toEqual({ error: "Runtime policy is unavailable" });
+  });
+
+  it("returns a stable error when runtime policy loading fails unexpectedly", async () => {
+    const loadTaskRuntimePolicy = vi.fn(async () => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskRuntimePolicy }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/task-1/runtime-policy"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "task_runtime_policy_failed" });
+  });
+
+  it("does not expose runtime policy mutations", async () => {
+    const loadTaskRuntimePolicy = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskRuntimePolicy }),
+    );
+
+    for (const method of ["POST", "DELETE"] as const) {
+      const output = response();
+      await handler(request(method, "/tasks/task-1/runtime-policy"), output.value);
+      expect(output.status()).toBe(404);
+      expect(output.json()).toEqual({ error: "Not found" });
+    }
+
+    expect(loadTaskRuntimePolicy).not.toHaveBeenCalled();
+  });
+
+  it("does not treat pr as runtime policy", async () => {
+    const loadTaskRuntimePolicy = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskRuntimePolicy }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/task-1/pr"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadTaskRuntimePolicy).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on runtime policy", async () => {
+    const loadTaskRuntimePolicy = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskRuntimePolicy }),
+    );
+    const output = response();
+    const incoming = request("GET", "/tasks/task-1/runtime-policy");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadTaskRuntimePolicy).not.toHaveBeenCalled();
+  });
+
+  it("rejects a mismatched loopback Origin on runtime policy", async () => {
+    const loadTaskRuntimePolicy = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskRuntimePolicy }),
+    );
+    const output = response();
+    const incoming = request("GET", "/tasks/task-1/runtime-policy");
+    incoming.headers.host = "127.0.0.1:3000";
+    incoming.headers.origin = "http://127.0.0.1:4000";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "Cross-origin requests are not allowed",
+    });
+    expect(loadTaskRuntimePolicy).not.toHaveBeenCalled();
   });
 });

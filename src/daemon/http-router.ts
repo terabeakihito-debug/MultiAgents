@@ -21,6 +21,11 @@ import {
   TaskProfileNotFoundError,
 } from "../core/task-profile-service";
 import {
+  taskRuntimePolicyService,
+  TaskRuntimePolicyNotFoundError,
+  TaskRuntimePolicyUnavailableError,
+} from "../core/task-runtime-policy-service";
+import {
   taskSandboxPolicyService,
   TaskSandboxPolicyNotFoundError,
   TaskSandboxPolicyUnavailableError,
@@ -40,6 +45,7 @@ type DaemonHttpDependencies = {
   loadTaskFindings: typeof taskFindingsService.load;
   loadTaskCi: typeof taskCiService.load;
   loadTaskSandboxPolicy: typeof taskSandboxPolicyService.load;
+  loadTaskRuntimePolicy: typeof taskRuntimePolicyService.load;
 };
 
 export function createDaemonHttpHandler(
@@ -52,6 +58,7 @@ export function createDaemonHttpHandler(
     loadTaskFindings: (id) => taskFindingsService.load(id),
     loadTaskCi: (id) => taskCiService.load(id),
     loadTaskSandboxPolicy: (id) => taskSandboxPolicyService.load(id),
+    loadTaskRuntimePolicy: (id) => taskRuntimePolicyService.load(id),
   },
 ) {
   return async function handleDaemonHttp(
@@ -239,6 +246,37 @@ export function createDaemonHttpHandler(
       return;
     }
 
+    const runtimePolicyTaskId = matchTaskLeafPath(url.pathname, "runtime-policy");
+    if (runtimePolicyTaskId) {
+      if (request.method !== "GET") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          await dependencies.loadTaskRuntimePolicy(runtimePolicyTaskId),
+        );
+      } catch (error) {
+        if (error instanceof TaskRuntimePolicyNotFoundError) {
+          writeJson(response, 404, { error: "Task not found" });
+          return;
+        }
+        if (error instanceof TaskRuntimePolicyUnavailableError) {
+          writeJson(response, 409, { error: error.message });
+          return;
+        }
+        console.error(
+          "daemon_task_runtime_policy_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "task_runtime_policy_failed" });
+      }
+      return;
+    }
+
     const taskId = matchTaskIdPath(url.pathname);
     if (taskId) {
       if (request.method !== "GET") {
@@ -324,7 +362,7 @@ function matchTaskIdPath(pathname: string) {
 
 function matchTaskLeafPath(
   pathname: string,
-  leaf: "history" | "profile" | "findings" | "ci" | "sandbox-policy",
+  leaf: "history" | "profile" | "findings" | "ci" | "sandbox-policy" | "runtime-policy",
 ) {
   const match = /^\/tasks\/([^/]+)\/([^/]+)$/.exec(pathname);
   if (!match || match[2] !== leaf) return;
