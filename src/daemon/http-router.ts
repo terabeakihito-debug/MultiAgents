@@ -40,6 +40,7 @@ import {
   findingsQueueService,
   RemediationQueueQueryError,
 } from "../core/findings-queue-service";
+import { operationsOverviewService } from "../core/operations-overview-service";
 import {
   notificationListService,
   NotificationInputError,
@@ -68,6 +69,7 @@ type DaemonHttpDependencies = {
   loadCredentialStatus: typeof credentialStatusService.load;
   loadNotifications: typeof notificationListService.load;
   loadFindingsQueue: typeof findingsQueueService.load;
+  loadOperationsOverview: typeof operationsOverviewService.load;
 };
 
 export function createDaemonHttpHandler(
@@ -87,6 +89,7 @@ export function createDaemonHttpHandler(
     loadCredentialStatus: () => credentialStatusService.load(),
     loadNotifications: (url) => notificationListService.load(url),
     loadFindingsQueue: (url) => findingsQueueService.load(url),
+    loadOperationsOverview: () => operationsOverviewService.load(),
   },
 ) {
   return async function handleDaemonHttp(
@@ -190,6 +193,19 @@ export function createDaemonHttpHandler(
           error instanceof Error ? error.message : "unknown",
         );
         writeJson(response, 500, { error: "findings_queue_failed" });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/operations/overview") {
+      try {
+        writeJson(response, 200, await dependencies.loadOperationsOverview());
+      } catch (error) {
+        console.error(
+          "daemon_operations_overview_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "operations_overview_failed" });
       }
       return;
     }

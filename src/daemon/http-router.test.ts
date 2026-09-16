@@ -122,6 +122,10 @@ function dependencies(
       limit: 100,
       offset: 0,
     })) as never,
+    loadOperationsOverview: vi.fn(async () => ({
+      overall: "ok",
+      database: { status: "ok" },
+    })) as never,
     ...overrides,
   };
 }
@@ -497,6 +501,70 @@ describe("daemon HTTP router", () => {
       error: "This API is available only on localhost",
     });
     expect(loadFindingsQueue).not.toHaveBeenCalled();
+  });
+
+  it("serves operations overview through the core operations-overview boundary", async () => {
+    const payload = { overall: "ok", maintenance: { state: "RUNNING" } };
+    const loadOperationsOverview = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadOperationsOverview }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/operations/overview"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadOperationsOverview).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a stable error when operations overview loading fails", async () => {
+    const loadOperationsOverview = vi.fn(async () => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadOperationsOverview }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/operations/overview"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "operations_overview_failed" });
+  });
+
+  it("does not expose operations overview on unsupported methods", async () => {
+    const loadOperationsOverview = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadOperationsOverview }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/operations/overview"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadOperationsOverview).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on operations overview", async () => {
+    const loadOperationsOverview = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadOperationsOverview }),
+    );
+    const output = response();
+    const incoming = request("GET", "/operations/overview");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadOperationsOverview).not.toHaveBeenCalled();
   });
 
   it("serves the task list through the core task boundary", async () => {
