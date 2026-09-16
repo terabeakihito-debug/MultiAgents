@@ -3,6 +3,10 @@ import {
   taskDetailService,
   TaskDetailNotFoundError,
 } from "../core/task-detail-service";
+import {
+  taskHistoryService,
+  TaskHistoryNotFoundError,
+} from "../core/task-history-service";
 import { taskService } from "../core/task-service";
 import {
   healthReadiness,
@@ -13,6 +17,7 @@ type DaemonHttpDependencies = {
   health: typeof healthReadiness;
   listTasks: typeof taskService.list;
   loadTaskDetail: typeof taskDetailService.load;
+  loadTaskHistory: typeof taskHistoryService.load;
 };
 
 export function createDaemonHttpHandler(
@@ -20,6 +25,7 @@ export function createDaemonHttpHandler(
     health: healthReadiness,
     listTasks: () => taskService.list(),
     loadTaskDetail: (id) => taskDetailService.load(id),
+    loadTaskHistory: (id) => taskHistoryService.load(id),
   },
 ) {
   return async function handleDaemonHttp(
@@ -64,6 +70,33 @@ export function createDaemonHttpHandler(
           error instanceof Error ? error.message : "unknown",
         );
         writeJson(response, 500, { error: "task_list_failed" });
+      }
+      return;
+    }
+
+    const historyTaskId = matchTaskHistoryPath(url.pathname);
+    if (historyTaskId) {
+      if (request.method !== "GET") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          await dependencies.loadTaskHistory(historyTaskId),
+        );
+      } catch (error) {
+        if (error instanceof TaskHistoryNotFoundError) {
+          writeJson(response, 404, { error: "Task not found" });
+          return;
+        }
+        console.error(
+          "daemon_task_history_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "task_history_failed" });
       }
       return;
     }
@@ -148,8 +181,14 @@ function isLoopbackHost(hostHeader: string) {
 }
 
 function matchTaskIdPath(pathname: string) {
-  const match = /^\/tasks\/([^/]+)$/.exec(pathname);
-  const rawId = match?.[1];
+  return decodeTaskIdSegment(/^\/tasks\/([^/]+)$/.exec(pathname)?.[1]);
+}
+
+function matchTaskHistoryPath(pathname: string) {
+  return decodeTaskIdSegment(/^\/tasks\/([^/]+)\/history$/.exec(pathname)?.[1]);
+}
+
+function decodeTaskIdSegment(rawId: string | undefined) {
   if (!rawId) return;
 
   try {

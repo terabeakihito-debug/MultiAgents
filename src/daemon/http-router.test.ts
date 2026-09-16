@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { describe, expect, it, vi } from "vitest";
 import { TaskDetailNotFoundError } from "../core/task-detail-service";
+import { TaskHistoryNotFoundError } from "../core/task-history-service";
 import { createDaemonHttpHandler } from "./http-router";
 
 function request(
@@ -50,6 +51,9 @@ function dependencies(
       task: { id: "task-1" },
       diff: { patch: "" },
       conflict: false,
+    })) as never,
+    loadTaskHistory: vi.fn(async () => ({
+      history: { events: [] },
     })) as never,
     ...overrides,
   };
@@ -284,10 +288,118 @@ describe("daemon HTTP router", () => {
     );
     const output = response();
 
-    await handler(request("GET", "/tasks/task-1/history"), output.value);
+    await handler(request("GET", "/tasks/task-1/profile"), output.value);
 
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Not found" });
     expect(loadTaskDetail).not.toHaveBeenCalled();
+  });
+
+  it("serves task history through the core task-history boundary", async () => {
+    const history = {
+      events: [{ type: "created" }],
+      stepVersions: [],
+      diffVersions: [],
+      approvalEvents: [],
+    };
+    const loadTaskHistory = vi.fn(async () => ({ history })) as never;
+    const loadTaskDetail = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskHistory, loadTaskDetail }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/task-1/history"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual({ history });
+    expect(loadTaskHistory).toHaveBeenCalledTimes(1);
+    expect(loadTaskHistory).toHaveBeenCalledWith("task-1");
+    expect(loadTaskDetail).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 when task history does not exist", async () => {
+    const loadTaskHistory = vi.fn(async () => {
+      throw new TaskHistoryNotFoundError();
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskHistory }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/missing/history"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Task not found" });
+  });
+
+  it("returns a stable error when task history loading fails", async () => {
+    const loadTaskHistory = vi.fn(async () => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskHistory }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/task-1/history"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "task_history_failed" });
+  });
+
+  it("does not expose task history mutations", async () => {
+    const loadTaskHistory = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskHistory }),
+    );
+
+    for (const method of ["POST", "DELETE"] as const) {
+      const output = response();
+      await handler(request(method, "/tasks/task-1/history"), output.value);
+      expect(output.status()).toBe(404);
+      expect(output.json()).toEqual({ error: "Not found" });
+    }
+
+    expect(loadTaskHistory).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on task history", async () => {
+    const loadTaskHistory = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskHistory }),
+    );
+    const output = response();
+    const incoming = request("GET", "/tasks/task-1/history");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadTaskHistory).not.toHaveBeenCalled();
+  });
+
+  it("rejects a mismatched loopback Origin on task history", async () => {
+    const loadTaskHistory = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskHistory }),
+    );
+    const output = response();
+    const incoming = request("GET", "/tasks/task-1/history");
+    incoming.headers.host = "127.0.0.1:3000";
+    incoming.headers.origin = "http://127.0.0.1:4000";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "Cross-origin requests are not allowed",
+    });
+    expect(loadTaskHistory).not.toHaveBeenCalled();
   });
 });
