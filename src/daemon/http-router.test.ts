@@ -135,6 +135,9 @@ function dependencies(
       statusCode: 200,
       body: { status: "enforced", backend: "bubblewrap" },
     })) as never,
+    loadNotificationPreferences: vi.fn(() => ({
+      preferences: { taskInactive: true },
+    })) as never,
     ...overrides,
   };
 }
@@ -338,6 +341,72 @@ describe("daemon HTTP router", () => {
       error: "This API is available only on localhost",
     });
     expect(loadCredentialStatus).not.toHaveBeenCalled();
+  });
+
+  it("serves notification preferences through the core notification-preferences boundary", async () => {
+    const payload = { preferences: { taskInactive: true, taskFailed: false } };
+    const loadNotificationPreferences = vi.fn(() => payload) as never;
+    const loadNotifications = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadNotificationPreferences, loadNotifications }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/notification-preferences"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadNotificationPreferences).toHaveBeenCalledTimes(1);
+    expect(loadNotifications).not.toHaveBeenCalled();
+  });
+
+  it("returns a stable error when notification preferences loading fails", async () => {
+    const loadNotificationPreferences = vi.fn(() => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadNotificationPreferences }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/notification-preferences"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "notification_preferences_failed" });
+  });
+
+  it("does not expose notification preferences mutations on the daemon", async () => {
+    const loadNotificationPreferences = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadNotificationPreferences }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/notification-preferences"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadNotificationPreferences).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on notification preferences", async () => {
+    const loadNotificationPreferences = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadNotificationPreferences }),
+    );
+    const output = response();
+    const incoming = request("GET", "/notification-preferences");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadNotificationPreferences).not.toHaveBeenCalled();
   });
 
   it("serves notifications through the core notification-list boundary", async () => {

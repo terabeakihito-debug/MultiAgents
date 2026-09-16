@@ -1,11 +1,13 @@
+import { notificationPreferencesService } from "@/core/notification-preferences-service";
 import { NotificationInputError, parseNotificationPreferences } from "@/server/notifications";
 import { rejectNonHumanNotificationMutation, rejectNonLocalRequest } from "@/server/request-security";
 import { getStateStore } from "@/server/state-store";
 
 export const runtime = "nodejs";
 export async function GET(request: Request) {
-  const rejection = rejectNonLocalRequest(request); if (rejection) return rejection;
-  return Response.json({ preferences: getStateStore().loadNotificationPreferences() });
+  const rejection = rejectNonLocalRequest(request);
+  if (rejection) return rejection;
+  return Response.json(notificationPreferencesService.load());
 }
 export async function POST(request: Request) {
   const rejection = rejectNonHumanNotificationMutation(request, "notification-preferences"); if (rejection) return rejection;

@@ -50,6 +50,7 @@ import {
   notificationListService,
   NotificationInputError,
 } from "../core/notification-list-service";
+import { notificationPreferencesService } from "../core/notification-preferences-service";
 import { profileListService } from "../core/profile-list-service";
 import { repoListService } from "../core/repo-list-service";
 import { taskService } from "../core/task-service";
@@ -77,6 +78,7 @@ type DaemonHttpDependencies = {
   loadOperationsOverview: typeof operationsOverviewService.load;
   loadDashboardTasks: typeof dashboardTasksService.load;
   loadRuntimeSandboxStatus: typeof runtimeSandboxStatusService.load;
+  loadNotificationPreferences: typeof notificationPreferencesService.load;
 };
 
 export function createDaemonHttpHandler(
@@ -99,6 +101,7 @@ export function createDaemonHttpHandler(
     loadOperationsOverview: () => operationsOverviewService.load(),
     loadDashboardTasks: (url) => dashboardTasksService.load(url),
     loadRuntimeSandboxStatus: () => runtimeSandboxStatusService.load(),
+    loadNotificationPreferences: () => notificationPreferencesService.load(),
   },
 ) {
   return async function handleDaemonHttp(
@@ -168,6 +171,19 @@ export function createDaemonHttpHandler(
           error instanceof Error ? error.message : "unknown",
         );
         writeJson(response, 500, { error: "credential_status_failed" });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/notification-preferences") {
+      try {
+        writeJson(response, 200, dependencies.loadNotificationPreferences());
+      } catch (error) {
+        console.error(
+          "daemon_notification_preferences_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "notification_preferences_failed" });
       }
       return;
     }
