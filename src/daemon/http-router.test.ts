@@ -2,6 +2,10 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { describe, expect, it, vi } from "vitest";
 import { TaskDetailNotFoundError } from "../core/task-detail-service";
 import { TaskHistoryNotFoundError } from "../core/task-history-service";
+import {
+  TaskProfileInvalidError,
+  TaskProfileNotFoundError,
+} from "../core/task-profile-service";
 import { createDaemonHttpHandler } from "./http-router";
 
 function request(
@@ -54,6 +58,9 @@ function dependencies(
     })) as never,
     loadTaskHistory: vi.fn(async () => ({
       history: { events: [] },
+    })) as never,
+    loadTaskProfile: vi.fn(async () => ({
+      profile: { id: "default" },
     })) as never,
     ...overrides,
   };
@@ -283,16 +290,20 @@ describe("daemon HTTP router", () => {
 
   it("does not treat nested task paths as task detail", async () => {
     const loadTaskDetail = vi.fn() as never;
+    const loadTaskHistory = vi.fn() as never;
+    const loadTaskProfile = vi.fn() as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ loadTaskDetail }),
+      dependencies({ loadTaskDetail, loadTaskHistory, loadTaskProfile }),
     );
     const output = response();
 
-    await handler(request("GET", "/tasks/task-1/profile"), output.value);
+    await handler(request("GET", "/tasks/task-1/findings"), output.value);
 
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Not found" });
     expect(loadTaskDetail).not.toHaveBeenCalled();
+    expect(loadTaskHistory).not.toHaveBeenCalled();
+    expect(loadTaskProfile).not.toHaveBeenCalled();
   });
 
   it("serves task history through the core task-history boundary", async () => {
@@ -304,8 +315,9 @@ describe("daemon HTTP router", () => {
     };
     const loadTaskHistory = vi.fn(async () => ({ history })) as never;
     const loadTaskDetail = vi.fn() as never;
+    const loadTaskProfile = vi.fn() as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ loadTaskHistory, loadTaskDetail }),
+      dependencies({ loadTaskHistory, loadTaskDetail, loadTaskProfile }),
     );
     const output = response();
 
@@ -318,6 +330,7 @@ describe("daemon HTTP router", () => {
     expect(loadTaskHistory).toHaveBeenCalledTimes(1);
     expect(loadTaskHistory).toHaveBeenCalledWith("task-1");
     expect(loadTaskDetail).not.toHaveBeenCalled();
+    expect(loadTaskProfile).not.toHaveBeenCalled();
   });
 
   it("returns 404 when task history does not exist", async () => {
@@ -401,5 +414,125 @@ describe("daemon HTTP router", () => {
       error: "Cross-origin requests are not allowed",
     });
     expect(loadTaskHistory).not.toHaveBeenCalled();
+  });
+
+  it("serves task profile through the core task-profile boundary", async () => {
+    const profile = { id: "coding" };
+    const loadTaskProfile = vi.fn(async () => ({ profile })) as never;
+    const loadTaskDetail = vi.fn() as never;
+    const loadTaskHistory = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskProfile, loadTaskDetail, loadTaskHistory }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/task-1/profile"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual({ profile });
+    expect(loadTaskProfile).toHaveBeenCalledTimes(1);
+    expect(loadTaskProfile).toHaveBeenCalledWith("task-1");
+    expect(loadTaskDetail).not.toHaveBeenCalled();
+    expect(loadTaskHistory).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 when task profile does not exist", async () => {
+    const loadTaskProfile = vi.fn(async () => {
+      throw new TaskProfileNotFoundError();
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskProfile }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/missing/profile"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Task not found" });
+  });
+
+  it("returns 409 when the task profile snapshot is invalid", async () => {
+    const loadTaskProfile = vi.fn(async () => {
+      throw new TaskProfileInvalidError("profile mismatch");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskProfile }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/task-1/profile"), output.value);
+
+    expect(output.status()).toBe(409);
+    expect(output.json()).toEqual({ error: "profile mismatch" });
+  });
+
+  it("returns a stable error when task profile loading fails", async () => {
+    const loadTaskProfile = vi.fn(async () => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskProfile }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/task-1/profile"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "task_profile_failed" });
+  });
+
+  it("does not expose task profile mutations", async () => {
+    const loadTaskProfile = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskProfile }),
+    );
+
+    for (const method of ["POST", "DELETE"] as const) {
+      const output = response();
+      await handler(request(method, "/tasks/task-1/profile"), output.value);
+      expect(output.status()).toBe(404);
+      expect(output.json()).toEqual({ error: "Not found" });
+    }
+
+    expect(loadTaskProfile).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on task profile", async () => {
+    const loadTaskProfile = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskProfile }),
+    );
+    const output = response();
+    const incoming = request("GET", "/tasks/task-1/profile");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadTaskProfile).not.toHaveBeenCalled();
+  });
+
+  it("rejects a mismatched loopback Origin on task profile", async () => {
+    const loadTaskProfile = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskProfile }),
+    );
+    const output = response();
+    const incoming = request("GET", "/tasks/task-1/profile");
+    incoming.headers.host = "127.0.0.1:3000";
+    incoming.headers.origin = "http://127.0.0.1:4000";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "Cross-origin requests are not allowed",
+    });
+    expect(loadTaskProfile).not.toHaveBeenCalled();
   });
 });

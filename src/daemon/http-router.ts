@@ -7,6 +7,11 @@ import {
   taskHistoryService,
   TaskHistoryNotFoundError,
 } from "../core/task-history-service";
+import {
+  taskProfileService,
+  TaskProfileInvalidError,
+  TaskProfileNotFoundError,
+} from "../core/task-profile-service";
 import { taskService } from "../core/task-service";
 import {
   healthReadiness,
@@ -18,6 +23,7 @@ type DaemonHttpDependencies = {
   listTasks: typeof taskService.list;
   loadTaskDetail: typeof taskDetailService.load;
   loadTaskHistory: typeof taskHistoryService.load;
+  loadTaskProfile: typeof taskProfileService.load;
 };
 
 export function createDaemonHttpHandler(
@@ -26,6 +32,7 @@ export function createDaemonHttpHandler(
     listTasks: () => taskService.list(),
     loadTaskDetail: (id) => taskDetailService.load(id),
     loadTaskHistory: (id) => taskHistoryService.load(id),
+    loadTaskProfile: (id) => taskProfileService.load(id),
   },
 ) {
   return async function handleDaemonHttp(
@@ -74,7 +81,7 @@ export function createDaemonHttpHandler(
       return;
     }
 
-    const historyTaskId = matchTaskHistoryPath(url.pathname);
+    const historyTaskId = matchTaskLeafPath(url.pathname, "history");
     if (historyTaskId) {
       if (request.method !== "GET") {
         writeJson(response, 404, { error: "Not found" });
@@ -97,6 +104,37 @@ export function createDaemonHttpHandler(
           error instanceof Error ? error.message : "unknown",
         );
         writeJson(response, 500, { error: "task_history_failed" });
+      }
+      return;
+    }
+
+    const profileTaskId = matchTaskLeafPath(url.pathname, "profile");
+    if (profileTaskId) {
+      if (request.method !== "GET") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          await dependencies.loadTaskProfile(profileTaskId),
+        );
+      } catch (error) {
+        if (error instanceof TaskProfileNotFoundError) {
+          writeJson(response, 404, { error: "Task not found" });
+          return;
+        }
+        if (error instanceof TaskProfileInvalidError) {
+          writeJson(response, 409, { error: error.message });
+          return;
+        }
+        console.error(
+          "daemon_task_profile_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "task_profile_failed" });
       }
       return;
     }
@@ -184,8 +222,10 @@ function matchTaskIdPath(pathname: string) {
   return decodeTaskIdSegment(/^\/tasks\/([^/]+)$/.exec(pathname)?.[1]);
 }
 
-function matchTaskHistoryPath(pathname: string) {
-  return decodeTaskIdSegment(/^\/tasks\/([^/]+)\/history$/.exec(pathname)?.[1]);
+function matchTaskLeafPath(pathname: string, leaf: "history" | "profile") {
+  const match = /^\/tasks\/([^/]+)\/([^/]+)$/.exec(pathname);
+  if (!match || match[2] !== leaf) return;
+  return decodeTaskIdSegment(match[1]);
 }
 
 function decodeTaskIdSegment(rawId: string | undefined) {
