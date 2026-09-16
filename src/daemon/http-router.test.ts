@@ -150,6 +150,88 @@ describe("daemon HTTP router", () => {
     expect(listTasks).not.toHaveBeenCalled();
   });
 
+  it("serves the task history list through the core task boundary", async () => {
+    const tasks = [{ id: "task-1" }];
+    const listTasks = vi.fn(async () => tasks) as never;
+    const loadTaskDetail = vi.fn() as never;
+    const loadTaskHistory = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ listTasks, loadTaskDetail, loadTaskHistory }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/history"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual({ tasks });
+    expect(listTasks).toHaveBeenCalledTimes(1);
+    expect(loadTaskDetail).not.toHaveBeenCalled();
+    expect(loadTaskHistory).not.toHaveBeenCalled();
+  });
+
+  it("returns a stable error when the task history list fails", async () => {
+    const listTasks = vi.fn(async () => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ listTasks }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/history"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "task_history_list_failed" });
+  });
+
+  it("does not expose the task history list on unsupported methods", async () => {
+    const listTasks = vi.fn(async () => []) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ listTasks }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/tasks/history"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(listTasks).not.toHaveBeenCalled();
+  });
+
+  it("does not treat the task history list path as task detail", async () => {
+    const listTasks = vi.fn(async () => [{ id: "task-1" }]) as never;
+    const loadTaskDetail = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ listTasks, loadTaskDetail }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/history"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(loadTaskDetail).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on the task history list", async () => {
+    const listTasks = vi.fn(async () => []) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ listTasks }),
+    );
+    const output = response();
+    const incoming = request("GET", "/tasks/history");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(listTasks).not.toHaveBeenCalled();
+  });
+
 
   it("rejects a non-loopback Host header", async () => {
     const handler = createDaemonHttpHandler(dependencies());

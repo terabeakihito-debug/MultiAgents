@@ -114,6 +114,20 @@ export function createDaemonHttpHandler(
       return;
     }
 
+    if (request.method === "GET" && url.pathname === "/tasks/history") {
+      try {
+        const tasks = await dependencies.listTasks();
+        writeJson(response, 200, { tasks });
+      } catch (error) {
+        console.error(
+          "daemon_task_history_list_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "task_history_list_failed" });
+      }
+      return;
+    }
+
     const historyTaskId = matchTaskLeafPath(url.pathname, "history");
     if (historyTaskId) {
       if (request.method !== "GET") {
