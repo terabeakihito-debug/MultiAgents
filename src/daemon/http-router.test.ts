@@ -57,8 +57,14 @@ function response() {
       headers.set(name.toLowerCase(), headerValue);
       return value;
     },
-    end(chunk?: string) {
-      body = chunk ?? "";
+    write(chunk: string | Buffer) {
+      body += typeof chunk === "string" ? chunk : chunk.toString();
+      return true;
+    },
+    end(chunk?: string | Buffer) {
+      if (chunk !== undefined) {
+        body += typeof chunk === "string" ? chunk : chunk.toString();
+      }
       return value;
     },
   } as unknown as ServerResponse;
@@ -238,6 +244,11 @@ function dependencies(
       flowId: "flow-1",
       steps: [],
     })) as never,
+    prepareReviewRerun: vi.fn(async () => ({
+      kind: "error",
+      status: 400,
+      body: { error: "A valid taskId is required" },
+    })) as never,
     ...overrides,
   };
 }
@@ -365,23 +376,78 @@ describe("daemon HTTP router", () => {
     );
   });
 
-  it("does not expose nested review flow routes on the daemon", async () => {
-    const applyReviewFlowMutation = vi.fn() as never;
+  it("rejects review rerun POST without the human mutation gate", async () => {
+    const prepareReviewRerun = vi.fn(async () => ({
+      kind: "stream",
+      stream: new ReadableStream(),
+    })) as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ applyReviewFlowMutation }),
+      dependencies({ prepareReviewRerun }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/flows/review/rerun",
+        {},
+        '{"taskId":"00000000-0000-4000-8000-000000000001","stepId":"codex_draft"}',
+      ),
+      output.value,
     );
 
-    for (const path of ["/flows/review/stream", "/flows/review/rerun"] as const) {
-      const output = response();
-      await handler(
-        postJsonRequest(path, {}, '{"prompt":"Review this"}'),
-        output.value,
-      );
-      expect(output.status()).toBe(404);
-      expect(output.json()).toEqual({ error: "Not found" });
-    }
+    expect(output.status()).toBe(403);
+    expect(prepareReviewRerun).not.toHaveBeenCalled();
+  });
 
-    expect(applyReviewFlowMutation).not.toHaveBeenCalled();
+  it("accepts review rerun POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("review-rerun");
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("event: test\n\n"));
+        controller.close();
+      },
+    });
+    const prepareReviewRerun = vi.fn(async () => ({
+      kind: "stream",
+      stream,
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ prepareReviewRerun }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/flows/review/rerun",
+        authorizedHumanHeaders(nonce, cookie, "review-rerun"),
+        '{"taskId":"00000000-0000-4000-8000-000000000001","stepId":"codex_draft"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe(
+      "text/event-stream; charset=utf-8",
+    );
+    expect(prepareReviewRerun).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not expose review flow stream on the daemon", async () => {
+    const prepareReviewRerun = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ prepareReviewRerun }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/flows/review/stream", {}, '{"prompt":"Review this"}'),
+      output.value,
+    );
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(prepareReviewRerun).not.toHaveBeenCalled();
   });
 
   it("rejects agent run POST without the human mutation gate", async () => {

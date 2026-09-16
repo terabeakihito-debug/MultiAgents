@@ -119,6 +119,7 @@ import {
   ReviewRequestError,
   reviewFlowMutationService,
 } from "../core/review-flow-mutation-service";
+import { reviewRerunMutationService } from "../core/review-rerun-mutation-service";
 import { taskService } from "../core/task-service";
 import {
   healthReadiness,
@@ -158,6 +159,7 @@ type DaemonHttpDependencies = {
   applyAgentRunMutation: typeof agentRunMutationService.apply;
   applyAgentParallelRunMutation: typeof agentParallelRunMutationService.apply;
   applyReviewFlowMutation: typeof reviewFlowMutationService.apply;
+  prepareReviewRerun: typeof reviewRerunMutationService.prepare;
   loadRepoPulls: typeof repoPullsService.load;
   issueHumanSession: typeof humanSessionService.issue;
   rejectHumanMutation: typeof humanMutationGateService.reject;
@@ -218,6 +220,8 @@ export function createDaemonHttpHandler(
       agentParallelRunMutationService.apply(body, options),
     applyReviewFlowMutation: (body, options) =>
       reviewFlowMutationService.apply(body, options),
+    prepareReviewRerun: (body, signal) =>
+      reviewRerunMutationService.prepare(body, signal),
     loadRepoPulls: (repoId) => repoPullsService.load(repoId),
     issueHumanSession: (webRequest) => humanSessionService.issue(webRequest),
     rejectHumanMutation: (webRequest, action, options) =>
@@ -317,6 +321,46 @@ export function createDaemonHttpHandler(
             error instanceof Error ? error.message : "Review execution failed",
         });
       }
+      return;
+    }
+
+    if (url.pathname === "/flows/review/rerun") {
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "review-rerun",
+        { label: "Review rerun" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      let body: unknown;
+      try {
+        body = await webRequest.json();
+      } catch {
+        writeJson(response, 400, {
+          error: "Request body must be valid JSON",
+        });
+        return;
+      }
+
+      const prepared = await dependencies.prepareReviewRerun(
+        body,
+        webRequest.signal,
+      );
+      if (prepared.kind === "error") {
+        writeJson(response, prepared.status, prepared.body);
+        return;
+      }
+
+      await writeEventStreamResponse(response, prepared.stream);
       return;
     }
 
@@ -1533,6 +1577,36 @@ async function writeWebResponse(
     response.setHeader(name, value);
   });
   response.end(Buffer.from(await webResponse.arrayBuffer()));
+}
+
+async function writeEventStreamResponse(
+  response: ServerResponse,
+  stream: ReadableStream<Uint8Array>,
+) {
+  response.statusCode = 200;
+  response.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  response.setHeader("Cache-Control", "no-cache, no-transform");
+  response.setHeader("Connection", "keep-alive");
+  response.setHeader("X-Accel-Buffering", "no");
+
+  const reader = stream.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value?.length) continue;
+      const chunk = Buffer.from(value);
+      if (typeof response.write === "function") {
+        response.write(chunk);
+      } else {
+        response.end(chunk);
+        return;
+      }
+    }
+    response.end();
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 
