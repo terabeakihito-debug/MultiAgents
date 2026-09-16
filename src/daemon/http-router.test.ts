@@ -234,6 +234,10 @@ function dependencies(
     applyTaskApplyReviewMutation: vi.fn(async () => ({
       task: { id: "task-1", status: "open" },
     })) as never,
+    applyTaskPrepareApprovalMutation: vi.fn(async () => ({
+      status: 200,
+      body: { diff: {}, task: { id: "task-1" } },
+    })) as never,
     applyRetentionPolicyMutation: vi.fn(() => ({ preset: "balanced" })) as never,
     applyCleanupPreviewMutation: vi.fn(async () => ({
       selected: [],
@@ -3033,6 +3037,58 @@ describe("daemon HTTP router", () => {
 
     expect(output.status()).toBe(500);
     expect(output.json()).toEqual({ error: "task_detail_failed" });
+  });
+
+  it("rejects task prepare-approval POST without the human mutation gate", async () => {
+    const applyTaskPrepareApprovalMutation = vi.fn(async () => ({
+      status: 200,
+      body: {},
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskPrepareApprovalMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/tasks/task-1/prepare-approval", {}, ""),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyTaskPrepareApprovalMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts task prepare-approval POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce(
+      "task-prepare-approval",
+    );
+    const payload = {
+      status: 200,
+      body: {
+        diff: { approvable: true },
+        approval: { approvalId: "ap-1" },
+        task: { id: "task-1" },
+      },
+    };
+    const applyTaskPrepareApprovalMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskPrepareApprovalMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/prepare-approval",
+        authorizedHumanHeaders(nonce, cookie, "task-prepare-approval"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload.body);
+    expect(applyTaskPrepareApprovalMutation).toHaveBeenCalledWith("task-1");
   });
 
   it("rejects task apply-review POST without the human mutation gate", async () => {

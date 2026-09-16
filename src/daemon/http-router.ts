@@ -143,6 +143,7 @@ import {
   TaskApplyReviewInputError,
   taskApplyReviewMutationService,
 } from "../core/task-apply-review-mutation-service";
+import { taskPrepareApprovalMutationService } from "../core/task-prepare-approval-mutation-service";
 import {
   TaskCleanupRequestError,
   taskDeleteMutationService,
@@ -240,6 +241,7 @@ type DaemonHttpDependencies = {
   applyTaskApproveMutation: typeof taskApproveMutationService.apply;
   applyTaskApproveReworkMutation: typeof taskApproveReworkMutationService.apply;
   applyTaskApplyReviewMutation: typeof taskApplyReviewMutationService.apply;
+  applyTaskPrepareApprovalMutation: typeof taskPrepareApprovalMutationService.apply;
   loadOutboundSlackSettings: typeof outboundSlackSettingsService.load;
   applyOutboundSlackSettingsMutation: typeof outboundSlackSettingsMutationService.apply;
   loadMaintenanceState: typeof maintenanceStateService.load;
@@ -337,6 +339,8 @@ export function createDaemonHttpHandler(
       taskApproveReworkMutationService.apply(taskId, body),
     applyTaskApplyReviewMutation: (taskId, body) =>
       taskApplyReviewMutationService.apply(taskId, body),
+    applyTaskPrepareApprovalMutation: (taskId) =>
+      taskPrepareApprovalMutationService.apply(taskId),
     loadOutboundSlackSettings: () => outboundSlackSettingsService.load(),
     applyOutboundSlackSettingsMutation: (body) =>
       outboundSlackSettingsMutationService.apply(body),
@@ -2124,6 +2128,31 @@ export function createDaemonHttpHandler(
       return;
     }
 
+    const taskPrepareApprovalId = matchTaskPrepareApprovalPath(url.pathname);
+    if (taskPrepareApprovalId) {
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "task-prepare-approval",
+        { label: "Approval snapshot" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      const result = await dependencies.applyTaskPrepareApprovalMutation(
+        taskPrepareApprovalId,
+      );
+      writeJson(response, result.status, result.body);
+      return;
+    }
+
     const taskApplyReviewId = matchTaskApplyReviewPath(url.pathname);
     if (taskApplyReviewId) {
       if (request.method !== "POST") {
@@ -2489,6 +2518,11 @@ function matchTaskApproveReworkPath(pathname: string) {
 
 function matchTaskApplyReviewPath(pathname: string) {
   const match = /^\/tasks\/([^/]+)\/apply-review$/.exec(pathname);
+  return decodePathSegment(match?.[1]);
+}
+
+function matchTaskPrepareApprovalPath(pathname: string) {
+  const match = /^\/tasks\/([^/]+)\/prepare-approval$/.exec(pathname);
   return decodePathSegment(match?.[1]);
 }
 
