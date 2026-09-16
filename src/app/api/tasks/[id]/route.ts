@@ -1,5 +1,6 @@
+import { taskCleanupService, TaskCleanupRequestError } from "@/core/task-cleanup-service";
 import { taskDetailService, TaskDetailNotFoundError } from "@/core/task-detail-service";
-import { deleteTask, initializeTaskRecovery } from "@/server/tasks";
+import { initializeTaskRecovery } from "@/server/tasks";
 import { rejectNonLocalRequest, requireHumanMutation } from "@/server/request-security";
 
 export const runtime = "nodejs";
@@ -19,17 +20,23 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
 export async function DELETE(request: Request, context: { params: Promise<{ id: string }> }) {
   const rejection = requireHumanMutation(request, "task-delete", { method: "DELETE", label: "Task cleanup" }); if (rejection) return rejection;
   await initializeTaskRecovery();
-  let input: { confirmedPrCleanup?: boolean } = {};
+
+  let cleanupRequest;
   try {
     const body = await request.text();
-    if (body) {
-      const parsed = JSON.parse(body) as Record<string, unknown>;
-      if (Object.keys(parsed).some((key) => key !== "confirmedPrCleanup") || (parsed.confirmedPrCleanup !== undefined && typeof parsed.confirmedPrCleanup !== "boolean")) {
-        return Response.json({ error: "Invalid cleanup request" }, { status: 400 });
-      }
-      input = { confirmedPrCleanup: parsed.confirmedPrCleanup === true };
+    const parsed: unknown = body ? JSON.parse(body) : {};
+    cleanupRequest = taskCleanupService.parseRequest(parsed);
+  } catch (error) {
+    if (error instanceof SyntaxError || error instanceof TaskCleanupRequestError) {
+      return Response.json({ error: "Invalid cleanup request" }, { status: 400 });
     }
-  } catch { return Response.json({ error: "Invalid cleanup request" }, { status: 400 }); }
-  try { await deleteTask((await context.params).id, input); return new Response(null, { status: 204 }); }
-  catch (error) { return Response.json({ error: error instanceof Error ? error.message : "Cleanup failed" }, { status: 409 }); }
+    throw error;
+  }
+
+  try {
+    await taskCleanupService.remove((await context.params).id, cleanupRequest);
+    return new Response(null, { status: 204 });
+  } catch (error) {
+    return Response.json({ error: error instanceof Error ? error.message : "Cleanup failed" }, { status: 409 });
+  }
 }
