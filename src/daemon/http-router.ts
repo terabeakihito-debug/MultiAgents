@@ -58,6 +58,10 @@ import {
   repoProfileService,
   RepoProfileNotFoundError,
 } from "../core/repo-profile-service";
+import {
+  repoTemplatesService,
+  RepoTemplatesNotFoundError,
+} from "../core/repo-templates-service";
 import { retentionPolicyService } from "../core/retention-policy-service";
 import { taskService } from "../core/task-service";
 import {
@@ -88,6 +92,7 @@ type DaemonHttpDependencies = {
   loadRetentionPolicy: typeof retentionPolicyService.load;
   loadCleanupCandidates: typeof cleanupCandidatesService.load;
   loadRepoProfile: typeof repoProfileService.load;
+  loadRepoTemplates: typeof repoTemplatesService.load;
 };
 
 export function createDaemonHttpHandler(
@@ -114,6 +119,7 @@ export function createDaemonHttpHandler(
     loadRetentionPolicy: () => retentionPolicyService.load(),
     loadCleanupCandidates: () => cleanupCandidatesService.load(),
     loadRepoProfile: (repoId) => repoProfileService.load(repoId),
+    loadRepoTemplates: (repoId) => repoTemplatesService.load(repoId),
   },
 ) {
   return async function handleDaemonHttp(
@@ -197,6 +203,33 @@ export function createDaemonHttpHandler(
           error instanceof Error ? error.message : "unknown",
         );
         writeJson(response, 500, { error: "repo_profile_failed" });
+      }
+      return;
+    }
+
+    const repoTemplatesId = matchRepoLeafPath(url.pathname, "templates");
+    if (repoTemplatesId) {
+      if (request.method !== "GET") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          await dependencies.loadRepoTemplates(repoTemplatesId),
+        );
+      } catch (error) {
+        if (error instanceof RepoTemplatesNotFoundError) {
+          writeJson(response, 404, { error: error.message });
+          return;
+        }
+        console.error(
+          "daemon_repo_templates_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "repo_templates_failed" });
       }
       return;
     }
