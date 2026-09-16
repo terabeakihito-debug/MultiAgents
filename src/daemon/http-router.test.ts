@@ -147,6 +147,9 @@ function dependencies(
     applyNotificationSlackMarkDeliveredMutation: vi.fn(() => ({
       delivery: { deliveryId: "d-1", status: "delivered" },
     })) as never,
+    applyNotificationSlackDeliveryDismissMutation: vi.fn(() => ({
+      delivery: { deliveryId: "d-1", status: "suppressed" },
+    })) as never,
     loadFindingsQueue: vi.fn(() => ({
       findings: [{ findingId: "f-1" }],
       counts: { total: 1 },
@@ -2120,6 +2123,72 @@ describe("daemon HTTP router", () => {
 
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Notification not found" });
+  });
+
+  it("rejects notification slack delivery dismiss POST without the human mutation gate", async () => {
+    const applyNotificationSlackDeliveryDismissMutation = vi.fn(() => ({
+      delivery: { deliveryId: "d-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationSlackDeliveryDismissMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/notifications/n-1/deliveries/slack/dismiss",
+        {},
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyNotificationSlackDeliveryDismissMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts notification slack delivery dismiss POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("outbound-dismiss");
+    const payload = { delivery: { deliveryId: "d-1", status: "suppressed" } };
+    const applyNotificationSlackDeliveryDismissMutation = vi.fn(
+      () => payload,
+    ) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationSlackDeliveryDismissMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/notifications/n-1/deliveries/slack/dismiss",
+        authorizedHumanHeaders(nonce, cookie, "outbound-dismiss"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyNotificationSlackDeliveryDismissMutation).toHaveBeenCalledWith(
+      "n-1",
+    );
+  });
+
+  it("does not treat slack delivery dismiss as notification dismiss", async () => {
+    const applyNotificationDismissMutation = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationDismissMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/notifications/n-1/deliveries/slack/dismiss", {}, ""),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyNotificationDismissMutation).not.toHaveBeenCalled();
   });
 
   it("rejects notification slack mark-delivered POST without the human mutation gate", async () => {
