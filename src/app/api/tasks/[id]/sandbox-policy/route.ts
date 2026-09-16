@@ -1,6 +1,8 @@
-import { buildTaskRuntimePolicies } from "@/server/runtime-policy";
-import { publicOsSandboxPolicy } from "@/server/os-sandbox";
-import { getTask, initializeTaskRecovery } from "@/server/tasks";
+import {
+  taskSandboxPolicyService,
+  TaskSandboxPolicyNotFoundError,
+  TaskSandboxPolicyUnavailableError,
+} from "@/core/task-sandbox-policy-service";
 import { rejectNonLocalRequest } from "@/server/request-security";
 
 export const runtime = "nodejs";
@@ -8,20 +10,15 @@ export const runtime = "nodejs";
 export async function GET(request: Request, context: { params: Promise<{ id: string }> }) {
   const rejection = rejectNonLocalRequest(request);
   if (rejection) return rejection;
-  await initializeTaskRecovery();
-  const task = getTask((await context.params).id);
-  if (!task) return Response.json({ error: "Task not found" }, { status: 404 });
   try {
-    const policies = await buildTaskRuntimePolicies(task);
-    return Response.json({
-      status: "enforced",
-      validation: publicOsSandboxPolicy("validation"),
-      agents: Object.values(policies).filter((policy) => policy.role !== "disabled").map((policy) => ({
-        agent: policy.agent,
-        ...publicOsSandboxPolicy(policy.osSandboxProfile),
-      })),
-    });
+    return Response.json(await taskSandboxPolicyService.load((await context.params).id));
   } catch (error) {
-    return Response.json({ error: error instanceof Error ? error.message : "OS sandbox policy is unavailable" }, { status: 409 });
+    if (error instanceof TaskSandboxPolicyNotFoundError) {
+      return Response.json({ error: "Task not found" }, { status: 404 });
+    }
+    if (error instanceof TaskSandboxPolicyUnavailableError) {
+      return Response.json({ error: error.message }, { status: 409 });
+    }
+    throw error;
   }
 }
