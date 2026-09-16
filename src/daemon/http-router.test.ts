@@ -141,6 +141,9 @@ function dependencies(
       status: "dismissed",
     })) as never,
     applyNotificationReadAllMutation: vi.fn(() => ({ updated: 2 })) as never,
+    applyNotificationSlackRetryMutation: vi.fn(async () => ({
+      delivery: { deliveryId: "d-1", status: "pending" },
+    })) as never,
     loadFindingsQueue: vi.fn(() => ({
       findings: [{ findingId: "f-1" }],
       counts: { total: 1 },
@@ -2114,6 +2117,48 @@ describe("daemon HTTP router", () => {
 
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Notification not found" });
+  });
+
+  it("rejects notification slack retry POST without the human mutation gate", async () => {
+    const applyNotificationSlackRetryMutation = vi.fn(async () => ({
+      delivery: { deliveryId: "d-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationSlackRetryMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/notifications/n-1/deliveries/slack/retry", {}, ""),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyNotificationSlackRetryMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts notification slack retry POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("outbound-retry");
+    const payload = { delivery: { deliveryId: "d-1", status: "delivered" } };
+    const applyNotificationSlackRetryMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationSlackRetryMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/notifications/n-1/deliveries/slack/retry",
+        authorizedHumanHeaders(nonce, cookie, "outbound-retry"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyNotificationSlackRetryMutation).toHaveBeenCalledWith("n-1");
   });
 
   it("rejects notification read-all POST without the human mutation gate", async () => {
