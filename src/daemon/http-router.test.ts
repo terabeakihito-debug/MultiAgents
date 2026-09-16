@@ -227,6 +227,10 @@ function dependencies(
       templates: [{ templateId: "bug_fix", enabled: true }],
       settings: { defaultTemplateId: "bug_fix" },
     })) as never,
+    applyAgentRunMutation: vi.fn(async () => ({
+      status: "completed",
+      output: "done",
+    })) as never,
     ...overrides,
   };
 }
@@ -309,6 +313,69 @@ function authorizedHumanHeaders(
 }
 
 describe("daemon HTTP router", () => {
+  it("rejects agent run POST without the human mutation gate", async () => {
+    const applyAgentRunMutation = vi.fn(async () => ({
+      status: "completed",
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyAgentRunMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/agents/codex", {}, '{"prompt":"hello"}'),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyAgentRunMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts agent run POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("agent-run");
+    const payload = { status: "completed", output: "analysis" };
+    const applyAgentRunMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyAgentRunMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/agents/codex",
+        authorizedHumanHeaders(nonce, cookie, "agent-run"),
+        '{"prompt":"hello"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyAgentRunMutation).toHaveBeenCalledWith(
+      "codex",
+      { prompt: "hello" },
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+  });
+
+  it("does not expose parallel agent execution on the daemon", async () => {
+    const applyAgentRunMutation = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyAgentRunMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/agents/parallel", {}, '{"prompt":"hello"}'),
+      output.value,
+    );
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(applyAgentRunMutation).not.toHaveBeenCalled();
+  });
+
   it("serves human session through the core human-session boundary", async () => {
     const webResponse = Response.json(
       { nonce: "nonce-1", expiresAt: "2026-01-01T00:02:00.000Z" },

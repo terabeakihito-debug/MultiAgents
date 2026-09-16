@@ -109,6 +109,11 @@ import {
   BackupValidationError,
   stateBackupValidateService,
 } from "../core/state-backup-validate-service";
+import {
+  AgentRunInputError,
+  AgentRunUnknownAgentError,
+  agentRunMutationService,
+} from "../core/agent-run-mutation-service";
 import { taskService } from "../core/task-service";
 import {
   healthReadiness,
@@ -145,6 +150,7 @@ type DaemonHttpDependencies = {
   applyRepoProfileMutation: typeof repoProfileMutationService.apply;
   loadRepoTemplates: typeof repoTemplatesService.load;
   applyRepoTemplatesMutation: typeof repoTemplatesMutationService.apply;
+  applyAgentRunMutation: typeof agentRunMutationService.apply;
   loadRepoPulls: typeof repoPullsService.load;
   issueHumanSession: typeof humanSessionService.issue;
   rejectHumanMutation: typeof humanMutationGateService.reject;
@@ -199,6 +205,8 @@ export function createDaemonHttpHandler(
     loadRepoTemplates: (repoId) => repoTemplatesService.load(repoId),
     applyRepoTemplatesMutation: (repoId, body) =>
       repoTemplatesMutationService.apply(repoId, body),
+    applyAgentRunMutation: (agentId, body, options) =>
+      agentRunMutationService.apply(agentId, body, options),
     loadRepoPulls: (repoId) => repoPullsService.load(repoId),
     issueHumanSession: (webRequest) => humanSessionService.issue(webRequest),
     rejectHumanMutation: (webRequest, action, options) =>
@@ -248,6 +256,64 @@ export function createDaemonHttpHandler(
             error instanceof ReadinessError
               ? error.message
               : "readiness_failed",
+        });
+      }
+      return;
+    }
+
+    if (url.pathname === "/agents/parallel") {
+      writeJson(response, 404, { error: "Not found" });
+      return;
+    }
+
+    const agentRunId = matchAgentRunPath(url.pathname);
+    if (agentRunId) {
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "agent-run",
+        { label: "Agent execution" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      let body: unknown;
+      try {
+        body = await webRequest.json();
+      } catch {
+        writeJson(response, 400, {
+          error: "Request body must be valid JSON",
+        });
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          await dependencies.applyAgentRunMutation(agentRunId, body, {
+            signal: webRequest.signal,
+          }),
+        );
+      } catch (error) {
+        if (error instanceof AgentRunUnknownAgentError) {
+          writeJson(response, 404, { error: error.message });
+          return;
+        }
+        if (error instanceof AgentRunInputError) {
+          writeJson(response, 400, { error: error.message });
+          return;
+        }
+        writeJson(response, 500, {
+          error:
+            error instanceof Error ? error.message : "Agent execution failed",
         });
       }
       return;
@@ -1405,6 +1471,10 @@ function isLoopbackHost(hostHeader: string) {
 function matchStateBackupValidatePath(pathname: string) {
   const match = /^\/state\/backups\/([^/]+)\/validate$/.exec(pathname);
   return decodePathSegment(match?.[1]);
+}
+
+function matchAgentRunPath(pathname: string) {
+  return decodePathSegment(/^\/agents\/([^/]+)$/.exec(pathname)?.[1]);
 }
 
 function matchRepoLeafPath(pathname: string, leaf: "profile" | "templates" | "pulls") {
