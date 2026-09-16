@@ -273,6 +273,11 @@ function dependencies(
       remediation: null,
       history: [],
     })) as never,
+    applyFindingResolveMutation: vi.fn(async () => ({
+      finding: { findingId: "f-1", resolvedAt: "now" },
+      remediation: null,
+      history: [],
+    })) as never,
     ...overrides,
   };
 }
@@ -3381,6 +3386,54 @@ describe("daemon HTTP router", () => {
       confirmed: true,
       templateId: "bug_fix",
       objective: "Fix it",
+    });
+  });
+
+  it("rejects finding resolve POST without the human mutation gate", async () => {
+    const applyFindingResolveMutation = vi.fn(async () => ({
+      finding: { findingId: "f-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyFindingResolveMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/findings/f-1/resolve", {}, '{"confirmed":true}'),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyFindingResolveMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts finding resolve POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("finding-resolve");
+    const payload = {
+      finding: { findingId: "f-1", resolvedAt: "now" },
+      remediation: { findingId: "f-1" },
+      history: [{ type: "finding_resolved" }],
+    };
+    const applyFindingResolveMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyFindingResolveMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/findings/f-1/resolve",
+        authorizedHumanHeaders(nonce, cookie, "finding-resolve"),
+        '{"confirmed":true}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyFindingResolveMutation).toHaveBeenCalledWith("f-1", {
+      confirmed: true,
     });
   });
 

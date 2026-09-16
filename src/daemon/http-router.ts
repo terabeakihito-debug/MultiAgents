@@ -20,6 +20,10 @@ import {
   findingConvertMutationService,
 } from "../core/finding-convert-mutation-service";
 import {
+  FindingResolveInputError,
+  findingResolveMutationService,
+} from "../core/finding-resolve-mutation-service";
+import {
   FindingDismissInputError,
   findingDismissMutationService,
 } from "../core/finding-dismiss-mutation-service";
@@ -154,6 +158,7 @@ type DaemonHttpDependencies = {
   applyFindingAcceptMutation: typeof findingAcceptMutationService.apply;
   applyFindingDismissMutation: typeof findingDismissMutationService.apply;
   applyFindingConvertMutation: typeof findingConvertMutationService.apply;
+  applyFindingResolveMutation: typeof findingResolveMutationService.apply;
   loadTaskCi: typeof taskCiService.load;
   loadTaskPr: typeof taskPrService.load;
   loadTaskSandboxPolicy: typeof taskSandboxPolicyService.load;
@@ -215,6 +220,8 @@ export function createDaemonHttpHandler(
       findingDismissMutationService.apply(findingId, body),
     applyFindingConvertMutation: (findingId, body) =>
       findingConvertMutationService.apply(findingId, body),
+    applyFindingResolveMutation: (findingId, body) =>
+      findingResolveMutationService.apply(findingId, body),
     loadTaskCi: (id) => taskCiService.load(id),
     loadTaskPr: (id) => taskPrService.load(id),
     loadTaskSandboxPolicy: (id) => taskSandboxPolicyService.load(id),
@@ -1351,6 +1358,56 @@ export function createDaemonHttpHandler(
       return;
     }
 
+    const findingResolveId = matchFindingResolvePath(url.pathname);
+    if (findingResolveId) {
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "finding-resolve",
+        { label: "Finding" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      let body: unknown;
+      try {
+        body = await webRequest.json();
+      } catch {
+        writeJson(response, 400, {
+          error: "Request body must be valid JSON",
+        });
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          await dependencies.applyFindingResolveMutation(
+            findingResolveId,
+            body,
+          ),
+        );
+      } catch (error) {
+        if (error instanceof FindingResolveInputError) {
+          writeJson(response, 400, { error: error.message });
+          return;
+        }
+        writeJson(response, 409, {
+          error:
+            error instanceof Error ? error.message : "Finding resolution failed",
+        });
+      }
+      return;
+    }
+
     if (request.method === "GET" && url.pathname === "/findings/queue") {
       try {
         writeJson(response, 200, dependencies.loadFindingsQueue(url));
@@ -1951,6 +2008,11 @@ function matchFindingDismissPath(pathname: string) {
 
 function matchFindingConvertPath(pathname: string) {
   const match = /^\/findings\/([^/]+)\/convert$/.exec(pathname);
+  return decodePathSegment(match?.[1]);
+}
+
+function matchFindingResolvePath(pathname: string) {
+  const match = /^\/findings\/([^/]+)\/resolve$/.exec(pathname);
   return decodePathSegment(match?.[1]);
 }
 
