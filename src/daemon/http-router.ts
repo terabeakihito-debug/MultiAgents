@@ -68,6 +68,7 @@ import {
   RepoTemplatesNotFoundError,
 } from "../core/repo-templates-service";
 import { humanSessionService } from "../core/human-session-service";
+import { maintenanceStateService } from "../core/maintenance-state-service";
 import { retentionPolicyService } from "../core/retention-policy-service";
 import { taskService } from "../core/task-service";
 import {
@@ -102,6 +103,7 @@ type DaemonHttpDependencies = {
   loadRepoPulls: typeof repoPullsService.load;
   issueHumanSession: typeof humanSessionService.issue;
   loadOutboundSlackSettings: typeof outboundSlackSettingsService.load;
+  loadMaintenanceState: typeof maintenanceStateService.load;
 };
 
 export function createDaemonHttpHandler(
@@ -132,6 +134,7 @@ export function createDaemonHttpHandler(
     loadRepoPulls: (repoId) => repoPullsService.load(repoId),
     issueHumanSession: (webRequest) => humanSessionService.issue(webRequest),
     loadOutboundSlackSettings: () => outboundSlackSettingsService.load(),
+    loadMaintenanceState: () => maintenanceStateService.load(),
   },
 ) {
   return async function handleDaemonHttp(
@@ -176,6 +179,19 @@ export function createDaemonHttpHandler(
         response,
         dependencies.issueHumanSession(toWebRequest(request)),
       );
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/maintenance") {
+      try {
+        writeJson(response, 200, dependencies.loadMaintenanceState());
+      } catch (error) {
+        console.error(
+          "daemon_maintenance_state_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "maintenance_state_failed" });
+      }
       return;
     }
 

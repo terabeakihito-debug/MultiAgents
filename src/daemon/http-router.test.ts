@@ -173,6 +173,9 @@ function dependencies(
       configured: true,
       config: { enabled: true },
     })) as never,
+    loadMaintenanceState: vi.fn(() => ({
+      state: "RUNNING",
+    })) as never,
     ...overrides,
   };
 }
@@ -239,6 +242,62 @@ describe("daemon HTTP router", () => {
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Not found" });
     expect(issueHumanSession).not.toHaveBeenCalled();
+  });
+
+  it("does not expose agent execution routes as daemon reads", async () => {
+    const handler = createDaemonHttpHandler(dependencies());
+    const output = response();
+
+    await handler(request("GET", "/agents/codex"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+  });
+
+  it("serves maintenance state through the core maintenance-state boundary", async () => {
+    const payload = { state: "MAINTENANCE" };
+    const loadMaintenanceState = vi.fn(() => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadMaintenanceState }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/maintenance"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadMaintenanceState).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a stable error when maintenance state loading fails", async () => {
+    const loadMaintenanceState = vi.fn(() => {
+      throw new Error("registry failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadMaintenanceState }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/maintenance"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "maintenance_state_failed" });
+  });
+
+  it("does not expose maintenance mutations on the daemon", async () => {
+    const loadMaintenanceState = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadMaintenanceState }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/maintenance"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadMaintenanceState).not.toHaveBeenCalled();
   });
 
   it("serves outbound Slack settings through the core outbound-slack-settings boundary", async () => {
