@@ -40,6 +40,7 @@ import {
   DashboardQueryError,
 } from "../core/dashboard-tasks-service";
 import { cleanupCandidatesService } from "../core/cleanup-candidates-service";
+import { cleanupExecuteMutationService } from "../core/cleanup-execute-mutation-service";
 import { cleanupPreviewMutationService } from "../core/cleanup-preview-mutation-service";
 import { credentialStatusService } from "../core/credential-status-service";
 import {
@@ -124,6 +125,7 @@ type DaemonHttpDependencies = {
   applyRetentionPolicyMutation: typeof retentionPolicyMutationService.apply;
   loadCleanupCandidates: typeof cleanupCandidatesService.load;
   applyCleanupPreviewMutation: typeof cleanupPreviewMutationService.apply;
+  applyCleanupExecuteMutation: typeof cleanupExecuteMutationService.apply;
   loadRepoProfile: typeof repoProfileService.load;
   loadRepoTemplates: typeof repoTemplatesService.load;
   loadRepoPulls: typeof repoPullsService.load;
@@ -168,6 +170,8 @@ export function createDaemonHttpHandler(
     loadCleanupCandidates: () => cleanupCandidatesService.load(),
     applyCleanupPreviewMutation: (body) =>
       cleanupPreviewMutationService.apply(body),
+    applyCleanupExecuteMutation: (body) =>
+      cleanupExecuteMutationService.apply(body),
     loadRepoProfile: (repoId) => repoProfileService.load(repoId),
     loadRepoTemplates: (repoId) => repoTemplatesService.load(repoId),
     loadRepoPulls: (repoId) => repoPullsService.load(repoId),
@@ -507,6 +511,47 @@ export function createDaemonHttpHandler(
         writeJson(response, 409, {
           error:
             error instanceof Error ? error.message : "Cleanup preview failed",
+        });
+      }
+      return;
+    }
+
+    if (url.pathname === "/cleanup/execute") {
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "cleanup-execute",
+        { label: "Cleanup" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      let body: unknown;
+      try {
+        body = await webRequest.json();
+      } catch {
+        writeJson(response, 400, {
+          error: "Cleanup selection must be valid JSON",
+        });
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          await dependencies.applyCleanupExecuteMutation(body),
+        );
+      } catch (error) {
+        writeJson(response, 409, {
+          error: error instanceof Error ? error.message : "Cleanup failed",
         });
       }
       return;

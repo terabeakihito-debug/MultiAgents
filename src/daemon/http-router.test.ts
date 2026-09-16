@@ -206,6 +206,10 @@ function dependencies(
       selected: [],
       estimatedBytes: 0,
     })) as never,
+    applyCleanupExecuteMutation: vi.fn(async () => ({
+      completed: [],
+      estimatedBytes: 0,
+    })) as never,
     ...overrides,
   };
 }
@@ -1210,10 +1214,13 @@ describe("daemon HTTP router", () => {
     });
   });
 
-  it("does not expose cleanup execute on the daemon", async () => {
-    const applyCleanupPreviewMutation = vi.fn() as never;
+  it("rejects cleanup execute POST without the human mutation gate", async () => {
+    const applyCleanupExecuteMutation = vi.fn(async () => ({
+      completed: [],
+      estimatedBytes: 0,
+    })) as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ applyCleanupPreviewMutation }),
+      dependencies({ applyCleanupExecuteMutation }),
     );
     const output = response();
 
@@ -1222,9 +1229,37 @@ describe("daemon HTTP router", () => {
       output.value,
     );
 
-    expect(output.status()).toBe(404);
-    expect(output.json()).toEqual({ error: "Not found" });
-    expect(applyCleanupPreviewMutation).not.toHaveBeenCalled();
+    expect(output.status()).toBe(403);
+    expect(applyCleanupExecuteMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts cleanup execute POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("cleanup-execute");
+    const executePayload = {
+      completed: ["notification:n-1"],
+      estimatedBytes: 10,
+    };
+    const applyCleanupExecuteMutation = vi.fn(async () => executePayload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyCleanupExecuteMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/cleanup/execute",
+        authorizedHumanHeaders(nonce, cookie, "cleanup-execute"),
+        '{"candidateIds":["notification:n-1"]}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(executePayload);
+    expect(applyCleanupExecuteMutation).toHaveBeenCalledWith({
+      candidateIds: ["notification:n-1"],
+    });
   });
 
   it("rejects a non-loopback Host header on cleanup candidates", async () => {
