@@ -257,6 +257,9 @@ function dependencies(
     applyTaskReassociateMutation: vi.fn(async () => ({
       task: { id: "task-1" },
     })) as never,
+    applyTaskDependencyRecoveryInstructionsMutation: vi.fn(async () => ({
+      steps: ["npm install"],
+    })) as never,
     applyRetentionPolicyMutation: vi.fn(() => ({ preset: "balanced" })) as never,
     applyCleanupPreviewMutation: vi.fn(async () => ({
       selected: [],
@@ -3056,6 +3059,62 @@ describe("daemon HTTP router", () => {
 
     expect(output.status()).toBe(500);
     expect(output.json()).toEqual({ error: "task_detail_failed" });
+  });
+
+  it("rejects dependency recovery instructions POST without the human mutation gate", async () => {
+    const applyTaskDependencyRecoveryInstructionsMutation = vi.fn(async () => ({
+      steps: [],
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskDependencyRecoveryInstructionsMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/dependency-recovery-instructions",
+        {},
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyTaskDependencyRecoveryInstructionsMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts dependency recovery instructions POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce(
+      "task-dependency-recovery-instructions",
+    );
+    const payload = { steps: ["npm ci"], workdir: "/tmp/wt" };
+    const applyTaskDependencyRecoveryInstructionsMutation = vi.fn(
+      async () => payload,
+    ) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskDependencyRecoveryInstructionsMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/dependency-recovery-instructions",
+        authorizedHumanHeaders(
+          nonce,
+          cookie,
+          "task-dependency-recovery-instructions",
+        ),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyTaskDependencyRecoveryInstructionsMutation).toHaveBeenCalledWith(
+      "task-1",
+    );
   });
 
   it("rejects task reassociate preview POST without the human mutation gate", async () => {

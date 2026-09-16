@@ -156,6 +156,11 @@ import {
   taskRefreshPrMutationService,
 } from "../core/task-refresh-pr-mutation-service";
 import {
+  DependencyRecoveryTaskNotFoundError,
+  DependencyRecoveryUnavailableError,
+  taskDependencyRecoveryInstructionsMutationService,
+} from "../core/task-dependency-recovery-instructions-mutation-service";
+import {
   TaskReassociateInputError,
   taskReassociateMutationService,
 } from "../core/task-reassociate-mutation-service";
@@ -266,6 +271,7 @@ type DaemonHttpDependencies = {
   applyTaskResumeMutation: typeof taskResumeMutationService.apply;
   applyTaskReassociatePreviewMutation: typeof taskReassociatePreviewMutationService.apply;
   applyTaskReassociateMutation: typeof taskReassociateMutationService.apply;
+  applyTaskDependencyRecoveryInstructionsMutation: typeof taskDependencyRecoveryInstructionsMutationService.apply;
   loadOutboundSlackSettings: typeof outboundSlackSettingsService.load;
   applyOutboundSlackSettingsMutation: typeof outboundSlackSettingsMutationService.apply;
   loadMaintenanceState: typeof maintenanceStateService.load;
@@ -377,6 +383,8 @@ export function createDaemonHttpHandler(
       taskReassociatePreviewMutationService.apply(taskId),
     applyTaskReassociateMutation: (taskId, body) =>
       taskReassociateMutationService.apply(taskId, body),
+    applyTaskDependencyRecoveryInstructionsMutation: (taskId) =>
+      taskDependencyRecoveryInstructionsMutationService.apply(taskId),
     loadOutboundSlackSettings: () => outboundSlackSettingsService.load(),
     applyOutboundSlackSettingsMutation: (body) =>
       outboundSlackSettingsMutationService.apply(body),
@@ -2164,6 +2172,50 @@ export function createDaemonHttpHandler(
       return;
     }
 
+    const taskDependencyRecoveryId =
+      matchTaskDependencyRecoveryInstructionsPath(url.pathname);
+    if (taskDependencyRecoveryId) {
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "task-dependency-recovery-instructions",
+        { label: "Dependency recovery instructions" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          await dependencies.applyTaskDependencyRecoveryInstructionsMutation(
+            taskDependencyRecoveryId,
+          ),
+        );
+      } catch (error) {
+        if (error instanceof DependencyRecoveryTaskNotFoundError) {
+          writeJson(response, 404, { error: "Task not found" });
+          return;
+        }
+        if (error instanceof DependencyRecoveryUnavailableError) {
+          writeJson(response, 409, {
+            error:
+              "Dependency recovery instructions are unavailable for this task",
+          });
+          return;
+        }
+        throw error;
+      }
+      return;
+    }
+
     const taskReassociatePreviewId = matchTaskReassociatePreviewPath(url.pathname);
     if (taskReassociatePreviewId) {
       if (request.method !== "POST") {
@@ -2802,6 +2854,12 @@ function matchTaskReassociatePreviewPath(pathname: string) {
 
 function matchTaskReassociatePath(pathname: string) {
   const match = /^\/tasks\/([^/]+)\/reassociate$/.exec(pathname);
+  return decodePathSegment(match?.[1]);
+}
+
+function matchTaskDependencyRecoveryInstructionsPath(pathname: string) {
+  const match =
+    /^\/tasks\/([^/]+)\/dependency-recovery-instructions$/.exec(pathname);
   return decodePathSegment(match?.[1]);
 }
 
