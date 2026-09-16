@@ -251,6 +251,9 @@ function dependencies(
       status: 200,
       body: { task: { id: "task-1" } },
     })) as never,
+    applyTaskReassociatePreviewMutation: vi.fn(async () => ({
+      preview: { fingerprint: "fp-1" },
+    })) as never,
     applyRetentionPolicyMutation: vi.fn(() => ({ preset: "balanced" })) as never,
     applyCleanupPreviewMutation: vi.fn(async () => ({
       selected: [],
@@ -3050,6 +3053,50 @@ describe("daemon HTTP router", () => {
 
     expect(output.status()).toBe(500);
     expect(output.json()).toEqual({ error: "task_detail_failed" });
+  });
+
+  it("rejects task reassociate preview POST without the human mutation gate", async () => {
+    const applyTaskReassociatePreviewMutation = vi.fn(async () => ({
+      preview: {},
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskReassociatePreviewMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/tasks/task-1/reassociate/preview", {}, ""),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyTaskReassociatePreviewMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts task reassociate preview POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce(
+      "task-reassociation-preview",
+    );
+    const payload = { preview: { fingerprint: "fp-1", candidates: [] } };
+    const applyTaskReassociatePreviewMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskReassociatePreviewMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/reassociate/preview",
+        authorizedHumanHeaders(nonce, cookie, "task-reassociation-preview"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyTaskReassociatePreviewMutation).toHaveBeenCalledWith("task-1");
   });
 
   it("rejects task resume POST without the human mutation gate", async () => {

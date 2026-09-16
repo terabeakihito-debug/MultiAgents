@@ -155,6 +155,7 @@ import {
   ApprovalError as TaskRefreshPrApprovalError,
   taskRefreshPrMutationService,
 } from "../core/task-refresh-pr-mutation-service";
+import { taskReassociatePreviewMutationService } from "../core/task-reassociate-preview-mutation-service";
 import { taskResumeMutationService } from "../core/task-resume-mutation-service";
 import { taskPrepareApprovalMutationService } from "../core/task-prepare-approval-mutation-service";
 import {
@@ -259,6 +260,7 @@ type DaemonHttpDependencies = {
   applyTaskFetchReviewMutation: typeof taskFetchReviewMutationService.apply;
   applyTaskRefreshPrMutation: typeof taskRefreshPrMutationService.apply;
   applyTaskResumeMutation: typeof taskResumeMutationService.apply;
+  applyTaskReassociatePreviewMutation: typeof taskReassociatePreviewMutationService.apply;
   loadOutboundSlackSettings: typeof outboundSlackSettingsService.load;
   applyOutboundSlackSettingsMutation: typeof outboundSlackSettingsMutationService.apply;
   loadMaintenanceState: typeof maintenanceStateService.load;
@@ -366,6 +368,8 @@ export function createDaemonHttpHandler(
       taskRefreshPrMutationService.apply(taskId),
     applyTaskResumeMutation: (taskId) =>
       taskResumeMutationService.apply(taskId),
+    applyTaskReassociatePreviewMutation: (taskId) =>
+      taskReassociatePreviewMutationService.apply(taskId),
     loadOutboundSlackSettings: () => outboundSlackSettingsService.load(),
     applyOutboundSlackSettingsMutation: (body) =>
       outboundSlackSettingsMutationService.apply(body),
@@ -2153,6 +2157,41 @@ export function createDaemonHttpHandler(
       return;
     }
 
+    const taskReassociatePreviewId = matchTaskReassociatePreviewPath(url.pathname);
+    if (taskReassociatePreviewId) {
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "task-reassociation-preview",
+        { label: "Worktree reassociation preview" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          await dependencies.applyTaskReassociatePreviewMutation(
+            taskReassociatePreviewId,
+          ),
+        );
+      } catch (error) {
+        writeJson(response, 409, {
+          error:
+            error instanceof Error ? error.message : "Reassociation preview failed",
+        });
+      }
+      return;
+    }
+
     const taskResumeId = matchTaskResumePath(url.pathname);
     if (taskResumeId) {
       if (request.method !== "POST") {
@@ -2697,6 +2736,11 @@ function matchTaskRefreshPrPath(pathname: string) {
 
 function matchTaskResumePath(pathname: string) {
   const match = /^\/tasks\/([^/]+)\/resume$/.exec(pathname);
+  return decodePathSegment(match?.[1]);
+}
+
+function matchTaskReassociatePreviewPath(pathname: string) {
+  const match = /^\/tasks\/([^/]+)\/reassociate\/preview$/.exec(pathname);
   return decodePathSegment(match?.[1]);
 }
 
