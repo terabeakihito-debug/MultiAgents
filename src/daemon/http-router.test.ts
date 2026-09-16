@@ -201,6 +201,7 @@ function dependencies(
     initializeTaskDeleteRecovery: vi.fn(async () => undefined) as never,
     parseTaskDeleteBody: vi.fn(() => ({})) as never,
     removeTask: vi.fn(async () => undefined) as never,
+    applyRetentionPolicyMutation: vi.fn(() => ({ preset: "balanced" })) as never,
     ...overrides,
   };
 }
@@ -1207,18 +1208,49 @@ describe("daemon HTTP router", () => {
     expect(output.json()).toEqual({ error: "retention_policy_failed" });
   });
 
-  it("does not expose retention policy mutations on the daemon", async () => {
-    const loadRetentionPolicy = vi.fn() as never;
+  it("rejects retention policy POST without the human mutation gate", async () => {
+    const applyRetentionPolicyMutation = vi.fn(() => ({
+      preset: "balanced",
+    })) as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ loadRetentionPolicy }),
+      dependencies({ applyRetentionPolicyMutation }),
     );
     const output = response();
 
-    await handler(request("POST", "/retention-policy"), output.value);
+    await handler(
+      postJsonRequest("/retention-policy", {}, '{"preset":"balanced"}'),
+      output.value,
+    );
 
-    expect(output.status()).toBe(404);
-    expect(output.json()).toEqual({ error: "Not found" });
-    expect(loadRetentionPolicy).not.toHaveBeenCalled();
+    expect(output.status()).toBe(403);
+    expect(applyRetentionPolicyMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts retention policy POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("retention-policy");
+    const applyRetentionPolicyMutation = vi.fn(() => ({
+      preset: "balanced",
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyRetentionPolicyMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/retention-policy",
+        authorizedHumanHeaders(nonce, cookie, "retention-policy"),
+        '{"preset":"balanced"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual({ preset: "balanced" });
+    expect(applyRetentionPolicyMutation).toHaveBeenCalledWith({
+      preset: "balanced",
+    });
   });
 
   it("rejects a non-loopback Host header on retention policy", async () => {

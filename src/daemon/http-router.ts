@@ -84,6 +84,10 @@ import {
 import { maintenanceStateService } from "../core/maintenance-state-service";
 import { toWebRequestWithBody } from "./incoming-request";
 import { retentionPolicyService } from "../core/retention-policy-service";
+import {
+  RetentionPresetInvalidError,
+  retentionPolicyMutationService,
+} from "../core/retention-policy-mutation-service";
 import { stateBackupsService } from "../core/state-backups-service";
 import {
   BackupValidationError,
@@ -116,6 +120,7 @@ type DaemonHttpDependencies = {
   loadRuntimeSandboxStatus: typeof runtimeSandboxStatusService.load;
   loadNotificationPreferences: typeof notificationPreferencesService.load;
   loadRetentionPolicy: typeof retentionPolicyService.load;
+  applyRetentionPolicyMutation: typeof retentionPolicyMutationService.apply;
   loadCleanupCandidates: typeof cleanupCandidatesService.load;
   loadRepoProfile: typeof repoProfileService.load;
   loadRepoTemplates: typeof repoTemplatesService.load;
@@ -156,6 +161,8 @@ export function createDaemonHttpHandler(
     loadRuntimeSandboxStatus: () => runtimeSandboxStatusService.load(),
     loadNotificationPreferences: () => notificationPreferencesService.load(),
     loadRetentionPolicy: () => retentionPolicyService.load(),
+    applyRetentionPolicyMutation: (body) =>
+      retentionPolicyMutationService.apply(body),
     loadCleanupCandidates: () => cleanupCandidatesService.load(),
     loadRepoProfile: (repoId) => repoProfileService.load(repoId),
     loadRepoTemplates: (repoId) => repoTemplatesService.load(repoId),
@@ -472,16 +479,64 @@ export function createDaemonHttpHandler(
       return;
     }
 
-    if (request.method === "GET" && url.pathname === "/retention-policy") {
-      try {
-        writeJson(response, 200, dependencies.loadRetentionPolicy());
-      } catch (error) {
-        console.error(
-          "daemon_retention_policy_failed",
-          error instanceof Error ? error.message : "unknown",
-        );
-        writeJson(response, 500, { error: "retention_policy_failed" });
+    if (url.pathname === "/retention-policy") {
+      if (request.method === "GET") {
+        try {
+          writeJson(response, 200, dependencies.loadRetentionPolicy());
+        } catch (error) {
+          console.error(
+            "daemon_retention_policy_failed",
+            error instanceof Error ? error.message : "unknown",
+          );
+          writeJson(response, 500, { error: "retention_policy_failed" });
+        }
+        return;
       }
+
+      if (request.method === "POST") {
+        const webRequest = await toWebRequestWithBody(request);
+        const rejection = dependencies.rejectHumanMutation(
+          webRequest,
+          "retention-policy",
+          { label: "Retention policy" },
+        );
+        if (rejection) {
+          await writeWebResponse(response, rejection);
+          return;
+        }
+
+        let body: unknown;
+        try {
+          body = await webRequest.json();
+        } catch {
+          writeJson(response, 400, {
+            error: "Retention policy must be valid JSON",
+          });
+          return;
+        }
+
+        try {
+          writeJson(
+            response,
+            200,
+            dependencies.applyRetentionPolicyMutation(body),
+          );
+        } catch (error) {
+          if (error instanceof RetentionPresetInvalidError) {
+            writeJson(response, 400, { error: error.message });
+            return;
+          }
+          writeJson(response, 500, {
+            error:
+              error instanceof Error
+                ? error.message
+                : "retention_policy_update_failed",
+          });
+        }
+        return;
+      }
+
+      writeJson(response, 404, { error: "Not found" });
       return;
     }
 
