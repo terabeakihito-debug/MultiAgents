@@ -99,11 +99,84 @@ function dependencies(
       taskType: "bug_fix",
       policies: [],
     })) as never,
+    loadProfileList: vi.fn(() => ({
+      presets: [{ id: "safe_default" }],
+      profiles: [],
+      versions: [],
+    })) as never,
     ...overrides,
   };
 }
 
 describe("daemon HTTP router", () => {
+  it("serves the profile catalog through the core profile-list boundary", async () => {
+    const catalog = {
+      presets: [{ id: "safe_default" }],
+      profiles: [{ id: "profile-1" }],
+      versions: [{ id: "v1" }],
+    };
+    const loadProfileList = vi.fn(() => catalog) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadProfileList }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/profiles"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(catalog);
+    expect(loadProfileList).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a stable error when profile listing fails", async () => {
+    const loadProfileList = vi.fn(() => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadProfileList }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/profiles"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "profile_list_failed" });
+  });
+
+  it("does not expose profile listing on unsupported methods", async () => {
+    const loadProfileList = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadProfileList }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/profiles"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadProfileList).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on profile listing", async () => {
+    const loadProfileList = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadProfileList }),
+    );
+    const output = response();
+    const incoming = request("GET", "/profiles");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadProfileList).not.toHaveBeenCalled();
+  });
+
   it("serves the task list through the core task boundary", async () => {
     const tasks = [{ id: "task-1" }, { id: "task-2" }];
     const listTasks = vi.fn(async () => tasks) as never;

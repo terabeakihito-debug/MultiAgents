@@ -35,6 +35,7 @@ import {
   TaskSandboxPolicyNotFoundError,
   TaskSandboxPolicyUnavailableError,
 } from "../core/task-sandbox-policy-service";
+import { profileListService } from "../core/profile-list-service";
 import { taskService } from "../core/task-service";
 import {
   healthReadiness,
@@ -52,6 +53,7 @@ type DaemonHttpDependencies = {
   loadTaskPr: typeof taskPrService.load;
   loadTaskSandboxPolicy: typeof taskSandboxPolicyService.load;
   loadTaskRuntimePolicy: typeof taskRuntimePolicyService.load;
+  loadProfileList: typeof profileListService.load;
 };
 
 export function createDaemonHttpHandler(
@@ -66,6 +68,7 @@ export function createDaemonHttpHandler(
     loadTaskPr: (id) => taskPrService.load(id),
     loadTaskSandboxPolicy: (id) => taskSandboxPolicyService.load(id),
     loadTaskRuntimePolicy: (id) => taskRuntimePolicyService.load(id),
+    loadProfileList: () => profileListService.load(),
   },
 ) {
   return async function handleDaemonHttp(
@@ -96,6 +99,19 @@ export function createDaemonHttpHandler(
               ? error.message
               : "readiness_failed",
         });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/profiles") {
+      try {
+        writeJson(response, 200, dependencies.loadProfileList());
+      } catch (error) {
+        console.error(
+          "daemon_profile_list_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "profile_list_failed" });
       }
       return;
     }
