@@ -194,20 +194,25 @@ function dependencies(
     applyMaintenanceMutation: vi.fn(async () => ({
       state: "RUNNING",
     })) as never,
+    initializeTaskRecovery: vi.fn(async () => undefined) as never,
+    createTaskFromBody: vi.fn(async () => ({
+      task: { id: "task-new", repoId: "repo-1" },
+    })) as never,
     ...overrides,
   };
 }
 
 const MAINTENANCE_ORIGIN = "http://127.0.0.1:3000";
 
-function postMaintenanceRequest(
+function postJsonRequest(
+  path: string,
   headers: Record<string, string>,
-  jsonBody = '{"enabled":false}',
+  jsonBody: string,
 ): IncomingMessage {
   const stream = Readable.from([Buffer.from(jsonBody)]);
   return Object.assign(stream, {
     method: "POST",
-    url: "/maintenance",
+    url: path,
     headers: {
       host: "127.0.0.1:3000",
       "content-type": "application/json",
@@ -216,7 +221,17 @@ function postMaintenanceRequest(
   }) as unknown as IncomingMessage;
 }
 
-async function issuedMaintenanceNonce(now = Date.now()) {
+function postMaintenanceRequest(
+  headers: Record<string, string>,
+  jsonBody = '{"enabled":false}',
+): IncomingMessage {
+  return postJsonRequest("/maintenance", headers, jsonBody);
+}
+
+async function issuedHumanMutationNonce(
+  action = "maintenance-mode",
+  now = Date.now(),
+) {
   const nonceResponse = issueHumanMutationNonce(
     new Request(`${MAINTENANCE_ORIGIN}/human-session`, {
       headers: {
@@ -231,6 +246,25 @@ async function issuedMaintenanceNonce(now = Date.now()) {
   return {
     nonce: payload.nonce,
     cookie: nonceResponse.headers.get("set-cookie")!.split(";")[0],
+    action,
+  };
+}
+
+async function issuedMaintenanceNonce(now = Date.now()) {
+  return issuedHumanMutationNonce("maintenance-mode", now);
+}
+
+function authorizedHumanHeaders(
+  nonce: string,
+  cookie: string,
+  action: string,
+) {
+  return {
+    origin: MAINTENANCE_ORIGIN,
+    "sec-fetch-site": "same-origin",
+    "x-multiagents-human-action": action,
+    "x-multiagents-human-nonce": nonce,
+    cookie,
   };
 }
 
@@ -367,13 +401,9 @@ describe("daemon HTTP router", () => {
     const output = response();
 
     await handler(
-      postMaintenanceRequest({
-        origin: MAINTENANCE_ORIGIN,
-        "sec-fetch-site": "same-origin",
-        "x-multiagents-human-action": "maintenance-mode",
-        "x-multiagents-human-nonce": nonce,
-        cookie,
-      }),
+      postMaintenanceRequest(
+        authorizedHumanHeaders(nonce, cookie, "maintenance-mode"),
+      ),
       output.value,
     );
 
@@ -1706,6 +1736,57 @@ describe("daemon HTTP router", () => {
     expect(output.json()).toEqual({ error: "task_list_failed" });
   });
 
+  it("rejects task create POST without the human mutation gate", async () => {
+    const createTaskFromBody = vi.fn(async () => ({
+      task: { id: "task-new" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ createTaskFromBody }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/tasks", {}, '{"repoId":"repo-1"}'),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(createTaskFromBody).not.toHaveBeenCalled();
+  });
+
+  it("accepts task create POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("task-create");
+    const initializeTaskRecovery = vi.fn(async () => undefined) as never;
+    const createTaskFromBody = vi.fn(async () => ({
+      task: { id: "task-new", repoId: "repo-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ initializeTaskRecovery, createTaskFromBody }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks",
+        authorizedHumanHeaders(nonce, cookie, "task-create"),
+        '{"repoId":"repo-1","templateId":"bug_fix","prompt":"Fix"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(201);
+    expect(output.json()).toEqual({
+      task: { id: "task-new", repoId: "repo-1" },
+    });
+    expect(initializeTaskRecovery).toHaveBeenCalledTimes(1);
+    expect(createTaskFromBody).toHaveBeenCalledWith({
+      repoId: "repo-1",
+      templateId: "bug_fix",
+      prompt: "Fix",
+    });
+  });
+
   it("does not expose task listing on unsupported methods", async () => {
     const listTasks = vi.fn(async () => []) as never;
     const handler = createDaemonHttpHandler(
@@ -1713,7 +1794,7 @@ describe("daemon HTTP router", () => {
     );
     const output = response();
 
-    await handler(request("POST", "/tasks"), output.value);
+    await handler(request("DELETE", "/tasks"), output.value);
 
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Not found" });

@@ -73,6 +73,10 @@ import {
   maintenanceMutationErrorStatus,
   maintenanceMutationService,
 } from "../core/maintenance-mutation-service";
+import {
+  TaskRequestError,
+  taskCreateMutationService,
+} from "../core/task-create-mutation-service";
 import { maintenanceStateService } from "../core/maintenance-state-service";
 import { toWebRequestWithBody } from "./incoming-request";
 import { retentionPolicyService } from "../core/retention-policy-service";
@@ -115,6 +119,8 @@ type DaemonHttpDependencies = {
   issueHumanSession: typeof humanSessionService.issue;
   rejectHumanMutation: typeof humanMutationGateService.reject;
   applyMaintenanceMutation: typeof maintenanceMutationService.apply;
+  initializeTaskRecovery: typeof taskCreateMutationService.initialize;
+  createTaskFromBody: typeof taskCreateMutationService.createFromBody;
   loadOutboundSlackSettings: typeof outboundSlackSettingsService.load;
   loadMaintenanceState: typeof maintenanceStateService.load;
   loadStateBackups: typeof stateBackupsService.load;
@@ -151,6 +157,8 @@ export function createDaemonHttpHandler(
     rejectHumanMutation: (webRequest, action, options) =>
       humanMutationGateService.reject(webRequest, action, options),
     applyMaintenanceMutation: (body) => maintenanceMutationService.apply(body),
+    initializeTaskRecovery: () => taskCreateMutationService.initialize(),
+    createTaskFromBody: (body) => taskCreateMutationService.createFromBody(body),
     loadOutboundSlackSettings: () => outboundSlackSettingsService.load(),
     loadMaintenanceState: () => maintenanceStateService.load(),
     loadStateBackups: () => stateBackupsService.load(),
@@ -556,17 +564,65 @@ export function createDaemonHttpHandler(
       return;
     }
 
-    if (request.method === "GET" && url.pathname === "/tasks") {
-      try {
-        const tasks = await dependencies.listTasks();
-        writeJson(response, 200, { tasks });
-      } catch (error) {
-        console.error(
-          "daemon_task_list_failed",
-          error instanceof Error ? error.message : "unknown",
-        );
-        writeJson(response, 500, { error: "task_list_failed" });
+    if (url.pathname === "/tasks") {
+      if (request.method === "GET") {
+        try {
+          const tasks = await dependencies.listTasks();
+          writeJson(response, 200, { tasks });
+        } catch (error) {
+          console.error(
+            "daemon_task_list_failed",
+            error instanceof Error ? error.message : "unknown",
+          );
+          writeJson(response, 500, { error: "task_list_failed" });
+        }
+        return;
       }
+
+      if (request.method === "POST") {
+        const webRequest = await toWebRequestWithBody(request);
+        const rejection = dependencies.rejectHumanMutation(
+          webRequest,
+          "task-create",
+          { label: "Task creation" },
+        );
+        if (rejection) {
+          await writeWebResponse(response, rejection);
+          return;
+        }
+
+        await dependencies.initializeTaskRecovery();
+
+        let body: unknown;
+        try {
+          body = await webRequest.json();
+        } catch {
+          writeJson(response, 400, {
+            error: "Request body must be valid JSON",
+          });
+          return;
+        }
+
+        try {
+          writeJson(
+            response,
+            201,
+            await dependencies.createTaskFromBody(body),
+          );
+        } catch (error) {
+          if (error instanceof TaskRequestError) {
+            writeJson(response, 400, { error: error.message });
+            return;
+          }
+          writeJson(response, 400, {
+            error:
+              error instanceof Error ? error.message : "Task creation failed",
+          });
+        }
+        return;
+      }
+
+      writeJson(response, 404, { error: "Not found" });
       return;
     }
 
