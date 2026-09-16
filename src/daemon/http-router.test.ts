@@ -210,6 +210,9 @@ function dependencies(
       completed: [],
       estimatedBytes: 0,
     })) as never,
+    createStateBackup: vi.fn(async () => ({
+      backup: { backupId: "b-new", verified: false },
+    })) as never,
     ...overrides,
   };
 }
@@ -470,18 +473,48 @@ describe("daemon HTTP router", () => {
     expect(output.json()).toEqual({ error: "state_backups_failed" });
   });
 
-  it("does not expose state backup creation on the daemon", async () => {
-    const loadStateBackups = vi.fn() as never;
+  it("rejects state backup create POST without the human mutation gate", async () => {
+    const createStateBackup = vi.fn(async () => ({
+      backup: { backupId: "b-new" },
+    })) as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ loadStateBackups }),
+      dependencies({ createStateBackup }),
     );
     const output = response();
 
-    await handler(request("POST", "/state/backups"), output.value);
+    await handler(
+      postJsonRequest("/state/backups", {}, ""),
+      output.value,
+    );
 
-    expect(output.status()).toBe(404);
-    expect(output.json()).toEqual({ error: "Not found" });
-    expect(loadStateBackups).not.toHaveBeenCalled();
+    expect(output.status()).toBe(403);
+    expect(createStateBackup).not.toHaveBeenCalled();
+  });
+
+  it("accepts state backup create POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("state-backup");
+    const backupPayload = {
+      backup: { backupId: "b-new", verified: false },
+    };
+    const createStateBackup = vi.fn(async () => backupPayload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ createStateBackup }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/state/backups",
+        authorizedHumanHeaders(nonce, cookie, "state-backup"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(201);
+    expect(output.json()).toEqual(backupPayload);
+    expect(createStateBackup).toHaveBeenCalledTimes(1);
   });
 
   it("serves state backup validate through the core validate boundary", async () => {

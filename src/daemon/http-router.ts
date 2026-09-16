@@ -92,6 +92,10 @@ import {
 } from "../core/retention-policy-mutation-service";
 import { stateBackupsService } from "../core/state-backups-service";
 import {
+  StateBackupUnavailableError,
+  stateBackupCreateMutationService,
+} from "../core/state-backup-create-mutation-service";
+import {
   BackupValidationError,
   stateBackupValidateService,
 } from "../core/state-backup-validate-service";
@@ -140,6 +144,7 @@ type DaemonHttpDependencies = {
   loadOutboundSlackSettings: typeof outboundSlackSettingsService.load;
   loadMaintenanceState: typeof maintenanceStateService.load;
   loadStateBackups: typeof stateBackupsService.load;
+  createStateBackup: typeof stateBackupCreateMutationService.create;
   loadStateBackupValidate: typeof stateBackupValidateService.load;
 };
 
@@ -189,6 +194,7 @@ export function createDaemonHttpHandler(
     loadOutboundSlackSettings: () => outboundSlackSettingsService.load(),
     loadMaintenanceState: () => maintenanceStateService.load(),
     loadStateBackups: () => stateBackupsService.load(),
+    createStateBackup: () => stateBackupCreateMutationService.create(),
     loadStateBackupValidate: (backupId) =>
       stateBackupValidateService.load(backupId),
   },
@@ -328,16 +334,48 @@ export function createDaemonHttpHandler(
       return;
     }
 
-    if (request.method === "GET" && url.pathname === "/state/backups") {
-      try {
-        writeJson(response, 200, dependencies.loadStateBackups());
-      } catch (error) {
-        console.error(
-          "daemon_state_backups_failed",
-          error instanceof Error ? error.message : "unknown",
-        );
-        writeJson(response, 500, { error: "state_backups_failed" });
+    if (url.pathname === "/state/backups") {
+      if (request.method === "GET") {
+        try {
+          writeJson(response, 200, dependencies.loadStateBackups());
+        } catch (error) {
+          console.error(
+            "daemon_state_backups_failed",
+            error instanceof Error ? error.message : "unknown",
+          );
+          writeJson(response, 500, { error: "state_backups_failed" });
+        }
+        return;
       }
+
+      if (request.method === "POST") {
+        const webRequest = await toWebRequestWithBody(request);
+        const rejection = dependencies.rejectHumanMutation(
+          webRequest,
+          "state-backup",
+          { label: "State backup" },
+        );
+        if (rejection) {
+          await writeWebResponse(response, rejection);
+          return;
+        }
+
+        try {
+          writeJson(response, 201, await dependencies.createStateBackup());
+        } catch (error) {
+          if (error instanceof StateBackupUnavailableError) {
+            writeJson(response, 409, { error: error.message });
+            return;
+          }
+          writeJson(response, 500, {
+            error:
+              error instanceof Error ? error.message : "State backup failed",
+          });
+        }
+        return;
+      }
+
+      writeJson(response, 404, { error: "Not found" });
       return;
     }
 
