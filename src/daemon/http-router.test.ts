@@ -552,18 +552,48 @@ describe("daemon HTTP router", () => {
     expect(output.json()).toEqual({ error: "Backup metadata not found" });
   });
 
-  it("does not expose backup validate mutation on the daemon", async () => {
-    const loadStateBackupValidate = vi.fn() as never;
+  it("rejects backup validate POST without the human mutation gate", async () => {
+    const loadStateBackupValidate = vi.fn(() => ({
+      backup: { backupId: "b-1", verified: true },
+    })) as never;
     const handler = createDaemonHttpHandler(
       dependencies({ loadStateBackupValidate }),
     );
     const output = response();
 
-    await handler(request("POST", "/state/backups/b-1/validate"), output.value);
+    await handler(
+      postJsonRequest("/state/backups/b-1/validate", {}, ""),
+      output.value,
+    );
 
-    expect(output.status()).toBe(404);
-    expect(output.json()).toEqual({ error: "Not found" });
+    expect(output.status()).toBe(403);
     expect(loadStateBackupValidate).not.toHaveBeenCalled();
+  });
+
+  it("accepts backup validate POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce(
+      "state-backup-validate",
+    );
+    const payload = { backup: { backupId: "b-1", verified: true } };
+    const loadStateBackupValidate = vi.fn(() => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadStateBackupValidate }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/state/backups/b-1/validate",
+        authorizedHumanHeaders(nonce, cookie, "state-backup-validate"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(loadStateBackupValidate).toHaveBeenCalledWith("b-1");
   });
 
   it("rejects a non-loopback Host header on state backups", async () => {

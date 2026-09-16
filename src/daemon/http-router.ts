@@ -304,33 +304,66 @@ export function createDaemonHttpHandler(
 
     const stateBackupValidateId = matchStateBackupValidatePath(url.pathname);
     if (stateBackupValidateId) {
-      if (request.method !== "GET") {
-        writeJson(response, 404, { error: "Not found" });
+      if (request.method === "GET") {
+        try {
+          writeJson(
+            response,
+            200,
+            dependencies.loadStateBackupValidate(stateBackupValidateId),
+          );
+        } catch (error) {
+          if (error instanceof BackupValidationError) {
+            writeJson(response, 400, { error: error.message });
+            return;
+          }
+          console.error(
+            "daemon_state_backup_validate_failed",
+            error instanceof Error ? error.message : "unknown",
+          );
+          writeJson(response, 500, {
+            error:
+              error instanceof Error
+                ? error.message
+                : "Backup validation failed",
+          });
+        }
         return;
       }
 
-      try {
-        writeJson(
-          response,
-          200,
-          dependencies.loadStateBackupValidate(stateBackupValidateId),
+      if (request.method === "POST") {
+        const webRequest = await toWebRequestWithBody(request);
+        const rejection = dependencies.rejectHumanMutation(
+          webRequest,
+          "state-backup-validate",
+          { label: "Backup validation" },
         );
-      } catch (error) {
-        if (error instanceof BackupValidationError) {
-          writeJson(response, 400, { error: error.message });
+        if (rejection) {
+          await writeWebResponse(response, rejection);
           return;
         }
-        console.error(
-          "daemon_state_backup_validate_failed",
-          error instanceof Error ? error.message : "unknown",
-        );
-        writeJson(response, 500, {
-          error:
-            error instanceof Error
-              ? error.message
-              : "Backup validation failed",
-        });
+
+        try {
+          writeJson(
+            response,
+            200,
+            dependencies.loadStateBackupValidate(stateBackupValidateId),
+          );
+        } catch (error) {
+          if (error instanceof BackupValidationError) {
+            writeJson(response, 400, { error: error.message });
+            return;
+          }
+          writeJson(response, 500, {
+            error:
+              error instanceof Error
+                ? error.message
+                : "Backup validation failed",
+          });
+        }
+        return;
       }
+
+      writeJson(response, 404, { error: "Not found" });
       return;
     }
 
