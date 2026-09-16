@@ -107,6 +107,9 @@ function dependencies(
     loadRepoList: vi.fn(async () => ({
       repos: [{ id: "repo-1", templates: [], settings: {} }],
     })) as never,
+    loadCredentialStatus: vi.fn(() => ({
+      credentials: [{ capability: "github", status: "ready" }],
+    })) as never,
     ...overrides,
   };
 }
@@ -244,6 +247,72 @@ describe("daemon HTTP router", () => {
       error: "This API is available only on localhost",
     });
     expect(loadRepoList).not.toHaveBeenCalled();
+  });
+
+  it("serves credential status through the core credential-status boundary", async () => {
+    const payload = {
+      credentials: [{ capability: "github", status: "ready" }],
+    };
+    const loadCredentialStatus = vi.fn(() => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadCredentialStatus }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/credentials/status"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadCredentialStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a stable error when credential status loading fails", async () => {
+    const loadCredentialStatus = vi.fn(() => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadCredentialStatus }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/credentials/status"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "credential_status_failed" });
+  });
+
+  it("does not expose credential status on unsupported methods", async () => {
+    const loadCredentialStatus = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadCredentialStatus }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/credentials/status"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadCredentialStatus).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on credential status", async () => {
+    const loadCredentialStatus = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadCredentialStatus }),
+    );
+    const output = response();
+    const incoming = request("GET", "/credentials/status");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadCredentialStatus).not.toHaveBeenCalled();
   });
 
   it("serves the task list through the core task boundary", async () => {

@@ -35,6 +35,7 @@ import {
   TaskSandboxPolicyNotFoundError,
   TaskSandboxPolicyUnavailableError,
 } from "../core/task-sandbox-policy-service";
+import { credentialStatusService } from "../core/credential-status-service";
 import { profileListService } from "../core/profile-list-service";
 import { repoListService } from "../core/repo-list-service";
 import { taskService } from "../core/task-service";
@@ -56,6 +57,7 @@ type DaemonHttpDependencies = {
   loadTaskRuntimePolicy: typeof taskRuntimePolicyService.load;
   loadProfileList: typeof profileListService.load;
   loadRepoList: typeof repoListService.load;
+  loadCredentialStatus: typeof credentialStatusService.load;
 };
 
 export function createDaemonHttpHandler(
@@ -72,6 +74,7 @@ export function createDaemonHttpHandler(
     loadTaskRuntimePolicy: (id) => taskRuntimePolicyService.load(id),
     loadProfileList: () => profileListService.load(),
     loadRepoList: () => repoListService.load(),
+    loadCredentialStatus: () => credentialStatusService.load(),
   },
 ) {
   return async function handleDaemonHttp(
@@ -128,6 +131,19 @@ export function createDaemonHttpHandler(
           error instanceof Error ? error.message : "unknown",
         );
         writeJson(response, 500, { error: "repo_list_failed" });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/credentials/status") {
+      try {
+        writeJson(response, 200, dependencies.loadCredentialStatus());
+      } catch (error) {
+        console.error(
+          "daemon_credential_status_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "credential_status_failed" });
       }
       return;
     }
