@@ -231,6 +231,9 @@ function dependencies(
       status: "completed",
       output: "done",
     })) as never,
+    applyAgentParallelRunMutation: vi.fn(async () => ({
+      results: [{ status: "completed" }],
+    })) as never,
     ...overrides,
   };
 }
@@ -359,10 +362,12 @@ describe("daemon HTTP router", () => {
     );
   });
 
-  it("does not expose parallel agent execution on the daemon", async () => {
-    const applyAgentRunMutation = vi.fn() as never;
+  it("rejects parallel agent run POST without the human mutation gate", async () => {
+    const applyAgentParallelRunMutation = vi.fn(async () => ({
+      results: [],
+    })) as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ applyAgentRunMutation }),
+      dependencies({ applyAgentParallelRunMutation }),
     );
     const output = response();
 
@@ -371,9 +376,40 @@ describe("daemon HTTP router", () => {
       output.value,
     );
 
-    expect(output.status()).toBe(404);
-    expect(output.json()).toEqual({ error: "Not found" });
-    expect(applyAgentRunMutation).not.toHaveBeenCalled();
+    expect(output.status()).toBe(403);
+    expect(applyAgentParallelRunMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts parallel agent run POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("agent-run");
+    const payload = {
+      results: [
+        { status: "completed", output: "a" },
+        { status: "completed", output: "b" },
+      ],
+    };
+    const applyAgentParallelRunMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyAgentParallelRunMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/agents/parallel",
+        authorizedHumanHeaders(nonce, cookie, "agent-run"),
+        '{"prompt":"hello"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyAgentParallelRunMutation).toHaveBeenCalledWith(
+      { prompt: "hello" },
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
   });
 
   it("serves human session through the core human-session boundary", async () => {

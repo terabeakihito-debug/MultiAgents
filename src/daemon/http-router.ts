@@ -114,6 +114,7 @@ import {
   AgentRunUnknownAgentError,
   agentRunMutationService,
 } from "../core/agent-run-mutation-service";
+import { agentParallelRunMutationService } from "../core/agent-parallel-run-mutation-service";
 import { taskService } from "../core/task-service";
 import {
   healthReadiness,
@@ -151,6 +152,7 @@ type DaemonHttpDependencies = {
   loadRepoTemplates: typeof repoTemplatesService.load;
   applyRepoTemplatesMutation: typeof repoTemplatesMutationService.apply;
   applyAgentRunMutation: typeof agentRunMutationService.apply;
+  applyAgentParallelRunMutation: typeof agentParallelRunMutationService.apply;
   loadRepoPulls: typeof repoPullsService.load;
   issueHumanSession: typeof humanSessionService.issue;
   rejectHumanMutation: typeof humanMutationGateService.reject;
@@ -207,6 +209,8 @@ export function createDaemonHttpHandler(
       repoTemplatesMutationService.apply(repoId, body),
     applyAgentRunMutation: (agentId, body, options) =>
       agentRunMutationService.apply(agentId, body, options),
+    applyAgentParallelRunMutation: (body, options) =>
+      agentParallelRunMutationService.apply(body, options),
     loadRepoPulls: (repoId) => repoPullsService.load(repoId),
     issueHumanSession: (webRequest) => humanSessionService.issue(webRequest),
     rejectHumanMutation: (webRequest, action, options) =>
@@ -262,7 +266,52 @@ export function createDaemonHttpHandler(
     }
 
     if (url.pathname === "/agents/parallel") {
-      writeJson(response, 404, { error: "Not found" });
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "agent-run",
+        { label: "Parallel agent execution" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      let body: unknown;
+      try {
+        body = await webRequest.json();
+      } catch {
+        writeJson(response, 400, {
+          error: "Request body must be valid JSON",
+        });
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          await dependencies.applyAgentParallelRunMutation(body, {
+            signal: webRequest.signal,
+          }),
+        );
+      } catch (error) {
+        if (error instanceof AgentRunInputError) {
+          writeJson(response, 400, { error: error.message });
+          return;
+        }
+        writeJson(response, 500, {
+          error:
+            error instanceof Error
+              ? error.message
+              : "Parallel agent execution failed",
+        });
+      }
       return;
     }
 
