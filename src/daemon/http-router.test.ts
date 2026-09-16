@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { describe, expect, it, vi } from "vitest";
+import { TaskCiNotFoundError } from "../core/task-ci-service";
 import { TaskDetailNotFoundError } from "../core/task-detail-service";
 import { TaskFindingsLoadError } from "../core/task-findings-service";
 import { TaskHistoryNotFoundError } from "../core/task-history-service";
@@ -65,6 +66,11 @@ function dependencies(
     })) as never,
     loadTaskFindings: vi.fn(async () => ({
       findings: [],
+    })) as never,
+    loadTaskCi: vi.fn(async () => ({
+      task: { id: "task-1" },
+      checks: [],
+      message: undefined,
     })) as never,
     ...overrides,
   };
@@ -297,17 +303,19 @@ describe("daemon HTTP router", () => {
     const loadTaskHistory = vi.fn() as never;
     const loadTaskProfile = vi.fn() as never;
     const loadTaskFindings = vi.fn() as never;
+    const loadTaskCi = vi.fn() as never;
     const handler = createDaemonHttpHandler(
       dependencies({
         loadTaskDetail,
         loadTaskHistory,
         loadTaskProfile,
         loadTaskFindings,
+        loadTaskCi,
       }),
     );
     const output = response();
 
-    await handler(request("GET", "/tasks/task-1/ci"), output.value);
+    await handler(request("GET", "/tasks/task-1/sandbox-policy"), output.value);
 
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Not found" });
@@ -315,6 +323,7 @@ describe("daemon HTTP router", () => {
     expect(loadTaskHistory).not.toHaveBeenCalled();
     expect(loadTaskProfile).not.toHaveBeenCalled();
     expect(loadTaskFindings).not.toHaveBeenCalled();
+    expect(loadTaskCi).not.toHaveBeenCalled();
   });
 
   it("serves task history through the core task-history boundary", async () => {
@@ -567,12 +576,14 @@ describe("daemon HTTP router", () => {
     const loadTaskDetail = vi.fn() as never;
     const loadTaskHistory = vi.fn() as never;
     const loadTaskProfile = vi.fn() as never;
+    const loadTaskCi = vi.fn() as never;
     const handler = createDaemonHttpHandler(
       dependencies({
         loadTaskFindings,
         loadTaskDetail,
         loadTaskHistory,
         loadTaskProfile,
+        loadTaskCi,
       }),
     );
     const output = response();
@@ -588,6 +599,7 @@ describe("daemon HTTP router", () => {
     expect(loadTaskDetail).not.toHaveBeenCalled();
     expect(loadTaskHistory).not.toHaveBeenCalled();
     expect(loadTaskProfile).not.toHaveBeenCalled();
+    expect(loadTaskCi).not.toHaveBeenCalled();
   });
 
   it("returns 404 when task findings cannot be loaded", async () => {
@@ -685,5 +697,124 @@ describe("daemon HTTP router", () => {
       error: "Cross-origin requests are not allowed",
     });
     expect(loadTaskFindings).not.toHaveBeenCalled();
+  });
+
+  it("serves task CI through the core task-ci boundary", async () => {
+    const payload = {
+      task: { id: "task-1" },
+      checks: [{ name: "ci", state: "SUCCESS" }],
+      message: "All checks passed",
+    };
+    const loadTaskCi = vi.fn(async () => payload) as never;
+    const loadTaskDetail = vi.fn() as never;
+    const loadTaskHistory = vi.fn() as never;
+    const loadTaskProfile = vi.fn() as never;
+    const loadTaskFindings = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({
+        loadTaskCi,
+        loadTaskDetail,
+        loadTaskHistory,
+        loadTaskProfile,
+        loadTaskFindings,
+      }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/task-1/ci"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadTaskCi).toHaveBeenCalledTimes(1);
+    expect(loadTaskCi).toHaveBeenCalledWith("task-1");
+    expect(loadTaskDetail).not.toHaveBeenCalled();
+    expect(loadTaskHistory).not.toHaveBeenCalled();
+    expect(loadTaskProfile).not.toHaveBeenCalled();
+    expect(loadTaskFindings).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 when the requested CI task does not exist", async () => {
+    const loadTaskCi = vi.fn(async () => {
+      throw new TaskCiNotFoundError();
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskCi }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/missing/ci"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Task not found" });
+  });
+
+  it("returns a stable error when task CI loading fails", async () => {
+    const loadTaskCi = vi.fn(async () => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskCi }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/task-1/ci"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "task_ci_failed" });
+  });
+
+  it("does not expose task CI mutations", async () => {
+    const loadTaskCi = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskCi }),
+    );
+
+    for (const method of ["POST", "DELETE"] as const) {
+      const output = response();
+      await handler(request(method, "/tasks/task-1/ci"), output.value);
+      expect(output.status()).toBe(404);
+      expect(output.json()).toEqual({ error: "Not found" });
+    }
+
+    expect(loadTaskCi).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on task CI", async () => {
+    const loadTaskCi = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskCi }),
+    );
+    const output = response();
+    const incoming = request("GET", "/tasks/task-1/ci");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadTaskCi).not.toHaveBeenCalled();
+  });
+
+  it("rejects a mismatched loopback Origin on task CI", async () => {
+    const loadTaskCi = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskCi }),
+    );
+    const output = response();
+    const incoming = request("GET", "/tasks/task-1/ci");
+    incoming.headers.host = "127.0.0.1:3000";
+    incoming.headers.origin = "http://127.0.0.1:4000";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "Cross-origin requests are not allowed",
+    });
+    expect(loadTaskCi).not.toHaveBeenCalled();
   });
 });
