@@ -70,6 +70,7 @@ import {
 import { humanSessionService } from "../core/human-session-service";
 import { maintenanceStateService } from "../core/maintenance-state-service";
 import { retentionPolicyService } from "../core/retention-policy-service";
+import { stateBackupsService } from "../core/state-backups-service";
 import { taskService } from "../core/task-service";
 import {
   healthReadiness,
@@ -104,6 +105,7 @@ type DaemonHttpDependencies = {
   issueHumanSession: typeof humanSessionService.issue;
   loadOutboundSlackSettings: typeof outboundSlackSettingsService.load;
   loadMaintenanceState: typeof maintenanceStateService.load;
+  loadStateBackups: typeof stateBackupsService.load;
 };
 
 export function createDaemonHttpHandler(
@@ -135,6 +137,7 @@ export function createDaemonHttpHandler(
     issueHumanSession: (webRequest) => humanSessionService.issue(webRequest),
     loadOutboundSlackSettings: () => outboundSlackSettingsService.load(),
     loadMaintenanceState: () => maintenanceStateService.load(),
+    loadStateBackups: () => stateBackupsService.load(),
   },
 ) {
   return async function handleDaemonHttp(
@@ -191,6 +194,19 @@ export function createDaemonHttpHandler(
           error instanceof Error ? error.message : "unknown",
         );
         writeJson(response, 500, { error: "maintenance_state_failed" });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/state/backups") {
+      try {
+        writeJson(response, 200, dependencies.loadStateBackups());
+      } catch (error) {
+        console.error(
+          "daemon_state_backups_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "state_backups_failed" });
       }
       return;
     }

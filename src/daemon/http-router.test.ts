@@ -176,6 +176,10 @@ function dependencies(
     loadMaintenanceState: vi.fn(() => ({
       state: "RUNNING",
     })) as never,
+    loadStateBackups: vi.fn(() => ({
+      backups: [{ backupId: "b-1" }],
+      latest: { backupId: "b-1" },
+    })) as never,
     ...overrides,
   };
 }
@@ -298,6 +302,87 @@ describe("daemon HTTP router", () => {
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Not found" });
     expect(loadMaintenanceState).not.toHaveBeenCalled();
+  });
+
+  it("serves state backups through the core state-backups boundary", async () => {
+    const payload = {
+      backups: [{ backupId: "b-1" }],
+      latest: { backupId: "b-1", verified: true },
+    };
+    const loadStateBackups = vi.fn(() => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadStateBackups }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/state/backups"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadStateBackups).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a stable error when state backup listing fails", async () => {
+    const loadStateBackups = vi.fn(() => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadStateBackups }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/state/backups"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "state_backups_failed" });
+  });
+
+  it("does not expose state backup creation on the daemon", async () => {
+    const loadStateBackups = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadStateBackups }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/state/backups"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadStateBackups).not.toHaveBeenCalled();
+  });
+
+  it("does not treat backup validate as the backups list", async () => {
+    const loadStateBackups = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadStateBackups }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/state/backups/b-1/validate"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadStateBackups).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on state backups", async () => {
+    const loadStateBackups = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadStateBackups }),
+    );
+    const output = response();
+    const incoming = request("GET", "/state/backups");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadStateBackups).not.toHaveBeenCalled();
   });
 
   it("serves outbound Slack settings through the core outbound-slack-settings boundary", async () => {
