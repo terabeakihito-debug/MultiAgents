@@ -49,6 +49,10 @@ import {
 } from "../core/findings-queue-service";
 import { operationsOverviewService } from "../core/operations-overview-service";
 import { outboundSlackSettingsService } from "../core/outbound-slack-settings-service";
+import {
+  OutboundInputError,
+  outboundSlackSettingsMutationService,
+} from "../core/outbound-slack-settings-mutation-service";
 import { runtimeSandboxStatusService } from "../core/runtime-sandbox-status-service";
 import {
   notificationListService,
@@ -147,6 +151,7 @@ type DaemonHttpDependencies = {
   parseTaskDeleteBody: typeof taskDeleteMutationService.parseDeleteBody;
   removeTask: typeof taskDeleteMutationService.removeTask;
   loadOutboundSlackSettings: typeof outboundSlackSettingsService.load;
+  applyOutboundSlackSettingsMutation: typeof outboundSlackSettingsMutationService.apply;
   loadMaintenanceState: typeof maintenanceStateService.load;
   loadStateBackups: typeof stateBackupsService.load;
   createStateBackup: typeof stateBackupCreateMutationService.create;
@@ -199,6 +204,8 @@ export function createDaemonHttpHandler(
     removeTask: (id, cleanupRequest) =>
       taskDeleteMutationService.removeTask(id, cleanupRequest),
     loadOutboundSlackSettings: () => outboundSlackSettingsService.load(),
+    applyOutboundSlackSettingsMutation: (body) =>
+      outboundSlackSettingsMutationService.apply(body),
     loadMaintenanceState: () => maintenanceStateService.load(),
     loadStateBackups: () => stateBackupsService.load(),
     createStateBackup: () => stateBackupCreateMutationService.create(),
@@ -419,16 +426,60 @@ export function createDaemonHttpHandler(
       return;
     }
 
-    if (request.method === "GET" && url.pathname === "/outbound/slack/settings") {
-      try {
-        writeJson(response, 200, dependencies.loadOutboundSlackSettings());
-      } catch (error) {
-        console.error(
-          "daemon_outbound_slack_settings_failed",
-          error instanceof Error ? error.message : "unknown",
-        );
-        writeJson(response, 500, { error: "outbound_slack_settings_failed" });
+    if (url.pathname === "/outbound/slack/settings") {
+      if (request.method === "GET") {
+        try {
+          writeJson(response, 200, dependencies.loadOutboundSlackSettings());
+        } catch (error) {
+          console.error(
+            "daemon_outbound_slack_settings_failed",
+            error instanceof Error ? error.message : "unknown",
+          );
+          writeJson(response, 500, { error: "outbound_slack_settings_failed" });
+        }
+        return;
       }
+
+      if (request.method === "POST") {
+        const webRequest = await toWebRequestWithBody(request);
+        const rejection = dependencies.rejectHumanMutation(
+          webRequest,
+          "outbound-preferences",
+          { label: "External notification" },
+        );
+        if (rejection) {
+          await writeWebResponse(response, rejection);
+          return;
+        }
+
+        let body: unknown;
+        try {
+          body = await webRequest.json();
+        } catch {
+          writeJson(response, 400, {
+            error: "Request body must be valid JSON",
+          });
+          return;
+        }
+
+        try {
+          writeJson(
+            response,
+            200,
+            dependencies.applyOutboundSlackSettingsMutation(body),
+          );
+        } catch (error) {
+          writeJson(response, error instanceof OutboundInputError ? 400 : 500, {
+            error:
+              error instanceof Error
+                ? error.message
+                : "Outbound preferences update failed",
+          });
+        }
+        return;
+      }
+
+      writeJson(response, 404, { error: "Not found" });
       return;
     }
 

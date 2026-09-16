@@ -216,6 +216,10 @@ function dependencies(
     applyNotificationPreferencesMutation: vi.fn(() => ({
       preferences: { taskInactive: true },
     })) as never,
+    applyOutboundSlackSettingsMutation: vi.fn(() => ({
+      configured: true,
+      config: { enabled: true },
+    })) as never,
     ...overrides,
   };
 }
@@ -652,18 +656,58 @@ describe("daemon HTTP router", () => {
     expect(output.json()).toEqual({ error: "outbound_slack_settings_failed" });
   });
 
-  it("does not expose outbound Slack settings mutations on the daemon", async () => {
-    const loadOutboundSlackSettings = vi.fn() as never;
+  it("rejects outbound Slack settings POST without the human mutation gate", async () => {
+    const applyOutboundSlackSettingsMutation = vi.fn(() => ({
+      configured: true,
+      config: { enabled: true },
+    })) as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ loadOutboundSlackSettings }),
+      dependencies({ applyOutboundSlackSettingsMutation }),
     );
     const output = response();
 
-    await handler(request("POST", "/outbound/slack/settings"), output.value);
+    await handler(
+      postJsonRequest(
+        "/outbound/slack/settings",
+        {},
+        '{"enabled":true}',
+      ),
+      output.value,
+    );
 
-    expect(output.status()).toBe(404);
-    expect(output.json()).toEqual({ error: "Not found" });
-    expect(loadOutboundSlackSettings).not.toHaveBeenCalled();
+    expect(output.status()).toBe(403);
+    expect(applyOutboundSlackSettingsMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts outbound Slack settings POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce(
+      "outbound-preferences",
+    );
+    const payload = {
+      configured: true,
+      config: { enabled: true, webhookUrl: "https://hooks.example" },
+    };
+    const applyOutboundSlackSettingsMutation = vi.fn(() => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyOutboundSlackSettingsMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/outbound/slack/settings",
+        authorizedHumanHeaders(nonce, cookie, "outbound-preferences"),
+        '{"enabled":true}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyOutboundSlackSettingsMutation).toHaveBeenCalledWith({
+      enabled: true,
+    });
   });
 
   it("does not treat outbound Slack test as settings read", async () => {
