@@ -1,6 +1,16 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { describe, expect, it, vi } from "vitest";
 import { TaskCiNotFoundError } from "../core/task-ci-service";
+import { DashboardQueryError } from "../core/dashboard-tasks-service";
+import { RepoProfileNotFoundError } from "../core/repo-profile-service";
+import { RepoPullsRequestError } from "../core/repo-pulls-service";
+import { RepoTemplatesNotFoundError } from "../core/repo-templates-service";
+import { RemediationQueueQueryError } from "../core/findings-queue-service";
+import { NotificationInputError } from "../core/notification-list-service";
+import {
+  TaskPrConflictError,
+  TaskPrNotFoundError,
+} from "../core/task-pr-service";
 import { TaskDetailNotFoundError } from "../core/task-detail-service";
 import { TaskFindingsLoadError } from "../core/task-findings-service";
 import { TaskHistoryNotFoundError } from "../core/task-history-service";
@@ -80,6 +90,11 @@ function dependencies(
       checks: [],
       message: undefined,
     })) as never,
+    loadTaskPr: vi.fn(async () => ({
+      task: { id: "task-1" },
+      pullRequest: { title: "Fix" },
+      intake: undefined,
+    })) as never,
     loadTaskSandboxPolicy: vi.fn(async () => ({
       status: "enforced",
       validation: { profile: "validation" },
@@ -90,11 +105,1500 @@ function dependencies(
       taskType: "bug_fix",
       policies: [],
     })) as never,
+    loadProfileList: vi.fn(() => ({
+      presets: [{ id: "safe_default" }],
+      profiles: [],
+      versions: [],
+    })) as never,
+    loadRepoList: vi.fn(async () => ({
+      repos: [{ id: "repo-1", templates: [], settings: {} }],
+    })) as never,
+    loadCredentialStatus: vi.fn(() => ({
+      credentials: [{ capability: "github", status: "ready" }],
+    })) as never,
+    loadNotifications: vi.fn(() => ({
+      notifications: [{ id: "n-1" }],
+      unreadCount: 1,
+    })) as never,
+    loadFindingsQueue: vi.fn(() => ({
+      findings: [{ findingId: "f-1" }],
+      counts: { total: 1 },
+      limit: 100,
+      offset: 0,
+    })) as never,
+    loadOperationsOverview: vi.fn(async () => ({
+      overall: "ok",
+      database: { status: "ok" },
+    })) as never,
+    loadDashboardTasks: vi.fn(async () => ({
+      tasks: [{ id: "task-1" }],
+      counts: {},
+    })) as never,
+    loadRuntimeSandboxStatus: vi.fn(async () => ({
+      statusCode: 200,
+      body: { status: "enforced", backend: "bubblewrap" },
+    })) as never,
+    loadNotificationPreferences: vi.fn(() => ({
+      preferences: { taskInactive: true },
+    })) as never,
+    loadRetentionPolicy: vi.fn(() => ({
+      preset: "conservative",
+    })) as never,
+    loadCleanupCandidates: vi.fn(async () => ({
+      candidates: [],
+      potentialSavingsBytes: 0,
+      blocked: 0,
+      preset: "conservative",
+    })) as never,
+    loadRepoProfile: vi.fn(async () => ({
+      profile: { repoId: "repo-1", profileId: "safe_default" },
+    })) as never,
+    loadRepoTemplates: vi.fn(async () => ({
+      templates: [{ templateId: "bug_fix" }],
+      settings: { defaultTemplateId: "bug_fix" },
+    })) as never,
+    loadRepoPulls: vi.fn(async () => ({
+      pulls: [{ number: 1, title: "Fix" }],
+    })) as never,
+    issueHumanSession: vi.fn(() => Response.json(
+      { nonce: "nonce-1", expiresAt: "2026-01-01T00:02:00.000Z" },
+      {
+        headers: {
+          "Cache-Control": "no-store",
+          "Set-Cookie": "multiagents_human_session=abc; HttpOnly",
+        },
+      },
+    )) as never,
+    loadOutboundSlackSettings: vi.fn(() => ({
+      configured: true,
+      config: { enabled: true },
+    })) as never,
+    loadMaintenanceState: vi.fn(() => ({
+      state: "RUNNING",
+    })) as never,
+    loadStateBackups: vi.fn(() => ({
+      backups: [{ backupId: "b-1" }],
+      latest: { backupId: "b-1" },
+    })) as never,
+    loadStateBackupValidate: vi.fn((backupId: string) => ({
+      backup: { backupId, verified: true },
+    })) as never,
     ...overrides,
   };
 }
 
 describe("daemon HTTP router", () => {
+  it("serves human session through the core human-session boundary", async () => {
+    const webResponse = Response.json(
+      { nonce: "nonce-1", expiresAt: "2026-01-01T00:02:00.000Z" },
+      {
+        headers: {
+          "Cache-Control": "no-store",
+          "Set-Cookie": "multiagents_human_session=abc; HttpOnly",
+        },
+      },
+    );
+    const issueHumanSession = vi.fn(() => webResponse) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ issueHumanSession }),
+    );
+    const output = response();
+    const incoming = request("GET", "/human-session");
+    incoming.headers.referer = "http://127.0.0.1:3000/";
+    incoming.headers["sec-fetch-site"] = "same-origin";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.header("set-cookie")).toContain("multiagents_human_session=abc");
+    expect(output.json()).toEqual({
+      nonce: "nonce-1",
+      expiresAt: "2026-01-01T00:02:00.000Z",
+    });
+    expect(issueHumanSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("forwards human session gate failures from the shared issuer", async () => {
+    const issueHumanSession = vi.fn(() => Response.json(
+      { error: "A same-origin UI session is required" },
+      { status: 403 },
+    )) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ issueHumanSession }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/human-session"), output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "A same-origin UI session is required",
+    });
+  });
+
+  it("does not expose human session on unsupported methods", async () => {
+    const issueHumanSession = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ issueHumanSession }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/human-session"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(issueHumanSession).not.toHaveBeenCalled();
+  });
+
+  it("does not expose agent execution routes as daemon reads", async () => {
+    const handler = createDaemonHttpHandler(dependencies());
+    const output = response();
+
+    await handler(request("GET", "/agents/codex"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+  });
+
+  it("serves maintenance state through the core maintenance-state boundary", async () => {
+    const payload = { state: "MAINTENANCE" };
+    const loadMaintenanceState = vi.fn(() => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadMaintenanceState }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/maintenance"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadMaintenanceState).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a stable error when maintenance state loading fails", async () => {
+    const loadMaintenanceState = vi.fn(() => {
+      throw new Error("registry failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadMaintenanceState }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/maintenance"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "maintenance_state_failed" });
+  });
+
+  it("does not expose maintenance mutations on the daemon", async () => {
+    const loadMaintenanceState = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadMaintenanceState }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/maintenance"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadMaintenanceState).not.toHaveBeenCalled();
+  });
+
+  it("serves state backups through the core state-backups boundary", async () => {
+    const payload = {
+      backups: [{ backupId: "b-1" }],
+      latest: { backupId: "b-1", verified: true },
+    };
+    const loadStateBackups = vi.fn(() => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadStateBackups }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/state/backups"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadStateBackups).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a stable error when state backup listing fails", async () => {
+    const loadStateBackups = vi.fn(() => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadStateBackups }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/state/backups"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "state_backups_failed" });
+  });
+
+  it("does not expose state backup creation on the daemon", async () => {
+    const loadStateBackups = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadStateBackups }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/state/backups"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadStateBackups).not.toHaveBeenCalled();
+  });
+
+  it("serves state backup validate through the core validate boundary", async () => {
+    const payload = {
+      backup: { backupId: "b-1", verified: true },
+    };
+    const loadStateBackupValidate = vi.fn(() => payload) as never;
+    const loadStateBackups = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadStateBackupValidate, loadStateBackups }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/state/backups/b-1/validate"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(loadStateBackupValidate).toHaveBeenCalledWith("b-1");
+    expect(loadStateBackups).not.toHaveBeenCalled();
+  });
+
+  it("maps backup validation client errors to 400", async () => {
+    const { BackupValidationError } = await import("../server/state-backup");
+    const loadStateBackupValidate = vi.fn(() => {
+      throw new BackupValidationError("Backup metadata not found");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadStateBackupValidate }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/state/backups/b-1/validate"), output.value);
+
+    expect(output.status()).toBe(400);
+    expect(output.json()).toEqual({ error: "Backup metadata not found" });
+  });
+
+  it("does not expose backup validate mutation on the daemon", async () => {
+    const loadStateBackupValidate = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadStateBackupValidate }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/state/backups/b-1/validate"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadStateBackupValidate).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on state backups", async () => {
+    const loadStateBackups = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadStateBackups }),
+    );
+    const output = response();
+    const incoming = request("GET", "/state/backups");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadStateBackups).not.toHaveBeenCalled();
+  });
+
+  it("serves outbound Slack settings through the core outbound-slack-settings boundary", async () => {
+    const payload = {
+      configured: true,
+      config: { enabled: true, taskFailed: true },
+    };
+    const loadOutboundSlackSettings = vi.fn(() => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadOutboundSlackSettings }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/outbound/slack/settings"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadOutboundSlackSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a stable error when outbound Slack settings loading fails", async () => {
+    const loadOutboundSlackSettings = vi.fn(() => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadOutboundSlackSettings }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/outbound/slack/settings"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "outbound_slack_settings_failed" });
+  });
+
+  it("does not expose outbound Slack settings mutations on the daemon", async () => {
+    const loadOutboundSlackSettings = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadOutboundSlackSettings }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/outbound/slack/settings"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadOutboundSlackSettings).not.toHaveBeenCalled();
+  });
+
+  it("does not treat outbound Slack test as settings read", async () => {
+    const loadOutboundSlackSettings = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadOutboundSlackSettings }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/outbound/slack/test"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadOutboundSlackSettings).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on outbound Slack settings", async () => {
+    const loadOutboundSlackSettings = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadOutboundSlackSettings }),
+    );
+    const output = response();
+    const incoming = request("GET", "/outbound/slack/settings");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadOutboundSlackSettings).not.toHaveBeenCalled();
+  });
+
+  it("serves the profile catalog through the core profile-list boundary", async () => {
+    const catalog = {
+      presets: [{ id: "safe_default" }],
+      profiles: [{ id: "profile-1" }],
+      versions: [{ id: "v1" }],
+    };
+    const loadProfileList = vi.fn(() => catalog) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadProfileList }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/profiles"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(catalog);
+    expect(loadProfileList).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a stable error when profile listing fails", async () => {
+    const loadProfileList = vi.fn(() => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadProfileList }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/profiles"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "profile_list_failed" });
+  });
+
+  it("does not expose profile listing on unsupported methods", async () => {
+    const loadProfileList = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadProfileList }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/profiles"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadProfileList).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on profile listing", async () => {
+    const loadProfileList = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadProfileList }),
+    );
+    const output = response();
+    const incoming = request("GET", "/profiles");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadProfileList).not.toHaveBeenCalled();
+  });
+
+  it("serves the repository catalog through the core repo-list boundary", async () => {
+    const payload = {
+      repos: [{ id: "repo-1", name: "Repo One", templates: [], settings: {} }],
+    };
+    const loadRepoList = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoList }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/repos"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadRepoList).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a stable error when repository listing fails", async () => {
+    const loadRepoList = vi.fn(async () => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoList }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/repos"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "repo_list_failed" });
+  });
+
+  it("does not expose repository listing on unsupported methods", async () => {
+    const loadRepoList = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoList }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/repos"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadRepoList).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on repository listing", async () => {
+    const loadRepoList = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoList }),
+    );
+    const output = response();
+    const incoming = request("GET", "/repos");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadRepoList).not.toHaveBeenCalled();
+  });
+
+  it("serves repository profile through the core repo-profile boundary", async () => {
+    const payload = { profile: { repoId: "repo-1", profileId: "safe_default" } };
+    const loadRepoProfile = vi.fn(async () => payload) as never;
+    const loadRepoList = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoProfile, loadRepoList }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/repos/repo-1/profile"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadRepoProfile).toHaveBeenCalledWith("repo-1");
+    expect(loadRepoList).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 when the repository profile lookup fails", async () => {
+    const loadRepoProfile = vi.fn(async () => {
+      throw new RepoProfileNotFoundError("Repository not found");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoProfile }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/repos/missing/profile"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Repository not found" });
+  });
+
+  it("returns a stable error when repository profile loading fails unexpectedly", async () => {
+    const loadRepoProfile = vi.fn(async () => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoProfile }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/repos/repo-1/profile"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "repo_profile_failed" });
+  });
+
+  it("does not expose repository profile mutations on the daemon", async () => {
+    const loadRepoProfile = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoProfile }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/repos/repo-1/profile"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadRepoProfile).not.toHaveBeenCalled();
+  });
+
+  it("does not treat repository templates as repository profile", async () => {
+    const loadRepoProfile = vi.fn() as never;
+    const loadRepoTemplates = vi.fn(async () => ({
+      templates: [],
+      settings: { defaultTemplateId: "bug_fix" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoProfile, loadRepoTemplates }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/repos/repo-1/templates"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(loadRepoProfile).not.toHaveBeenCalled();
+    expect(loadRepoTemplates).toHaveBeenCalledWith("repo-1");
+  });
+
+  it("serves repository templates through the core repo-templates boundary", async () => {
+    const payload = {
+      templates: [{ templateId: "bug_fix" }],
+      settings: { defaultTemplateId: "bug_fix" },
+    };
+    const loadRepoTemplates = vi.fn(async () => payload) as never;
+    const loadRepoProfile = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoTemplates, loadRepoProfile }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/repos/repo-1/templates"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadRepoTemplates).toHaveBeenCalledWith("repo-1");
+    expect(loadRepoProfile).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 when the repository templates lookup fails", async () => {
+    const loadRepoTemplates = vi.fn(async () => {
+      throw new RepoTemplatesNotFoundError("Repository not found");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoTemplates }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/repos/missing/templates"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Repository not found" });
+  });
+
+  it("returns a stable error when repository templates loading fails unexpectedly", async () => {
+    const loadRepoTemplates = vi.fn(async () => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoTemplates }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/repos/repo-1/templates"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "repo_templates_failed" });
+  });
+
+  it("does not expose repository template mutations on the daemon", async () => {
+    const loadRepoTemplates = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoTemplates }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/repos/repo-1/templates"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadRepoTemplates).not.toHaveBeenCalled();
+  });
+
+  it("does not treat repository pulls as repository templates", async () => {
+    const loadRepoTemplates = vi.fn() as never;
+    const loadRepoPulls = vi.fn(async () => ({ pulls: [] })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoTemplates, loadRepoPulls }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/repos/repo-1/pulls"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(loadRepoTemplates).not.toHaveBeenCalled();
+    expect(loadRepoPulls).toHaveBeenCalledWith("repo-1");
+  });
+
+  it("serves repository pulls through the core repo-pulls boundary", async () => {
+    const payload = { pulls: [{ number: 42, title: "Fix bug" }] };
+    const loadRepoPulls = vi.fn(async () => payload) as never;
+    const loadRepoProfile = vi.fn() as never;
+    const loadRepoTemplates = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoPulls, loadRepoProfile, loadRepoTemplates }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/repos/repo-1/pulls"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadRepoPulls).toHaveBeenCalledWith("repo-1");
+    expect(loadRepoProfile).not.toHaveBeenCalled();
+    expect(loadRepoTemplates).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 when repository pull listing fails", async () => {
+    const loadRepoPulls = vi.fn(async () => {
+      throw new RepoPullsRequestError("Repository not found");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoPulls }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/repos/missing/pulls"), output.value);
+
+    expect(output.status()).toBe(400);
+    expect(output.json()).toEqual({ error: "Repository not found" });
+  });
+
+  it("returns a stable error when repository pulls loading fails unexpectedly", async () => {
+    const loadRepoPulls = vi.fn(async () => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoPulls }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/repos/repo-1/pulls"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "repo_pulls_failed" });
+  });
+
+  it("does not expose repository pulls on unsupported methods", async () => {
+    const loadRepoPulls = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoPulls }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/repos/repo-1/pulls"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadRepoPulls).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on repository pulls", async () => {
+    const loadRepoPulls = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoPulls }),
+    );
+    const output = response();
+    const incoming = request("GET", "/repos/repo-1/pulls");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadRepoPulls).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on repository templates", async () => {
+    const loadRepoTemplates = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoTemplates }),
+    );
+    const output = response();
+    const incoming = request("GET", "/repos/repo-1/templates");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadRepoTemplates).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on repository profile", async () => {
+    const loadRepoProfile = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoProfile }),
+    );
+    const output = response();
+    const incoming = request("GET", "/repos/repo-1/profile");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadRepoProfile).not.toHaveBeenCalled();
+  });
+
+  it("serves credential status through the core credential-status boundary", async () => {
+    const payload = {
+      credentials: [{ capability: "github", status: "ready" }],
+    };
+    const loadCredentialStatus = vi.fn(() => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadCredentialStatus }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/credentials/status"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadCredentialStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a stable error when credential status loading fails", async () => {
+    const loadCredentialStatus = vi.fn(() => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadCredentialStatus }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/credentials/status"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "credential_status_failed" });
+  });
+
+  it("does not expose credential status on unsupported methods", async () => {
+    const loadCredentialStatus = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadCredentialStatus }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/credentials/status"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadCredentialStatus).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on credential status", async () => {
+    const loadCredentialStatus = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadCredentialStatus }),
+    );
+    const output = response();
+    const incoming = request("GET", "/credentials/status");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadCredentialStatus).not.toHaveBeenCalled();
+  });
+
+  it("serves cleanup candidates through the core cleanup-candidates boundary", async () => {
+    const payload = {
+      candidates: [{ id: "worktree-1" }],
+      potentialSavingsBytes: 4096,
+      blocked: 1,
+      preset: "balanced",
+    };
+    const loadCleanupCandidates = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadCleanupCandidates }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/cleanup/candidates"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadCleanupCandidates).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a stable error when cleanup candidate loading fails", async () => {
+    const loadCleanupCandidates = vi.fn(async () => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadCleanupCandidates }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/cleanup/candidates"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "cleanup_candidates_failed" });
+  });
+
+  it("does not expose cleanup preview or execute on the candidates path", async () => {
+    const loadCleanupCandidates = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadCleanupCandidates }),
+    );
+
+    for (const method of ["POST", "DELETE"] as const) {
+      const output = response();
+      await handler(request(method, "/cleanup/candidates"), output.value);
+      expect(output.status()).toBe(404);
+      expect(output.json()).toEqual({ error: "Not found" });
+    }
+
+    expect(loadCleanupCandidates).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on cleanup candidates", async () => {
+    const loadCleanupCandidates = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadCleanupCandidates }),
+    );
+    const output = response();
+    const incoming = request("GET", "/cleanup/candidates");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadCleanupCandidates).not.toHaveBeenCalled();
+  });
+
+  it("serves retention policy through the core retention-policy boundary", async () => {
+    const payload = { preset: "balanced" };
+    const loadRetentionPolicy = vi.fn(() => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRetentionPolicy }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/retention-policy"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadRetentionPolicy).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a stable error when retention policy loading fails", async () => {
+    const loadRetentionPolicy = vi.fn(() => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRetentionPolicy }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/retention-policy"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "retention_policy_failed" });
+  });
+
+  it("does not expose retention policy mutations on the daemon", async () => {
+    const loadRetentionPolicy = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRetentionPolicy }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/retention-policy"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadRetentionPolicy).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on retention policy", async () => {
+    const loadRetentionPolicy = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRetentionPolicy }),
+    );
+    const output = response();
+    const incoming = request("GET", "/retention-policy");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadRetentionPolicy).not.toHaveBeenCalled();
+  });
+
+  it("serves notification preferences through the core notification-preferences boundary", async () => {
+    const payload = { preferences: { taskInactive: true, taskFailed: false } };
+    const loadNotificationPreferences = vi.fn(() => payload) as never;
+    const loadNotifications = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadNotificationPreferences, loadNotifications }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/notification-preferences"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadNotificationPreferences).toHaveBeenCalledTimes(1);
+    expect(loadNotifications).not.toHaveBeenCalled();
+  });
+
+  it("returns a stable error when notification preferences loading fails", async () => {
+    const loadNotificationPreferences = vi.fn(() => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadNotificationPreferences }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/notification-preferences"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "notification_preferences_failed" });
+  });
+
+  it("does not expose notification preferences mutations on the daemon", async () => {
+    const loadNotificationPreferences = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadNotificationPreferences }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/notification-preferences"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadNotificationPreferences).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on notification preferences", async () => {
+    const loadNotificationPreferences = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadNotificationPreferences }),
+    );
+    const output = response();
+    const incoming = request("GET", "/notification-preferences");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadNotificationPreferences).not.toHaveBeenCalled();
+  });
+
+  it("serves notifications through the core notification-list boundary", async () => {
+    const payload = {
+      notifications: [{ id: "n-1" }],
+      unreadCount: 2,
+    };
+    const loadNotifications = vi.fn(() => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadNotifications }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/notifications?unreadOnly=true"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadNotifications).toHaveBeenCalledTimes(1);
+    const calledUrl = (loadNotifications as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as URL;
+    expect(calledUrl.pathname).toBe("/notifications");
+    expect(calledUrl.searchParams.get("unreadOnly")).toBe("true");
+  });
+
+  it("returns 400 when notification query parameters are invalid", async () => {
+    const loadNotifications = vi.fn(() => {
+      throw new NotificationInputError("Invalid notification limit");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadNotifications }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/notifications?limit=0"), output.value);
+
+    expect(output.status()).toBe(400);
+    expect(output.json()).toEqual({ error: "Invalid notification limit" });
+  });
+
+  it("returns a stable error when notification listing fails unexpectedly", async () => {
+    const loadNotifications = vi.fn(() => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadNotifications }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/notifications"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "notification_list_failed" });
+  });
+
+  it("does not expose notification listing on unsupported methods", async () => {
+    const loadNotifications = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadNotifications }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/notifications"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadNotifications).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on notification listing", async () => {
+    const loadNotifications = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadNotifications }),
+    );
+    const output = response();
+    const incoming = request("GET", "/notifications");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadNotifications).not.toHaveBeenCalled();
+  });
+
+  it("serves the findings queue through the core findings-queue boundary", async () => {
+    const payload = {
+      findings: [{ findingId: "f-1" }],
+      counts: { total: 1 },
+      limit: 50,
+      offset: 0,
+    };
+    const loadFindingsQueue = vi.fn(() => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadFindingsQueue }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/findings/queue?limit=50"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadFindingsQueue).toHaveBeenCalledTimes(1);
+    const calledUrl = (loadFindingsQueue as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as URL;
+    expect(calledUrl.pathname).toBe("/findings/queue");
+    expect(calledUrl.searchParams.get("limit")).toBe("50");
+  });
+
+  it("returns 400 when findings queue query parameters are invalid", async () => {
+    const loadFindingsQueue = vi.fn(() => {
+      throw new RemediationQueueQueryError("Invalid sort order");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadFindingsQueue }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/findings/queue?sort=bad"), output.value);
+
+    expect(output.status()).toBe(400);
+    expect(output.json()).toEqual({ error: "Invalid sort order" });
+  });
+
+  it("returns a stable error when findings queue loading fails unexpectedly", async () => {
+    const loadFindingsQueue = vi.fn(() => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadFindingsQueue }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/findings/queue"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "findings_queue_failed" });
+  });
+
+  it("does not expose findings queue on unsupported methods", async () => {
+    const loadFindingsQueue = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadFindingsQueue }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/findings/queue"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadFindingsQueue).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on findings queue", async () => {
+    const loadFindingsQueue = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadFindingsQueue }),
+    );
+    const output = response();
+    const incoming = request("GET", "/findings/queue");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadFindingsQueue).not.toHaveBeenCalled();
+  });
+
+  it("serves operations overview through the core operations-overview boundary", async () => {
+    const payload = { overall: "ok", maintenance: { state: "RUNNING" } };
+    const loadOperationsOverview = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadOperationsOverview }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/operations/overview"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadOperationsOverview).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a stable error when operations overview loading fails", async () => {
+    const loadOperationsOverview = vi.fn(async () => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadOperationsOverview }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/operations/overview"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "operations_overview_failed" });
+  });
+
+  it("does not expose operations overview on unsupported methods", async () => {
+    const loadOperationsOverview = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadOperationsOverview }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/operations/overview"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadOperationsOverview).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on operations overview", async () => {
+    const loadOperationsOverview = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadOperationsOverview }),
+    );
+    const output = response();
+    const incoming = request("GET", "/operations/overview");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadOperationsOverview).not.toHaveBeenCalled();
+  });
+
+  it("serves dashboard tasks through the core dashboard-tasks boundary", async () => {
+    const payload = { tasks: [{ id: "task-1" }], counts: { active: 1 } };
+    const loadDashboardTasks = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadDashboardTasks }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/dashboard/tasks?limit=25"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadDashboardTasks).toHaveBeenCalledTimes(1);
+    const calledUrl = (loadDashboardTasks as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as URL;
+    expect(calledUrl.pathname).toBe("/dashboard/tasks");
+    expect(calledUrl.searchParams.get("limit")).toBe("25");
+  });
+
+  it("returns 400 when dashboard task query parameters are invalid", async () => {
+    const loadDashboardTasks = vi.fn(async () => {
+      throw new DashboardQueryError("Invalid bucket");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadDashboardTasks }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/dashboard/tasks?bucket=bad"), output.value);
+
+    expect(output.status()).toBe(400);
+    expect(output.json()).toEqual({ error: "Invalid bucket" });
+  });
+
+  it("returns a stable error when dashboard task loading fails unexpectedly", async () => {
+    const loadDashboardTasks = vi.fn(async () => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadDashboardTasks }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/dashboard/tasks"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "dashboard_tasks_failed" });
+  });
+
+  it("does not expose dashboard tasks on unsupported methods", async () => {
+    const loadDashboardTasks = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadDashboardTasks }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/dashboard/tasks"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadDashboardTasks).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on dashboard tasks", async () => {
+    const loadDashboardTasks = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadDashboardTasks }),
+    );
+    const output = response();
+    const incoming = request("GET", "/dashboard/tasks");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadDashboardTasks).not.toHaveBeenCalled();
+  });
+
+  it("serves runtime sandbox status through the core sandbox-status boundary", async () => {
+    const payload = {
+      statusCode: 200,
+      body: {
+        status: "enforced",
+        backend: "bubblewrap",
+        policyVersion: 3,
+      },
+    };
+    const loadRuntimeSandboxStatus = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRuntimeSandboxStatus }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/runtime/sandbox-status"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload.body);
+    expect(loadRuntimeSandboxStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns 503 when runtime sandbox status is unavailable", async () => {
+    const loadRuntimeSandboxStatus = vi.fn(async () => ({
+      statusCode: 503,
+      body: {
+        status: "unavailable",
+        error: "OS sandbox unavailable. Task execution blocked.",
+        failureCode: "namespace_unsupported",
+      },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRuntimeSandboxStatus }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/runtime/sandbox-status"), output.value);
+
+    expect(output.status()).toBe(503);
+    expect(output.json()).toEqual({
+      status: "unavailable",
+      error: "OS sandbox unavailable. Task execution blocked.",
+      failureCode: "namespace_unsupported",
+    });
+  });
+
+  it("returns a stable error when runtime sandbox status loading fails unexpectedly", async () => {
+    const loadRuntimeSandboxStatus = vi.fn(async () => {
+      throw new Error("unexpected");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRuntimeSandboxStatus }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/runtime/sandbox-status"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "runtime_sandbox_status_failed" });
+  });
+
+  it("does not expose runtime sandbox status on unsupported methods", async () => {
+    const loadRuntimeSandboxStatus = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRuntimeSandboxStatus }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/runtime/sandbox-status"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadRuntimeSandboxStatus).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on runtime sandbox status", async () => {
+    const loadRuntimeSandboxStatus = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRuntimeSandboxStatus }),
+    );
+    const output = response();
+    const incoming = request("GET", "/runtime/sandbox-status");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadRuntimeSandboxStatus).not.toHaveBeenCalled();
+  });
+
   it("serves the task list through the core task boundary", async () => {
     const tasks = [{ id: "task-1" }, { id: "task-2" }];
     const listTasks = vi.fn(async () => tasks) as never;
@@ -138,6 +1642,88 @@ describe("daemon HTTP router", () => {
 
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Not found" });
+    expect(listTasks).not.toHaveBeenCalled();
+  });
+
+  it("serves the task history list through the core task boundary", async () => {
+    const tasks = [{ id: "task-1" }];
+    const listTasks = vi.fn(async () => tasks) as never;
+    const loadTaskDetail = vi.fn() as never;
+    const loadTaskHistory = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ listTasks, loadTaskDetail, loadTaskHistory }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/history"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual({ tasks });
+    expect(listTasks).toHaveBeenCalledTimes(1);
+    expect(loadTaskDetail).not.toHaveBeenCalled();
+    expect(loadTaskHistory).not.toHaveBeenCalled();
+  });
+
+  it("returns a stable error when the task history list fails", async () => {
+    const listTasks = vi.fn(async () => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ listTasks }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/history"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "task_history_list_failed" });
+  });
+
+  it("does not expose the task history list on unsupported methods", async () => {
+    const listTasks = vi.fn(async () => []) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ listTasks }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/tasks/history"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(listTasks).not.toHaveBeenCalled();
+  });
+
+  it("does not treat the task history list path as task detail", async () => {
+    const listTasks = vi.fn(async () => [{ id: "task-1" }]) as never;
+    const loadTaskDetail = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ listTasks, loadTaskDetail }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/history"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(loadTaskDetail).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on the task history list", async () => {
+    const listTasks = vi.fn(async () => []) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ listTasks }),
+    );
+    const output = response();
+    const incoming = request("GET", "/tasks/history");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
     expect(listTasks).not.toHaveBeenCalled();
   });
 
@@ -317,11 +1903,17 @@ describe("daemon HTTP router", () => {
   });
 
   it("does not treat nested task paths as task detail", async () => {
+    const payload = {
+      task: { id: "task-1" },
+      pullRequest: { title: "Fix" },
+      intake: undefined,
+    };
     const loadTaskDetail = vi.fn() as never;
     const loadTaskHistory = vi.fn() as never;
     const loadTaskProfile = vi.fn() as never;
     const loadTaskFindings = vi.fn() as never;
     const loadTaskCi = vi.fn() as never;
+    const loadTaskPr = vi.fn(async () => payload) as never;
     const loadTaskSandboxPolicy = vi.fn() as never;
     const loadTaskRuntimePolicy = vi.fn() as never;
     const handler = createDaemonHttpHandler(
@@ -331,6 +1923,7 @@ describe("daemon HTTP router", () => {
         loadTaskProfile,
         loadTaskFindings,
         loadTaskCi,
+        loadTaskPr,
         loadTaskSandboxPolicy,
         loadTaskRuntimePolicy,
       }),
@@ -339,8 +1932,9 @@ describe("daemon HTTP router", () => {
 
     await handler(request("GET", "/tasks/task-1/pr"), output.value);
 
-    expect(output.status()).toBe(404);
-    expect(output.json()).toEqual({ error: "Not found" });
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(loadTaskPr).toHaveBeenCalledWith("task-1");
     expect(loadTaskDetail).not.toHaveBeenCalled();
     expect(loadTaskHistory).not.toHaveBeenCalled();
     expect(loadTaskProfile).not.toHaveBeenCalled();
@@ -842,6 +2436,136 @@ describe("daemon HTTP router", () => {
     expect(loadTaskCi).not.toHaveBeenCalled();
   });
 
+  it("serves task PR through the core task-pr boundary", async () => {
+    const payload = {
+      task: { id: "task-1" },
+      pullRequest: { title: "Fix bug" },
+      intake: { status: "pending" },
+    };
+    const loadTaskPr = vi.fn(async () => payload) as never;
+    const loadTaskDetail = vi.fn() as never;
+    const loadTaskCi = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({
+        loadTaskPr,
+        loadTaskDetail,
+        loadTaskCi,
+      }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/task-1/pr"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadTaskPr).toHaveBeenCalledTimes(1);
+    expect(loadTaskPr).toHaveBeenCalledWith("task-1");
+    expect(loadTaskDetail).not.toHaveBeenCalled();
+    expect(loadTaskCi).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 when the PR task does not exist", async () => {
+    const loadTaskPr = vi.fn(async () => {
+      throw new TaskPrNotFoundError();
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskPr }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/missing/pr"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Task not found" });
+  });
+
+  it("returns 409 when the task has no existing pull request", async () => {
+    const loadTaskPr = vi.fn(async () => {
+      throw new TaskPrConflictError();
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskPr }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/task-1/pr"), output.value);
+
+    expect(output.status()).toBe(409);
+    expect(output.json()).toEqual({
+      error: "Task does not have an existing pull request",
+    });
+  });
+
+  it("returns a stable error when task PR loading fails unexpectedly", async () => {
+    const loadTaskPr = vi.fn(async () => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskPr }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/task-1/pr"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "task_pr_failed" });
+  });
+
+  it("does not expose task PR mutations", async () => {
+    const loadTaskPr = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskPr }),
+    );
+
+    for (const method of ["POST", "DELETE"] as const) {
+      const output = response();
+      await handler(request(method, "/tasks/task-1/pr"), output.value);
+      expect(output.status()).toBe(404);
+      expect(output.json()).toEqual({ error: "Not found" });
+    }
+
+    expect(loadTaskPr).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on task PR", async () => {
+    const loadTaskPr = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskPr }),
+    );
+    const output = response();
+    const incoming = request("GET", "/tasks/task-1/pr");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadTaskPr).not.toHaveBeenCalled();
+  });
+
+  it("rejects a mismatched loopback Origin on task PR", async () => {
+    const loadTaskPr = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskPr }),
+    );
+    const output = response();
+    const incoming = request("GET", "/tasks/task-1/pr");
+    incoming.headers.host = "127.0.0.1:3000";
+    incoming.headers.origin = "http://127.0.0.1:4000";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "Cross-origin requests are not allowed",
+    });
+    expect(loadTaskPr).not.toHaveBeenCalled();
+  });
+
   it("serves task sandbox policy through the core sandbox-policy boundary", async () => {
     const payload = {
       status: "enforced" as const,
@@ -944,16 +2668,21 @@ describe("daemon HTTP router", () => {
 
   it("does not treat pr as sandbox policy", async () => {
     const loadTaskSandboxPolicy = vi.fn() as never;
+    const loadTaskPr = vi.fn(async () => ({
+      task: { id: "task-1" },
+      pullRequest: {},
+      intake: undefined,
+    })) as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ loadTaskSandboxPolicy }),
+      dependencies({ loadTaskSandboxPolicy, loadTaskPr }),
     );
     const output = response();
 
     await handler(request("GET", "/tasks/task-1/pr"), output.value);
 
-    expect(output.status()).toBe(404);
-    expect(output.json()).toEqual({ error: "Not found" });
+    expect(output.status()).toBe(200);
     expect(loadTaskSandboxPolicy).not.toHaveBeenCalled();
+    expect(loadTaskPr).toHaveBeenCalledWith("task-1");
   });
 
   it("rejects a non-loopback Host header on sandbox policy", async () => {
@@ -1090,16 +2819,21 @@ describe("daemon HTTP router", () => {
 
   it("does not treat pr as runtime policy", async () => {
     const loadTaskRuntimePolicy = vi.fn() as never;
+    const loadTaskPr = vi.fn(async () => ({
+      task: { id: "task-1" },
+      pullRequest: {},
+      intake: undefined,
+    })) as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ loadTaskRuntimePolicy }),
+      dependencies({ loadTaskRuntimePolicy, loadTaskPr }),
     );
     const output = response();
 
     await handler(request("GET", "/tasks/task-1/pr"), output.value);
 
-    expect(output.status()).toBe(404);
-    expect(output.json()).toEqual({ error: "Not found" });
+    expect(output.status()).toBe(200);
     expect(loadTaskRuntimePolicy).not.toHaveBeenCalled();
+    expect(loadTaskPr).toHaveBeenCalledWith("task-1");
   });
 
   it("rejects a non-loopback Host header on runtime policy", async () => {

@@ -16,6 +16,11 @@ import {
   TaskHistoryNotFoundError,
 } from "../core/task-history-service";
 import {
+  taskPrService,
+  TaskPrConflictError,
+  TaskPrNotFoundError,
+} from "../core/task-pr-service";
+import {
   taskProfileService,
   TaskProfileInvalidError,
   TaskProfileNotFoundError,
@@ -30,6 +35,46 @@ import {
   TaskSandboxPolicyNotFoundError,
   TaskSandboxPolicyUnavailableError,
 } from "../core/task-sandbox-policy-service";
+import {
+  dashboardTasksService,
+  DashboardQueryError,
+} from "../core/dashboard-tasks-service";
+import { cleanupCandidatesService } from "../core/cleanup-candidates-service";
+import { credentialStatusService } from "../core/credential-status-service";
+import {
+  findingsQueueService,
+  RemediationQueueQueryError,
+} from "../core/findings-queue-service";
+import { operationsOverviewService } from "../core/operations-overview-service";
+import { outboundSlackSettingsService } from "../core/outbound-slack-settings-service";
+import { runtimeSandboxStatusService } from "../core/runtime-sandbox-status-service";
+import {
+  notificationListService,
+  NotificationInputError,
+} from "../core/notification-list-service";
+import { notificationPreferencesService } from "../core/notification-preferences-service";
+import { profileListService } from "../core/profile-list-service";
+import { repoListService } from "../core/repo-list-service";
+import {
+  repoProfileService,
+  RepoProfileNotFoundError,
+} from "../core/repo-profile-service";
+import {
+  repoPullsService,
+  RepoPullsRequestError,
+} from "../core/repo-pulls-service";
+import {
+  repoTemplatesService,
+  RepoTemplatesNotFoundError,
+} from "../core/repo-templates-service";
+import { humanSessionService } from "../core/human-session-service";
+import { maintenanceStateService } from "../core/maintenance-state-service";
+import { retentionPolicyService } from "../core/retention-policy-service";
+import { stateBackupsService } from "../core/state-backups-service";
+import {
+  BackupValidationError,
+  stateBackupValidateService,
+} from "../core/state-backup-validate-service";
 import { taskService } from "../core/task-service";
 import {
   healthReadiness,
@@ -44,8 +89,28 @@ type DaemonHttpDependencies = {
   loadTaskProfile: typeof taskProfileService.load;
   loadTaskFindings: typeof taskFindingsService.load;
   loadTaskCi: typeof taskCiService.load;
+  loadTaskPr: typeof taskPrService.load;
   loadTaskSandboxPolicy: typeof taskSandboxPolicyService.load;
   loadTaskRuntimePolicy: typeof taskRuntimePolicyService.load;
+  loadProfileList: typeof profileListService.load;
+  loadRepoList: typeof repoListService.load;
+  loadCredentialStatus: typeof credentialStatusService.load;
+  loadNotifications: typeof notificationListService.load;
+  loadFindingsQueue: typeof findingsQueueService.load;
+  loadOperationsOverview: typeof operationsOverviewService.load;
+  loadDashboardTasks: typeof dashboardTasksService.load;
+  loadRuntimeSandboxStatus: typeof runtimeSandboxStatusService.load;
+  loadNotificationPreferences: typeof notificationPreferencesService.load;
+  loadRetentionPolicy: typeof retentionPolicyService.load;
+  loadCleanupCandidates: typeof cleanupCandidatesService.load;
+  loadRepoProfile: typeof repoProfileService.load;
+  loadRepoTemplates: typeof repoTemplatesService.load;
+  loadRepoPulls: typeof repoPullsService.load;
+  issueHumanSession: typeof humanSessionService.issue;
+  loadOutboundSlackSettings: typeof outboundSlackSettingsService.load;
+  loadMaintenanceState: typeof maintenanceStateService.load;
+  loadStateBackups: typeof stateBackupsService.load;
+  loadStateBackupValidate: typeof stateBackupValidateService.load;
 };
 
 export function createDaemonHttpHandler(
@@ -57,8 +122,29 @@ export function createDaemonHttpHandler(
     loadTaskProfile: (id) => taskProfileService.load(id),
     loadTaskFindings: (id) => taskFindingsService.load(id),
     loadTaskCi: (id) => taskCiService.load(id),
+    loadTaskPr: (id) => taskPrService.load(id),
     loadTaskSandboxPolicy: (id) => taskSandboxPolicyService.load(id),
     loadTaskRuntimePolicy: (id) => taskRuntimePolicyService.load(id),
+    loadProfileList: () => profileListService.load(),
+    loadRepoList: () => repoListService.load(),
+    loadCredentialStatus: () => credentialStatusService.load(),
+    loadNotifications: (url) => notificationListService.load(url),
+    loadFindingsQueue: (url) => findingsQueueService.load(url),
+    loadOperationsOverview: () => operationsOverviewService.load(),
+    loadDashboardTasks: (url) => dashboardTasksService.load(url),
+    loadRuntimeSandboxStatus: () => runtimeSandboxStatusService.load(),
+    loadNotificationPreferences: () => notificationPreferencesService.load(),
+    loadRetentionPolicy: () => retentionPolicyService.load(),
+    loadCleanupCandidates: () => cleanupCandidatesService.load(),
+    loadRepoProfile: (repoId) => repoProfileService.load(repoId),
+    loadRepoTemplates: (repoId) => repoTemplatesService.load(repoId),
+    loadRepoPulls: (repoId) => repoPullsService.load(repoId),
+    issueHumanSession: (webRequest) => humanSessionService.issue(webRequest),
+    loadOutboundSlackSettings: () => outboundSlackSettingsService.load(),
+    loadMaintenanceState: () => maintenanceStateService.load(),
+    loadStateBackups: () => stateBackupsService.load(),
+    loadStateBackupValidate: (backupId) =>
+      stateBackupValidateService.load(backupId),
   },
 ) {
   return async function handleDaemonHttp(
@@ -93,6 +179,327 @@ export function createDaemonHttpHandler(
       return;
     }
 
+    if (url.pathname === "/human-session") {
+      if (request.method !== "GET") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      await writeWebResponse(
+        response,
+        dependencies.issueHumanSession(toWebRequest(request)),
+      );
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/maintenance") {
+      try {
+        writeJson(response, 200, dependencies.loadMaintenanceState());
+      } catch (error) {
+        console.error(
+          "daemon_maintenance_state_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "maintenance_state_failed" });
+      }
+      return;
+    }
+
+    const stateBackupValidateId = matchStateBackupValidatePath(url.pathname);
+    if (stateBackupValidateId) {
+      if (request.method !== "GET") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          dependencies.loadStateBackupValidate(stateBackupValidateId),
+        );
+      } catch (error) {
+        if (error instanceof BackupValidationError) {
+          writeJson(response, 400, { error: error.message });
+          return;
+        }
+        console.error(
+          "daemon_state_backup_validate_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, {
+          error:
+            error instanceof Error
+              ? error.message
+              : "Backup validation failed",
+        });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/state/backups") {
+      try {
+        writeJson(response, 200, dependencies.loadStateBackups());
+      } catch (error) {
+        console.error(
+          "daemon_state_backups_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "state_backups_failed" });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/outbound/slack/settings") {
+      try {
+        writeJson(response, 200, dependencies.loadOutboundSlackSettings());
+      } catch (error) {
+        console.error(
+          "daemon_outbound_slack_settings_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "outbound_slack_settings_failed" });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/profiles") {
+      try {
+        writeJson(response, 200, dependencies.loadProfileList());
+      } catch (error) {
+        console.error(
+          "daemon_profile_list_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "profile_list_failed" });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/repos") {
+      try {
+        writeJson(response, 200, await dependencies.loadRepoList());
+      } catch (error) {
+        console.error(
+          "daemon_repo_list_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "repo_list_failed" });
+      }
+      return;
+    }
+
+    const repoProfileId = matchRepoLeafPath(url.pathname, "profile");
+    if (repoProfileId) {
+      if (request.method !== "GET") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          await dependencies.loadRepoProfile(repoProfileId),
+        );
+      } catch (error) {
+        if (error instanceof RepoProfileNotFoundError) {
+          writeJson(response, 404, { error: error.message });
+          return;
+        }
+        console.error(
+          "daemon_repo_profile_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "repo_profile_failed" });
+      }
+      return;
+    }
+
+    const repoTemplatesId = matchRepoLeafPath(url.pathname, "templates");
+    if (repoTemplatesId) {
+      if (request.method !== "GET") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          await dependencies.loadRepoTemplates(repoTemplatesId),
+        );
+      } catch (error) {
+        if (error instanceof RepoTemplatesNotFoundError) {
+          writeJson(response, 404, { error: error.message });
+          return;
+        }
+        console.error(
+          "daemon_repo_templates_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "repo_templates_failed" });
+      }
+      return;
+    }
+
+    const repoPullsId = matchRepoLeafPath(url.pathname, "pulls");
+    if (repoPullsId) {
+      if (request.method !== "GET") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          await dependencies.loadRepoPulls(repoPullsId),
+        );
+      } catch (error) {
+        if (error instanceof RepoPullsRequestError) {
+          writeJson(response, 400, { error: error.message });
+          return;
+        }
+        console.error(
+          "daemon_repo_pulls_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "repo_pulls_failed" });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/credentials/status") {
+      try {
+        writeJson(response, 200, dependencies.loadCredentialStatus());
+      } catch (error) {
+        console.error(
+          "daemon_credential_status_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "credential_status_failed" });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/cleanup/candidates") {
+      try {
+        writeJson(response, 200, await dependencies.loadCleanupCandidates());
+      } catch (error) {
+        console.error(
+          "daemon_cleanup_candidates_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "cleanup_candidates_failed" });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/retention-policy") {
+      try {
+        writeJson(response, 200, dependencies.loadRetentionPolicy());
+      } catch (error) {
+        console.error(
+          "daemon_retention_policy_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "retention_policy_failed" });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/notification-preferences") {
+      try {
+        writeJson(response, 200, dependencies.loadNotificationPreferences());
+      } catch (error) {
+        console.error(
+          "daemon_notification_preferences_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "notification_preferences_failed" });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/notifications") {
+      try {
+        writeJson(response, 200, dependencies.loadNotifications(url));
+      } catch (error) {
+        if (error instanceof NotificationInputError) {
+          writeJson(response, 400, { error: error.message });
+          return;
+        }
+        console.error(
+          "daemon_notification_list_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "notification_list_failed" });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/findings/queue") {
+      try {
+        writeJson(response, 200, dependencies.loadFindingsQueue(url));
+      } catch (error) {
+        if (error instanceof RemediationQueueQueryError) {
+          writeJson(response, 400, { error: error.message });
+          return;
+        }
+        console.error(
+          "daemon_findings_queue_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "findings_queue_failed" });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/operations/overview") {
+      try {
+        writeJson(response, 200, await dependencies.loadOperationsOverview());
+      } catch (error) {
+        console.error(
+          "daemon_operations_overview_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "operations_overview_failed" });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/dashboard/tasks") {
+      try {
+        writeJson(response, 200, await dependencies.loadDashboardTasks(url));
+      } catch (error) {
+        if (error instanceof DashboardQueryError) {
+          writeJson(response, 400, { error: error.message });
+          return;
+        }
+        console.error(
+          "daemon_dashboard_tasks_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "dashboard_tasks_failed" });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/runtime/sandbox-status") {
+      try {
+        const result = await dependencies.loadRuntimeSandboxStatus();
+        writeJson(response, result.statusCode, result.body);
+      } catch (error) {
+        console.error(
+          "daemon_runtime_sandbox_status_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "runtime_sandbox_status_failed" });
+      }
+      return;
+    }
+
     if (request.method === "GET" && url.pathname === "/tasks") {
       try {
         const tasks = await dependencies.listTasks();
@@ -103,6 +510,20 @@ export function createDaemonHttpHandler(
           error instanceof Error ? error.message : "unknown",
         );
         writeJson(response, 500, { error: "task_list_failed" });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/tasks/history") {
+      try {
+        const tasks = await dependencies.listTasks();
+        writeJson(response, 200, { tasks });
+      } catch (error) {
+        console.error(
+          "daemon_task_history_list_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "task_history_list_failed" });
       }
       return;
     }
@@ -188,6 +609,33 @@ export function createDaemonHttpHandler(
           error instanceof Error ? error.message : "unknown",
         );
         writeJson(response, 500, { error: "task_findings_failed" });
+      }
+      return;
+    }
+
+    const prTaskId = matchTaskLeafPath(url.pathname, "pr");
+    if (prTaskId) {
+      if (request.method !== "GET") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      try {
+        writeJson(response, 200, await dependencies.loadTaskPr(prTaskId));
+      } catch (error) {
+        if (error instanceof TaskPrNotFoundError) {
+          writeJson(response, 404, { error: "Task not found" });
+          return;
+        }
+        if (error instanceof TaskPrConflictError) {
+          writeJson(response, 409, { error: error.message });
+          return;
+        }
+        console.error(
+          "daemon_task_pr_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "task_pr_failed" });
       }
       return;
     }
@@ -319,6 +767,34 @@ function writeJson(
   response.end(JSON.stringify(body));
 }
 
+function toWebRequest(request: IncomingMessage) {
+  const host = request.headers.host ?? "127.0.0.1";
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(request.headers)) {
+    if (typeof value === "string") {
+      headers.set(name, value);
+    } else if (Array.isArray(value)) {
+      for (const entry of value) headers.append(name, entry);
+    }
+  }
+
+  return new Request(`http://${host}${request.url ?? "/"}`, {
+    method: request.method ?? "GET",
+    headers,
+  });
+}
+
+async function writeWebResponse(
+  response: ServerResponse,
+  webResponse: Response,
+) {
+  response.statusCode = webResponse.status;
+  webResponse.headers.forEach((value, name) => {
+    response.setHeader(name, value);
+  });
+  response.end(Buffer.from(await webResponse.arrayBuffer()));
+}
+
 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
@@ -356,20 +832,38 @@ function isLoopbackHost(hostHeader: string) {
   }
 }
 
+function matchStateBackupValidatePath(pathname: string) {
+  const match = /^\/state\/backups\/([^/]+)\/validate$/.exec(pathname);
+  return decodePathSegment(match?.[1]);
+}
+
+function matchRepoLeafPath(pathname: string, leaf: "profile" | "templates" | "pulls") {
+  const match = /^\/repos\/([^/]+)\/([^/]+)$/.exec(pathname);
+  if (!match || match[2] !== leaf) return;
+  return decodePathSegment(match[1]);
+}
+
 function matchTaskIdPath(pathname: string) {
-  return decodeTaskIdSegment(/^\/tasks\/([^/]+)$/.exec(pathname)?.[1]);
+  return decodePathSegment(/^\/tasks\/([^/]+)$/.exec(pathname)?.[1]);
 }
 
 function matchTaskLeafPath(
   pathname: string,
-  leaf: "history" | "profile" | "findings" | "ci" | "sandbox-policy" | "runtime-policy",
+  leaf:
+    | "history"
+    | "profile"
+    | "findings"
+    | "pr"
+    | "ci"
+    | "sandbox-policy"
+    | "runtime-policy",
 ) {
   const match = /^\/tasks\/([^/]+)\/([^/]+)$/.exec(pathname);
   if (!match || match[2] !== leaf) return;
-  return decodeTaskIdSegment(match[1]);
+  return decodePathSegment(match[1]);
 }
 
-function decodeTaskIdSegment(rawId: string | undefined) {
+function decodePathSegment(rawId: string | undefined) {
   if (!rawId) return;
 
   try {
