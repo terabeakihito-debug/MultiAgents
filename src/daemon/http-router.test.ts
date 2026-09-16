@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { describe, expect, it, vi } from "vitest";
+import { TaskDetailNotFoundError } from "../core/task-detail-service";
 import { createDaemonHttpHandler } from "./http-router";
 
 function request(
@@ -45,6 +46,11 @@ function dependencies(
   return {
     health: vi.fn(async () => ({ status: "ready" })) as never,
     listTasks: vi.fn(async () => []),
+    loadTaskDetail: vi.fn(async () => ({
+      task: { id: "task-1" },
+      diff: { patch: "" },
+      conflict: false,
+    })) as never,
     ...overrides,
   };
 }
@@ -134,5 +140,154 @@ describe("daemon HTTP router", () => {
 
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Not found" });
+  });
+
+  it("serves task detail through the core task-detail boundary", async () => {
+    const detail = {
+      task: { id: "task-1" },
+      diff: { patch: "diff --git a/README.md b/README.md" },
+      conflict: false as const,
+    };
+    const loadTaskDetail = vi.fn(async () => detail) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskDetail }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/task-1"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual({
+      task: detail.task,
+      diff: detail.diff,
+    });
+    expect(loadTaskDetail).toHaveBeenCalledTimes(1);
+    expect(loadTaskDetail).toHaveBeenCalledWith("task-1");
+  });
+
+  it("returns 404 when the requested task does not exist", async () => {
+    const loadTaskDetail = vi.fn(async () => {
+      throw new TaskDetailNotFoundError();
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskDetail }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/missing"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Task not found" });
+  });
+
+  it("returns the conflict payload when task detail reports a diff conflict", async () => {
+    const detail = {
+      task: { id: "task-1" },
+      diff: { patch: "conflict-diff" },
+      error: "first diff failed",
+      conflict: true as const,
+    };
+    const loadTaskDetail = vi.fn(async () => detail) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskDetail }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/task-1"), output.value);
+
+    expect(output.status()).toBe(409);
+    expect(output.json()).toEqual({
+      task: detail.task,
+      diff: detail.diff,
+      error: detail.error,
+    });
+  });
+
+  it("returns a stable error when task detail loading fails", async () => {
+    const loadTaskDetail = vi.fn(async () => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskDetail }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/task-1"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "task_detail_failed" });
+  });
+
+  it("does not expose task detail mutations", async () => {
+    const loadTaskDetail = vi.fn(async () => ({
+      task: { id: "task-1" },
+      diff: { patch: "" },
+      conflict: false as const,
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskDetail }),
+    );
+
+    for (const method of ["POST", "DELETE"] as const) {
+      const output = response();
+      await handler(request(method, "/tasks/task-1"), output.value);
+      expect(output.status()).toBe(404);
+      expect(output.json()).toEqual({ error: "Not found" });
+    }
+
+    expect(loadTaskDetail).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on task detail", async () => {
+    const loadTaskDetail = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskDetail }),
+    );
+    const output = response();
+    const incoming = request("GET", "/tasks/task-1");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadTaskDetail).not.toHaveBeenCalled();
+  });
+
+  it("rejects a mismatched loopback Origin on task detail", async () => {
+    const loadTaskDetail = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskDetail }),
+    );
+    const output = response();
+    const incoming = request("GET", "/tasks/task-1");
+    incoming.headers.host = "127.0.0.1:3000";
+    incoming.headers.origin = "http://127.0.0.1:4000";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "Cross-origin requests are not allowed",
+    });
+    expect(loadTaskDetail).not.toHaveBeenCalled();
+  });
+
+  it("does not treat nested task paths as task detail", async () => {
+    const loadTaskDetail = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadTaskDetail }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/tasks/task-1/history"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadTaskDetail).not.toHaveBeenCalled();
   });
 });

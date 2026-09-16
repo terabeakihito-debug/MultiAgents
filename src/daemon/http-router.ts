@@ -1,4 +1,8 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import {
+  taskDetailService,
+  TaskDetailNotFoundError,
+} from "../core/task-detail-service";
 import { taskService } from "../core/task-service";
 import {
   healthReadiness,
@@ -8,12 +12,14 @@ import {
 type DaemonHttpDependencies = {
   health: typeof healthReadiness;
   listTasks: typeof taskService.list;
+  loadTaskDetail: typeof taskDetailService.load;
 };
 
 export function createDaemonHttpHandler(
   dependencies: DaemonHttpDependencies = {
     health: healthReadiness,
     listTasks: () => taskService.list(),
+    loadTaskDetail: (id) => taskDetailService.load(id),
   },
 ) {
   return async function handleDaemonHttp(
@@ -58,6 +64,33 @@ export function createDaemonHttpHandler(
           error instanceof Error ? error.message : "unknown",
         );
         writeJson(response, 500, { error: "task_list_failed" });
+      }
+      return;
+    }
+
+    const taskId = matchTaskIdPath(url.pathname);
+    if (taskId) {
+      if (request.method !== "GET") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      try {
+        const detail = await dependencies.loadTaskDetail(taskId);
+        const body = detail.error
+          ? { diff: detail.diff, task: detail.task, error: detail.error }
+          : { diff: detail.diff, task: detail.task };
+        writeJson(response, detail.conflict ? 409 : 200, body);
+      } catch (error) {
+        if (error instanceof TaskDetailNotFoundError) {
+          writeJson(response, 404, { error: "Task not found" });
+          return;
+        }
+        console.error(
+          "daemon_task_detail_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "task_detail_failed" });
       }
       return;
     }
@@ -111,5 +144,18 @@ function isLoopbackHost(hostHeader: string) {
     return LOOPBACK_HOSTS.has(new URL(`http://${hostHeader}`).hostname);
   } catch {
     return false;
+  }
+}
+
+function matchTaskIdPath(pathname: string) {
+  const match = /^\/tasks\/([^/]+)$/.exec(pathname);
+  const rawId = match?.[1];
+  if (!rawId) return;
+
+  try {
+    const id = decodeURIComponent(rawId);
+    return id || undefined;
+  } catch {
+    return;
   }
 }
