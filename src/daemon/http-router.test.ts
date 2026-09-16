@@ -262,6 +262,11 @@ function dependencies(
       remediation: null,
       history: [],
     })) as never,
+    applyFindingDismissMutation: vi.fn(async () => ({
+      finding: { findingId: "f-1", status: "dismissed" },
+      remediation: null,
+      history: [],
+    })) as never,
     ...overrides,
   };
 }
@@ -3262,6 +3267,59 @@ describe("daemon HTTP router", () => {
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Not found" });
     expect(loadFindingsQueue).not.toHaveBeenCalled();
+  });
+
+  it("rejects finding dismiss POST without the human mutation gate", async () => {
+    const applyFindingDismissMutation = vi.fn(async () => ({
+      finding: { findingId: "f-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyFindingDismissMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/findings/f-1/dismiss",
+        {},
+        '{"confirmed":true}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyFindingDismissMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts finding dismiss POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("finding-dismiss");
+    const payload = {
+      finding: { findingId: "f-1", status: "dismissed" },
+      remediation: { findingId: "f-1" },
+      history: [{ type: "finding_dismissed" }],
+    };
+    const applyFindingDismissMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyFindingDismissMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/findings/f-1/dismiss",
+        authorizedHumanHeaders(nonce, cookie, "finding-dismiss"),
+        '{"confirmed":true,"reason":"not applicable"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyFindingDismissMutation).toHaveBeenCalledWith("f-1", {
+      confirmed: true,
+      reason: "not applicable",
+    });
   });
 
   it("rejects a non-loopback Host header on task findings", async () => {
