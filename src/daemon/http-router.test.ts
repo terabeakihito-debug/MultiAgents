@@ -249,6 +249,11 @@ function dependencies(
       status: 400,
       body: { error: "A valid taskId is required" },
     })) as never,
+    prepareReviewFlowStream: vi.fn(async () => ({
+      kind: "error",
+      status: 400,
+      body: { error: "Prompt is required" },
+    })) as never,
     ...overrides,
   };
 }
@@ -433,10 +438,13 @@ describe("daemon HTTP router", () => {
     expect(prepareReviewRerun).toHaveBeenCalledTimes(1);
   });
 
-  it("does not expose review flow stream on the daemon", async () => {
-    const prepareReviewRerun = vi.fn() as never;
+  it("rejects review flow stream POST without the human mutation gate", async () => {
+    const prepareReviewFlowStream = vi.fn(async () => ({
+      kind: "stream",
+      stream: new ReadableStream(),
+    })) as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ prepareReviewRerun }),
+      dependencies({ prepareReviewFlowStream }),
     );
     const output = response();
 
@@ -445,9 +453,42 @@ describe("daemon HTTP router", () => {
       output.value,
     );
 
-    expect(output.status()).toBe(404);
-    expect(output.json()).toEqual({ error: "Not found" });
-    expect(prepareReviewRerun).not.toHaveBeenCalled();
+    expect(output.status()).toBe(403);
+    expect(prepareReviewFlowStream).not.toHaveBeenCalled();
+  });
+
+  it("accepts review flow stream POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("review-run");
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("event: test\n\n"));
+        controller.close();
+      },
+    });
+    const prepareReviewFlowStream = vi.fn(async () => ({
+      kind: "stream",
+      stream,
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ prepareReviewFlowStream }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/flows/review/stream",
+        authorizedHumanHeaders(nonce, cookie, "review-run"),
+        '{"prompt":"Review this"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe(
+      "text/event-stream; charset=utf-8",
+    );
+    expect(prepareReviewFlowStream).toHaveBeenCalledTimes(1);
   });
 
   it("rejects agent run POST without the human mutation gate", async () => {

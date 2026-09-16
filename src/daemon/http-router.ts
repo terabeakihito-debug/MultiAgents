@@ -120,6 +120,7 @@ import {
   reviewFlowMutationService,
 } from "../core/review-flow-mutation-service";
 import { reviewRerunMutationService } from "../core/review-rerun-mutation-service";
+import { reviewFlowStreamMutationService } from "../core/review-flow-stream-mutation-service";
 import { taskService } from "../core/task-service";
 import {
   healthReadiness,
@@ -160,6 +161,7 @@ type DaemonHttpDependencies = {
   applyAgentParallelRunMutation: typeof agentParallelRunMutationService.apply;
   applyReviewFlowMutation: typeof reviewFlowMutationService.apply;
   prepareReviewRerun: typeof reviewRerunMutationService.prepare;
+  prepareReviewFlowStream: typeof reviewFlowStreamMutationService.prepare;
   loadRepoPulls: typeof repoPullsService.load;
   issueHumanSession: typeof humanSessionService.issue;
   rejectHumanMutation: typeof humanMutationGateService.reject;
@@ -222,6 +224,8 @@ export function createDaemonHttpHandler(
       reviewFlowMutationService.apply(body, options),
     prepareReviewRerun: (body, signal) =>
       reviewRerunMutationService.prepare(body, signal),
+    prepareReviewFlowStream: (body, signal) =>
+      reviewFlowStreamMutationService.prepare(body, signal),
     loadRepoPulls: (repoId) => repoPullsService.load(repoId),
     issueHumanSession: (webRequest) => humanSessionService.issue(webRequest),
     rejectHumanMutation: (webRequest, action, options) =>
@@ -321,6 +325,46 @@ export function createDaemonHttpHandler(
             error instanceof Error ? error.message : "Review execution failed",
         });
       }
+      return;
+    }
+
+    if (url.pathname === "/flows/review/stream") {
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "review-run",
+        { label: "Review execution" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      let body: unknown;
+      try {
+        body = await webRequest.json();
+      } catch {
+        writeJson(response, 400, {
+          error: "Request body must be valid JSON",
+        });
+        return;
+      }
+
+      const prepared = await dependencies.prepareReviewFlowStream(
+        body,
+        webRequest.signal,
+      );
+      if (prepared.kind === "error") {
+        writeJson(response, prepared.status, prepared.body);
+        return;
+      }
+
+      await writeEventStreamResponse(response, prepared.stream);
       return;
     }
 
