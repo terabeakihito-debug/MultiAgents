@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { describe, expect, it, vi } from "vitest";
 import { TaskCiNotFoundError } from "../core/task-ci-service";
+import { NotificationInputError } from "../core/notification-list-service";
 import {
   TaskPrConflictError,
   TaskPrNotFoundError,
@@ -109,6 +110,10 @@ function dependencies(
     })) as never,
     loadCredentialStatus: vi.fn(() => ({
       credentials: [{ capability: "github", status: "ready" }],
+    })) as never,
+    loadNotifications: vi.fn(() => ({
+      notifications: [{ id: "n-1" }],
+      unreadCount: 1,
     })) as never,
     ...overrides,
   };
@@ -313,6 +318,91 @@ describe("daemon HTTP router", () => {
       error: "This API is available only on localhost",
     });
     expect(loadCredentialStatus).not.toHaveBeenCalled();
+  });
+
+  it("serves notifications through the core notification-list boundary", async () => {
+    const payload = {
+      notifications: [{ id: "n-1" }],
+      unreadCount: 2,
+    };
+    const loadNotifications = vi.fn(() => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadNotifications }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/notifications?unreadOnly=true"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadNotifications).toHaveBeenCalledTimes(1);
+    const calledUrl = (loadNotifications as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as URL;
+    expect(calledUrl.pathname).toBe("/notifications");
+    expect(calledUrl.searchParams.get("unreadOnly")).toBe("true");
+  });
+
+  it("returns 400 when notification query parameters are invalid", async () => {
+    const loadNotifications = vi.fn(() => {
+      throw new NotificationInputError("Invalid notification limit");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadNotifications }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/notifications?limit=0"), output.value);
+
+    expect(output.status()).toBe(400);
+    expect(output.json()).toEqual({ error: "Invalid notification limit" });
+  });
+
+  it("returns a stable error when notification listing fails unexpectedly", async () => {
+    const loadNotifications = vi.fn(() => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadNotifications }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/notifications"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "notification_list_failed" });
+  });
+
+  it("does not expose notification listing on unsupported methods", async () => {
+    const loadNotifications = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadNotifications }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/notifications"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadNotifications).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on notification listing", async () => {
+    const loadNotifications = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadNotifications }),
+    );
+    const output = response();
+    const incoming = request("GET", "/notifications");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadNotifications).not.toHaveBeenCalled();
   });
 
   it("serves the task list through the core task boundary", async () => {

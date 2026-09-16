@@ -36,6 +36,10 @@ import {
   TaskSandboxPolicyUnavailableError,
 } from "../core/task-sandbox-policy-service";
 import { credentialStatusService } from "../core/credential-status-service";
+import {
+  notificationListService,
+  NotificationInputError,
+} from "../core/notification-list-service";
 import { profileListService } from "../core/profile-list-service";
 import { repoListService } from "../core/repo-list-service";
 import { taskService } from "../core/task-service";
@@ -58,6 +62,7 @@ type DaemonHttpDependencies = {
   loadProfileList: typeof profileListService.load;
   loadRepoList: typeof repoListService.load;
   loadCredentialStatus: typeof credentialStatusService.load;
+  loadNotifications: typeof notificationListService.load;
 };
 
 export function createDaemonHttpHandler(
@@ -75,6 +80,7 @@ export function createDaemonHttpHandler(
     loadProfileList: () => profileListService.load(),
     loadRepoList: () => repoListService.load(),
     loadCredentialStatus: () => credentialStatusService.load(),
+    loadNotifications: (url) => notificationListService.load(url),
   },
 ) {
   return async function handleDaemonHttp(
@@ -144,6 +150,23 @@ export function createDaemonHttpHandler(
           error instanceof Error ? error.message : "unknown",
         );
         writeJson(response, 500, { error: "credential_status_failed" });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/notifications") {
+      try {
+        writeJson(response, 200, dependencies.loadNotifications(url));
+      } catch (error) {
+        if (error instanceof NotificationInputError) {
+          writeJson(response, 400, { error: error.message });
+          return;
+        }
+        console.error(
+          "daemon_notification_list_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "notification_list_failed" });
       }
       return;
     }
