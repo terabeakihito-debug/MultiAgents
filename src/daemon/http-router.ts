@@ -12,6 +12,10 @@ import {
   TaskFindingsLoadError,
 } from "../core/task-findings-service";
 import {
+  TaskFindingsExtractInputError,
+  taskFindingsExtractMutationService,
+} from "../core/task-findings-extract-mutation-service";
+import {
   taskHistoryService,
   TaskHistoryNotFoundError,
 } from "../core/task-history-service";
@@ -134,6 +138,7 @@ type DaemonHttpDependencies = {
   loadTaskHistory: typeof taskHistoryService.load;
   loadTaskProfile: typeof taskProfileService.load;
   loadTaskFindings: typeof taskFindingsService.load;
+  applyTaskFindingsExtractMutation: typeof taskFindingsExtractMutationService.apply;
   loadTaskCi: typeof taskCiService.load;
   loadTaskPr: typeof taskPrService.load;
   loadTaskSandboxPolicy: typeof taskSandboxPolicyService.load;
@@ -187,6 +192,8 @@ export function createDaemonHttpHandler(
     loadTaskHistory: (id) => taskHistoryService.load(id),
     loadTaskProfile: (id) => taskProfileService.load(id),
     loadTaskFindings: (id) => taskFindingsService.load(id),
+    applyTaskFindingsExtractMutation: (taskId, body) =>
+      taskFindingsExtractMutationService.apply(taskId, body),
     loadTaskCi: (id) => taskCiService.load(id),
     loadTaskPr: (id) => taskPrService.load(id),
     loadTaskSandboxPolicy: (id) => taskSandboxPolicyService.load(id),
@@ -1371,6 +1378,56 @@ export function createDaemonHttpHandler(
       return;
     }
 
+    const findingsExtractTaskId = matchTaskFindingsExtractPath(url.pathname);
+    if (findingsExtractTaskId) {
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "finding-extract",
+        { label: "Finding" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      let body: unknown;
+      try {
+        body = await webRequest.json();
+      } catch {
+        writeJson(response, 400, {
+          error: "Request body must be valid JSON",
+        });
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          201,
+          await dependencies.applyTaskFindingsExtractMutation(
+            findingsExtractTaskId,
+            body,
+          ),
+        );
+      } catch (error) {
+        if (error instanceof TaskFindingsExtractInputError) {
+          writeJson(response, 400, { error: error.message });
+          return;
+        }
+        writeJson(response, 409, {
+          error:
+            error instanceof Error ? error.message : "Finding extraction failed",
+        });
+      }
+      return;
+    }
+
     const findingsTaskId = matchTaskLeafPath(url.pathname, "findings");
     if (findingsTaskId) {
       if (request.method !== "GET") {
@@ -1707,6 +1764,11 @@ function matchRepoLeafPath(pathname: string, leaf: "profile" | "templates" | "pu
 
 function matchTaskIdPath(pathname: string) {
   return decodePathSegment(/^\/tasks\/([^/]+)$/.exec(pathname)?.[1]);
+}
+
+function matchTaskFindingsExtractPath(pathname: string) {
+  const match = /^\/tasks\/([^/]+)\/findings\/extract$/.exec(pathname);
+  return decodePathSegment(match?.[1]);
 }
 
 function matchTaskLeafPath(

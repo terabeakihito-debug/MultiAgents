@@ -254,6 +254,9 @@ function dependencies(
       status: 400,
       body: { error: "Prompt is required" },
     })) as never,
+    applyTaskFindingsExtractMutation: vi.fn(async () => ({
+      findings: [{ findingId: "f-1" }],
+    })) as never,
     ...overrides,
   };
 }
@@ -3126,6 +3129,54 @@ describe("daemon HTTP router", () => {
     }
 
     expect(loadTaskFindings).not.toHaveBeenCalled();
+  });
+
+  it("rejects findings extract POST without the human mutation gate", async () => {
+    const applyTaskFindingsExtractMutation = vi.fn(async () => ({
+      findings: [],
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskFindingsExtractMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/findings/extract",
+        {},
+        '{"confirmed":true}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyTaskFindingsExtractMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts findings extract POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("finding-extract");
+    const payload = { findings: [{ findingId: "f-1", title: "Bug" }] };
+    const applyTaskFindingsExtractMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskFindingsExtractMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/findings/extract",
+        authorizedHumanHeaders(nonce, cookie, "finding-extract"),
+        '{"confirmed":true}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(201);
+    expect(output.json()).toEqual(payload);
+    expect(applyTaskFindingsExtractMutation).toHaveBeenCalledWith("task-1", {
+      confirmed: true,
+    });
   });
 
   it("does not treat findings extract as the findings read", async () => {
