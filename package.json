@@ -9,7 +9,9 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --config vitest.heavy.config.ts && vitest run --config vitest.light.config.ts",
-    "state:restore": "node scripts/state-restore.mjs"
+    "state:restore": "node scripts/state-restore.mjs",
+    "daemon:build": "node scripts/build-daemon.mjs",
+    "daemon:start": "node dist-daemon/daemon/main.js"
   },
   "dependencies": {
     "next": "^16.3.4",
