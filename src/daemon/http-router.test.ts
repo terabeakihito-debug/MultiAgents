@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { TaskCiNotFoundError } from "../core/task-ci-service";
 import { DashboardQueryError } from "../core/dashboard-tasks-service";
 import { RepoProfileNotFoundError } from "../core/repo-profile-service";
+import { RepoPullsRequestError } from "../core/repo-pulls-service";
 import { RepoTemplatesNotFoundError } from "../core/repo-templates-service";
 import { RemediationQueueQueryError } from "../core/findings-queue-service";
 import { NotificationInputError } from "../core/notification-list-service";
@@ -155,6 +156,9 @@ function dependencies(
     loadRepoTemplates: vi.fn(async () => ({
       templates: [{ templateId: "bug_fix" }],
       settings: { defaultTemplateId: "bug_fix" },
+    })) as never,
+    loadRepoPulls: vi.fn(async () => ({
+      pulls: [{ number: 1, title: "Fix" }],
     })) as never,
     ...overrides,
   };
@@ -444,16 +448,100 @@ describe("daemon HTTP router", () => {
 
   it("does not treat repository pulls as repository templates", async () => {
     const loadRepoTemplates = vi.fn() as never;
+    const loadRepoPulls = vi.fn(async () => ({ pulls: [] })) as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ loadRepoTemplates }),
+      dependencies({ loadRepoTemplates, loadRepoPulls }),
     );
     const output = response();
 
     await handler(request("GET", "/repos/repo-1/pulls"), output.value);
 
+    expect(output.status()).toBe(200);
+    expect(loadRepoTemplates).not.toHaveBeenCalled();
+    expect(loadRepoPulls).toHaveBeenCalledWith("repo-1");
+  });
+
+  it("serves repository pulls through the core repo-pulls boundary", async () => {
+    const payload = { pulls: [{ number: 42, title: "Fix bug" }] };
+    const loadRepoPulls = vi.fn(async () => payload) as never;
+    const loadRepoProfile = vi.fn() as never;
+    const loadRepoTemplates = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoPulls, loadRepoProfile, loadRepoTemplates }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/repos/repo-1/pulls"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadRepoPulls).toHaveBeenCalledWith("repo-1");
+    expect(loadRepoProfile).not.toHaveBeenCalled();
+    expect(loadRepoTemplates).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 when repository pull listing fails", async () => {
+    const loadRepoPulls = vi.fn(async () => {
+      throw new RepoPullsRequestError("Repository not found");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoPulls }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/repos/missing/pulls"), output.value);
+
+    expect(output.status()).toBe(400);
+    expect(output.json()).toEqual({ error: "Repository not found" });
+  });
+
+  it("returns a stable error when repository pulls loading fails unexpectedly", async () => {
+    const loadRepoPulls = vi.fn(async () => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoPulls }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/repos/repo-1/pulls"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "repo_pulls_failed" });
+  });
+
+  it("does not expose repository pulls on unsupported methods", async () => {
+    const loadRepoPulls = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoPulls }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/repos/repo-1/pulls"), output.value);
+
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Not found" });
-    expect(loadRepoTemplates).not.toHaveBeenCalled();
+    expect(loadRepoPulls).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on repository pulls", async () => {
+    const loadRepoPulls = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoPulls }),
+    );
+    const output = response();
+    const incoming = request("GET", "/repos/repo-1/pulls");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadRepoPulls).not.toHaveBeenCalled();
   });
 
   it("rejects a non-loopback Host header on repository templates", async () => {

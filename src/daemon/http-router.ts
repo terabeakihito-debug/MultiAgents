@@ -59,6 +59,10 @@ import {
   RepoProfileNotFoundError,
 } from "../core/repo-profile-service";
 import {
+  repoPullsService,
+  RepoPullsRequestError,
+} from "../core/repo-pulls-service";
+import {
   repoTemplatesService,
   RepoTemplatesNotFoundError,
 } from "../core/repo-templates-service";
@@ -93,6 +97,7 @@ type DaemonHttpDependencies = {
   loadCleanupCandidates: typeof cleanupCandidatesService.load;
   loadRepoProfile: typeof repoProfileService.load;
   loadRepoTemplates: typeof repoTemplatesService.load;
+  loadRepoPulls: typeof repoPullsService.load;
 };
 
 export function createDaemonHttpHandler(
@@ -120,6 +125,7 @@ export function createDaemonHttpHandler(
     loadCleanupCandidates: () => cleanupCandidatesService.load(),
     loadRepoProfile: (repoId) => repoProfileService.load(repoId),
     loadRepoTemplates: (repoId) => repoTemplatesService.load(repoId),
+    loadRepoPulls: (repoId) => repoPullsService.load(repoId),
   },
 ) {
   return async function handleDaemonHttp(
@@ -230,6 +236,33 @@ export function createDaemonHttpHandler(
           error instanceof Error ? error.message : "unknown",
         );
         writeJson(response, 500, { error: "repo_templates_failed" });
+      }
+      return;
+    }
+
+    const repoPullsId = matchRepoLeafPath(url.pathname, "pulls");
+    if (repoPullsId) {
+      if (request.method !== "GET") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          await dependencies.loadRepoPulls(repoPullsId),
+        );
+      } catch (error) {
+        if (error instanceof RepoPullsRequestError) {
+          writeJson(response, 400, { error: error.message });
+          return;
+        }
+        console.error(
+          "daemon_repo_pulls_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "repo_pulls_failed" });
       }
       return;
     }
