@@ -267,6 +267,12 @@ function dependencies(
       remediation: null,
       history: [],
     })) as never,
+    applyFindingConvertMutation: vi.fn(async () => ({
+      finding: { findingId: "f-1", status: "converted" },
+      task: { id: "task-2" },
+      remediation: null,
+      history: [],
+    })) as never,
     ...overrides,
   };
 }
@@ -3319,6 +3325,62 @@ describe("daemon HTTP router", () => {
     expect(applyFindingDismissMutation).toHaveBeenCalledWith("f-1", {
       confirmed: true,
       reason: "not applicable",
+    });
+  });
+
+  it("rejects finding convert POST without the human mutation gate", async () => {
+    const applyFindingConvertMutation = vi.fn(async () => ({
+      finding: { findingId: "f-1" },
+      task: { id: "task-2" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyFindingConvertMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/findings/f-1/convert",
+        {},
+        '{"confirmed":true,"templateId":"bug_fix","objective":"Fix it"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyFindingConvertMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts finding convert POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("finding-convert");
+    const payload = {
+      finding: { findingId: "f-1", status: "converted" },
+      task: { id: "task-2", repoId: "repo-1" },
+      remediation: { findingId: "f-1" },
+      history: [{ type: "implementation_task_created" }],
+    };
+    const applyFindingConvertMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyFindingConvertMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/findings/f-1/convert",
+        authorizedHumanHeaders(nonce, cookie, "finding-convert"),
+        '{"confirmed":true,"templateId":"bug_fix","objective":"Fix it"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(201);
+    expect(output.json()).toEqual(payload);
+    expect(applyFindingConvertMutation).toHaveBeenCalledWith("f-1", {
+      confirmed: true,
+      templateId: "bug_fix",
+      objective: "Fix it",
     });
   });
 

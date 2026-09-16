@@ -16,6 +16,10 @@ import {
   findingAcceptMutationService,
 } from "../core/finding-accept-mutation-service";
 import {
+  FindingConvertInputError,
+  findingConvertMutationService,
+} from "../core/finding-convert-mutation-service";
+import {
   FindingDismissInputError,
   findingDismissMutationService,
 } from "../core/finding-dismiss-mutation-service";
@@ -149,6 +153,7 @@ type DaemonHttpDependencies = {
   applyTaskFindingsExtractMutation: typeof taskFindingsExtractMutationService.apply;
   applyFindingAcceptMutation: typeof findingAcceptMutationService.apply;
   applyFindingDismissMutation: typeof findingDismissMutationService.apply;
+  applyFindingConvertMutation: typeof findingConvertMutationService.apply;
   loadTaskCi: typeof taskCiService.load;
   loadTaskPr: typeof taskPrService.load;
   loadTaskSandboxPolicy: typeof taskSandboxPolicyService.load;
@@ -208,6 +213,8 @@ export function createDaemonHttpHandler(
       findingAcceptMutationService.apply(findingId, body),
     applyFindingDismissMutation: (findingId, body) =>
       findingDismissMutationService.apply(findingId, body),
+    applyFindingConvertMutation: (findingId, body) =>
+      findingConvertMutationService.apply(findingId, body),
     loadTaskCi: (id) => taskCiService.load(id),
     loadTaskPr: (id) => taskPrService.load(id),
     loadTaskSandboxPolicy: (id) => taskSandboxPolicyService.load(id),
@@ -1294,6 +1301,56 @@ export function createDaemonHttpHandler(
       return;
     }
 
+    const findingConvertId = matchFindingConvertPath(url.pathname);
+    if (findingConvertId) {
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "finding-convert",
+        { label: "Finding" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      let body: unknown;
+      try {
+        body = await webRequest.json();
+      } catch {
+        writeJson(response, 400, {
+          error: "Request body must be valid JSON",
+        });
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          201,
+          await dependencies.applyFindingConvertMutation(
+            findingConvertId,
+            body,
+          ),
+        );
+      } catch (error) {
+        if (error instanceof FindingConvertInputError) {
+          writeJson(response, 400, { error: error.message });
+          return;
+        }
+        writeJson(response, 409, {
+          error:
+            error instanceof Error ? error.message : "Finding conversion failed",
+        });
+      }
+      return;
+    }
+
     if (request.method === "GET" && url.pathname === "/findings/queue") {
       try {
         writeJson(response, 200, dependencies.loadFindingsQueue(url));
@@ -1889,6 +1946,11 @@ function matchFindingAcceptPath(pathname: string) {
 
 function matchFindingDismissPath(pathname: string) {
   const match = /^\/findings\/([^/]+)\/dismiss$/.exec(pathname);
+  return decodePathSegment(match?.[1]);
+}
+
+function matchFindingConvertPath(pathname: string) {
+  const match = /^\/findings\/([^/]+)\/convert$/.exec(pathname);
   return decodePathSegment(match?.[1]);
 }
 
