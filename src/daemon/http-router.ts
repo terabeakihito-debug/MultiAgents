@@ -87,6 +87,7 @@ import {
   NotificationInputError as NotificationPreferencesInputError,
   notificationPreferencesMutationService,
 } from "../core/notification-preferences-mutation-service";
+import { notificationDismissMutationService } from "../core/notification-dismiss-mutation-service";
 import { notificationReadMutationService } from "../core/notification-read-mutation-service";
 import { profileListService } from "../core/profile-list-service";
 import { repoListService } from "../core/repo-list-service";
@@ -174,6 +175,7 @@ type DaemonHttpDependencies = {
   loadCredentialStatus: typeof credentialStatusService.load;
   loadNotifications: typeof notificationListService.load;
   applyNotificationReadMutation: typeof notificationReadMutationService.apply;
+  applyNotificationDismissMutation: typeof notificationDismissMutationService.apply;
   loadFindingsQueue: typeof findingsQueueService.load;
   loadOperationsOverview: typeof operationsOverviewService.load;
   loadDashboardTasks: typeof dashboardTasksService.load;
@@ -241,6 +243,8 @@ export function createDaemonHttpHandler(
     loadNotifications: (url) => notificationListService.load(url),
     applyNotificationReadMutation: (notificationId) =>
       notificationReadMutationService.apply(notificationId),
+    applyNotificationDismissMutation: (notificationId) =>
+      notificationDismissMutationService.apply(notificationId),
     loadFindingsQueue: (url) => findingsQueueService.load(url),
     loadOperationsOverview: () => operationsOverviewService.load(),
     loadDashboardTasks: (url) => dashboardTasksService.load(url),
@@ -1241,6 +1245,44 @@ export function createDaemonHttpHandler(
       return;
     }
 
+    const notificationDismissId = matchNotificationDismissPath(url.pathname);
+    if (notificationDismissId) {
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "notification-dismiss",
+        { label: "Notification" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      try {
+        const notification = dependencies.applyNotificationDismissMutation(
+          notificationDismissId,
+        );
+        if (!notification) {
+          writeJson(response, 404, { error: "Notification not found" });
+          return;
+        }
+        writeJson(response, 200, { notification });
+      } catch (error) {
+        writeJson(response, 400, {
+          error:
+            error instanceof Error
+              ? error.message
+              : "Notification dismissal failed",
+        });
+      }
+      return;
+    }
+
     if (request.method === "GET" && url.pathname === "/notifications") {
       try {
         writeJson(response, 200, dependencies.loadNotifications(url));
@@ -2122,6 +2164,11 @@ function matchFindingPriorityPath(pathname: string) {
 
 function matchNotificationReadPath(pathname: string) {
   const match = /^\/notifications\/([^/]+)\/read$/.exec(pathname);
+  return decodePathSegment(match?.[1]);
+}
+
+function matchNotificationDismissPath(pathname: string) {
+  const match = /^\/notifications\/([^/]+)\/dismiss$/.exec(pathname);
   return decodePathSegment(match?.[1]);
 }
 

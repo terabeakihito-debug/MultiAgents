@@ -136,6 +136,10 @@ function dependencies(
       notificationId: "n-1",
       status: "read",
     })) as never,
+    applyNotificationDismissMutation: vi.fn(() => ({
+      notificationId: "n-1",
+      status: "dismissed",
+    })) as never,
     loadFindingsQueue: vi.fn(() => ({
       findings: [{ findingId: "f-1" }],
       counts: { total: 1 },
@@ -2109,6 +2113,50 @@ describe("daemon HTTP router", () => {
 
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Notification not found" });
+  });
+
+  it("rejects notification dismiss POST without the human mutation gate", async () => {
+    const applyNotificationDismissMutation = vi.fn(() => ({
+      notificationId: "n-1",
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationDismissMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/notifications/n-1/dismiss", {}, ""),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyNotificationDismissMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts notification dismiss POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce(
+      "notification-dismiss",
+    );
+    const notification = { notificationId: "n-1", status: "dismissed" };
+    const applyNotificationDismissMutation = vi.fn(() => notification) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationDismissMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/notifications/n-1/dismiss",
+        authorizedHumanHeaders(nonce, cookie, "notification-dismiss"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual({ notification });
+    expect(applyNotificationDismissMutation).toHaveBeenCalledWith("n-1");
   });
 
   it("rejects a non-loopback Host header on notification listing", async () => {
