@@ -234,6 +234,10 @@ function dependencies(
     applyAgentParallelRunMutation: vi.fn(async () => ({
       results: [{ status: "completed" }],
     })) as never,
+    applyReviewFlowMutation: vi.fn(async () => ({
+      flowId: "flow-1",
+      steps: [],
+    })) as never,
     ...overrides,
   };
 }
@@ -316,6 +320,70 @@ function authorizedHumanHeaders(
 }
 
 describe("daemon HTTP router", () => {
+  it("rejects review flow POST without the human mutation gate", async () => {
+    const applyReviewFlowMutation = vi.fn(async () => ({
+      flowId: "flow-1",
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyReviewFlowMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/flows/review", {}, '{"prompt":"Review this"}'),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyReviewFlowMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts review flow POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("review-run");
+    const payload = { flowId: "flow-1", steps: [{ stepId: "s1" }] };
+    const applyReviewFlowMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyReviewFlowMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/flows/review",
+        authorizedHumanHeaders(nonce, cookie, "review-run"),
+        '{"prompt":"Review this"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyReviewFlowMutation).toHaveBeenCalledWith(
+      { prompt: "Review this" },
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+  });
+
+  it("does not expose nested review flow routes on the daemon", async () => {
+    const applyReviewFlowMutation = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyReviewFlowMutation }),
+    );
+
+    for (const path of ["/flows/review/stream", "/flows/review/rerun"] as const) {
+      const output = response();
+      await handler(
+        postJsonRequest(path, {}, '{"prompt":"Review this"}'),
+        output.value,
+      );
+      expect(output.status()).toBe(404);
+      expect(output.json()).toEqual({ error: "Not found" });
+    }
+
+    expect(applyReviewFlowMutation).not.toHaveBeenCalled();
+  });
+
   it("rejects agent run POST without the human mutation gate", async () => {
     const applyAgentRunMutation = vi.fn(async () => ({
       status: "completed",
