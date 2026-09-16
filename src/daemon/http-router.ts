@@ -129,6 +129,11 @@ import {
   taskCreateMutationService,
 } from "../core/task-create-mutation-service";
 import {
+  ApprovalError,
+  TaskApproveInputError,
+  taskApproveMutationService,
+} from "../core/task-approve-mutation-service";
+import {
   TaskCleanupRequestError,
   taskDeleteMutationService,
 } from "../core/task-delete-mutation-service";
@@ -222,6 +227,7 @@ type DaemonHttpDependencies = {
   initializeTaskDeleteRecovery: typeof taskDeleteMutationService.initialize;
   parseTaskDeleteBody: typeof taskDeleteMutationService.parseDeleteBody;
   removeTask: typeof taskDeleteMutationService.removeTask;
+  applyTaskApproveMutation: typeof taskApproveMutationService.apply;
   loadOutboundSlackSettings: typeof outboundSlackSettingsService.load;
   applyOutboundSlackSettingsMutation: typeof outboundSlackSettingsMutationService.apply;
   loadMaintenanceState: typeof maintenanceStateService.load;
@@ -313,6 +319,8 @@ export function createDaemonHttpHandler(
       taskDeleteMutationService.parseDeleteBody(rawBody),
     removeTask: (id, cleanupRequest) =>
       taskDeleteMutationService.removeTask(id, cleanupRequest),
+    applyTaskApproveMutation: (taskId, body) =>
+      taskApproveMutationService.apply(taskId, body),
     loadOutboundSlackSettings: () => outboundSlackSettingsService.load(),
     applyOutboundSlackSettingsMutation: (body) =>
       outboundSlackSettingsMutationService.apply(body),
@@ -2100,6 +2108,53 @@ export function createDaemonHttpHandler(
       return;
     }
 
+    const taskApproveId = matchTaskApprovePath(url.pathname);
+    if (taskApproveId) {
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "task-approve",
+        { label: "Task approval" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      let body: unknown;
+      try {
+        body = await webRequest.json();
+      } catch {
+        writeJson(response, 400, {
+          error: "Request body must be valid JSON",
+        });
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          await dependencies.applyTaskApproveMutation(taskApproveId, body),
+        );
+      } catch (error) {
+        if (error instanceof TaskApproveInputError) {
+          writeJson(response, 400, { error: error.message });
+          return;
+        }
+        writeJson(response, error instanceof ApprovalError ? error.statusCode : 409, {
+          error:
+            error instanceof Error ? error.message : "Approve and create PR failed",
+        });
+      }
+      return;
+    }
+
     const taskId = matchTaskIdPath(url.pathname);
     if (taskId) {
       if (request.method === "GET") {
@@ -2297,6 +2352,11 @@ function matchRepoLeafPath(pathname: string, leaf: "profile" | "templates" | "pu
 
 function matchTaskIdPath(pathname: string) {
   return decodePathSegment(/^\/tasks\/([^/]+)$/.exec(pathname)?.[1]);
+}
+
+function matchTaskApprovePath(pathname: string) {
+  const match = /^\/tasks\/([^/]+)\/approve$/.exec(pathname);
+  return decodePathSegment(match?.[1]);
 }
 
 function matchTaskFindingsExtractPath(pathname: string) {

@@ -225,6 +225,9 @@ function dependencies(
     initializeTaskDeleteRecovery: vi.fn(async () => undefined) as never,
     parseTaskDeleteBody: vi.fn(() => ({})) as never,
     removeTask: vi.fn(async () => undefined) as never,
+    applyTaskApproveMutation: vi.fn(async () => ({
+      task: { id: "task-1", status: "open" },
+    })) as never,
     applyRetentionPolicyMutation: vi.fn(() => ({ preset: "balanced" })) as never,
     applyCleanupPreviewMutation: vi.fn(async () => ({
       selected: [],
@@ -3024,6 +3027,56 @@ describe("daemon HTTP router", () => {
 
     expect(output.status()).toBe(500);
     expect(output.json()).toEqual({ error: "task_detail_failed" });
+  });
+
+  it("rejects task approve POST without the human mutation gate", async () => {
+    const applyTaskApproveMutation = vi.fn(async () => ({
+      task: { id: "task-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskApproveMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/approve",
+        {},
+        '{"approved":true,"diffHash":"abc","approvalId":"ap-1"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyTaskApproveMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts task approve POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("task-approve");
+    const payload = { task: { id: "task-1", prNumber: 42 } };
+    const applyTaskApproveMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskApproveMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/approve",
+        authorizedHumanHeaders(nonce, cookie, "task-approve"),
+        '{"approved":true,"diffHash":"abc","approvalId":"ap-1"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyTaskApproveMutation).toHaveBeenCalledWith("task-1", {
+      approved: true,
+      diffHash: "abc",
+      approvalId: "ap-1",
+    });
   });
 
   it("rejects task delete without the human mutation gate", async () => {
