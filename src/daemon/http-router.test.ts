@@ -254,6 +254,9 @@ function dependencies(
     applyTaskReassociatePreviewMutation: vi.fn(async () => ({
       preview: { fingerprint: "fp-1" },
     })) as never,
+    applyTaskReassociateMutation: vi.fn(async () => ({
+      task: { id: "task-1" },
+    })) as never,
     applyRetentionPolicyMutation: vi.fn(() => ({ preset: "balanced" })) as never,
     applyCleanupPreviewMutation: vi.fn(async () => ({
       selected: [],
@@ -3066,6 +3069,73 @@ describe("daemon HTTP router", () => {
 
     await handler(
       postJsonRequest("/tasks/task-1/reassociate/preview", {}, ""),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyTaskReassociatePreviewMutation).not.toHaveBeenCalled();
+  });
+
+  it("rejects task reassociate POST without the human mutation gate", async () => {
+    const applyTaskReassociateMutation = vi.fn(async () => ({
+      task: { id: "task-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskReassociateMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/reassociate",
+        {},
+        '{"confirmed":true,"fingerprint":"fp-1"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyTaskReassociateMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts task reassociate POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce(
+      "task-reassociation-confirm",
+    );
+    const payload = { task: { id: "task-1", worktreeStatus: "available" } };
+    const applyTaskReassociateMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskReassociateMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/reassociate",
+        authorizedHumanHeaders(nonce, cookie, "task-reassociation-confirm"),
+        '{"confirmed":true,"fingerprint":"fp-1"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyTaskReassociateMutation).toHaveBeenCalledWith("task-1", {
+      confirmed: true,
+      fingerprint: "fp-1",
+    });
+  });
+
+  it("does not treat reassociate confirm as preview", async () => {
+    const applyTaskReassociatePreviewMutation = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskReassociatePreviewMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/tasks/task-1/reassociate", {}, '{"confirmed":true,"fingerprint":"fp-1"}'),
       output.value,
     );
 
