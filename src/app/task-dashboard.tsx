@@ -167,13 +167,3 @@ function relativeTime(value: string) {
   if (elapsed < 86_400_000) return `${Math.floor(elapsed / 3_600_000)} hr ago`;
   return `${Math.floor(elapsed / 86_400_000)} days ago`;
 }
-
-function baseLabel(task: DashboardTask) {
-  if (task.baseState === "base_advanced") return `Advanced by ${task.baseAheadCount ?? "?"} commits`;
-  return task.baseState?.replace("base_", "") || "unchecked";
-}
-function formatBytes(value: number) {
-  if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(1)} GB`;
-  if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(1)} MB`;
-  return `${Math.ceil(value / 1024)} KB`;
-}

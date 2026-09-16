@@ -73,7 +73,7 @@ const initialSteps = (): FlowStep[] => [
 export default function Home() {
   const [prompt, setPrompt] = useState("");
   const [mode, setMode] = useState<Mode>("parallel");
-  const [cards, setCards] = useState(initialCards);
+  const [, setCards] = useState(initialCards);
   const [steps, setSteps] = useState(initialSteps);
   const [flowStatus, setFlowStatus] = useState<ReviewFlowResult["status"] | "idle" | "running">("idle");
   const [finalOutput, setFinalOutput] = useState("");
@@ -83,7 +83,7 @@ export default function Home() {
   const [repoId, setRepoId] = useState("");
   const [templateId, setTemplateId] = useState("");
   const [templateOverrideId, setTemplateOverrideId] = useState<string | undefined>();
-  const [openPulls, setOpenPulls] = useState<OpenPull[]>([]);
+  const [, setOpenPulls] = useState<OpenPull[]>([]);
   const [task, setTask] = useState<RepoTask | null>(null);
   const [dashboardRefresh, setDashboardRefresh] = useState(0);
   const [dashboardView, setDashboardView] = useState<"tasks" | "findings" | "operations" | "settings">("tasks");
@@ -197,18 +197,6 @@ export default function Home() {
       const data = await response.json() as { pulls?: OpenPull[]; error?: string };
       if (!response.ok) throw new Error(data.error || "Could not list pull requests");
       setOpenPulls(data.pulls ?? []);
-    } catch (error) { setTaskError(message(error)); }
-    finally { setReviewProcessing(false); }
-  }
-
-  async function recoverPull(prNumber: number) {
-    if (!repoId || reviewProcessing) return;
-    setReviewProcessing(true); setTaskError("");
-    try {
-      const response = await humanMutationFetch("/api/tasks/recover-pr", "task-recover-pr", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repoId, prNumber }) });
-      const data = await response.json() as { task?: RepoTask; error?: string };
-      if (!response.ok || !data.task) throw new Error(data.error || "PR task recovery failed");
-      setTask(data.task); setMode("review"); setOpenPulls([]); if (data.task.worktreeAvailable) await refreshDiff(data.task); else await loadTaskHistory(data.task.id);
     } catch (error) { setTaskError(message(error)); }
     finally { setReviewProcessing(false); }
   }
@@ -363,7 +351,6 @@ export default function Home() {
     setFlowStatus(event.result.status);
   }
 
-  function cancelFlow() { flowAbortRef.current?.abort(new Error("Cancelled by user")); }
 
   async function approveFinalDiff() {
     if (!task || !reviewedDiff || !approval?.diffHash || !approval.approvalId || approvalProcessing) return;
@@ -724,7 +711,6 @@ function PrReviewPanel({ task, processing, onFetch, onApply }: { task: RepoTask;
   </section>;
 }
 
-function AgentCard({ name, state }: { name: string; state: CardState }) { return <article className="card"><div className="cardHeader"><h2>{name}</h2><Status domain="flow" value={state.status} /></div>{state.error && <ErrorBlock error={state.error} />}<pre className="output">{state.output || fallback(state.status)}</pre></article>; }
 function FlowTimeline({ steps, versions, status, finalOutput, sending, activeRerun, rerunAvailable, onRerun }: { steps: FlowStep[]; versions: StepVersion[]; status: ReviewFlowResult["status"] | "idle" | "running"; finalOutput: string; sending: boolean; activeRerun: RerunnableStepId | null; rerunAvailable: boolean; onRerun: (id: RerunnableStepId) => void }) { return <section className="flow" aria-label="Review flow"><div className="flowTitle"><h2>Review Flow</h2><Status domain="flow" value={status} /></div>{flowStepIds.map((id, index) => { const step = steps.find((item) => item.id === id)!; const stepVersions = versions.filter((item) => item.stepId === id); const rerunnable = canRerunFailedReviewStep(step, rerunAvailable); return <div key={id}><article className={`card flowStep ${step.role === "final" ? "finalStep" : ""}`}><div className="cardHeader"><div><span className="stepNumber">Step {index + 1}</span><h2>{labels[step.agent]} — {roleLabels[step.role]}</h2></div><Status domain="flow" value={step.status} /></div><div className="duration">{step.status === "running" ? activeRerun === id ? "Re-running..." : "Running..." : <>Duration: {step.durationMs === undefined ? "—" : formatDuration(step.durationMs)}</>}</div>{step.error && (step.status === "stale" ? <div className="staleReason">{step.error}</div> : <ErrorBlock error={step.error} />)}{stepVersions.length > 1 ? <StepVersionViewer key={`${id}-${stepVersions.at(-1)?.version}`} versions={stepVersions} /> : <pre className="output">{step.output || fallback(step.status)}</pre>}{rerunnable && <button className="rerun" type="button" disabled={sending} onClick={() => onRerun(id as RerunnableStepId)}>Re-run</button>}</article>{index < steps.length - 1 && <div className="arrow" aria-hidden="true">↓</div>}</div>; })}{finalOutput && <article className="card finalOutput"><h2>Final Output</h2><pre className="output">{finalOutput}</pre></article>}</section>; }
 
 function StepVersionViewer({ versions }: { versions: StepVersion[] }) {
