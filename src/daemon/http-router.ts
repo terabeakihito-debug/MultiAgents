@@ -53,6 +53,7 @@ import {
 import { notificationPreferencesService } from "../core/notification-preferences-service";
 import { profileListService } from "../core/profile-list-service";
 import { repoListService } from "../core/repo-list-service";
+import { retentionPolicyService } from "../core/retention-policy-service";
 import { taskService } from "../core/task-service";
 import {
   healthReadiness,
@@ -79,6 +80,7 @@ type DaemonHttpDependencies = {
   loadDashboardTasks: typeof dashboardTasksService.load;
   loadRuntimeSandboxStatus: typeof runtimeSandboxStatusService.load;
   loadNotificationPreferences: typeof notificationPreferencesService.load;
+  loadRetentionPolicy: typeof retentionPolicyService.load;
 };
 
 export function createDaemonHttpHandler(
@@ -102,6 +104,7 @@ export function createDaemonHttpHandler(
     loadDashboardTasks: (url) => dashboardTasksService.load(url),
     loadRuntimeSandboxStatus: () => runtimeSandboxStatusService.load(),
     loadNotificationPreferences: () => notificationPreferencesService.load(),
+    loadRetentionPolicy: () => retentionPolicyService.load(),
   },
 ) {
   return async function handleDaemonHttp(
@@ -171,6 +174,19 @@ export function createDaemonHttpHandler(
           error instanceof Error ? error.message : "unknown",
         );
         writeJson(response, 500, { error: "credential_status_failed" });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/retention-policy") {
+      try {
+        writeJson(response, 200, dependencies.loadRetentionPolicy());
+      } catch (error) {
+        console.error(
+          "daemon_retention_policy_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "retention_policy_failed" });
       }
       return;
     }

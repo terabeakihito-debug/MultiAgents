@@ -138,6 +138,9 @@ function dependencies(
     loadNotificationPreferences: vi.fn(() => ({
       preferences: { taskInactive: true },
     })) as never,
+    loadRetentionPolicy: vi.fn(() => ({
+      preset: "conservative",
+    })) as never,
     ...overrides,
   };
 }
@@ -341,6 +344,70 @@ describe("daemon HTTP router", () => {
       error: "This API is available only on localhost",
     });
     expect(loadCredentialStatus).not.toHaveBeenCalled();
+  });
+
+  it("serves retention policy through the core retention-policy boundary", async () => {
+    const payload = { preset: "balanced" };
+    const loadRetentionPolicy = vi.fn(() => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRetentionPolicy }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/retention-policy"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadRetentionPolicy).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a stable error when retention policy loading fails", async () => {
+    const loadRetentionPolicy = vi.fn(() => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRetentionPolicy }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/retention-policy"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "retention_policy_failed" });
+  });
+
+  it("does not expose retention policy mutations on the daemon", async () => {
+    const loadRetentionPolicy = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRetentionPolicy }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/retention-policy"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadRetentionPolicy).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on retention policy", async () => {
+    const loadRetentionPolicy = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRetentionPolicy }),
+    );
+    const output = response();
+    const incoming = request("GET", "/retention-policy");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadRetentionPolicy).not.toHaveBeenCalled();
   });
 
   it("serves notification preferences through the core notification-preferences boundary", async () => {
