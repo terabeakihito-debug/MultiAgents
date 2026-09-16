@@ -103,6 +103,10 @@ import {
   notificationSlackRetryMutationService,
 } from "../core/notification-slack-retry-mutation-service";
 import { profileListService } from "../core/profile-list-service";
+import {
+  RepoCloneInputError,
+  repoCloneMutationService,
+} from "../core/repo-clone-mutation-service";
 import { repoListService } from "../core/repo-list-service";
 import {
   repoProfileService,
@@ -229,6 +233,7 @@ type DaemonHttpDependencies = {
   loadTaskRuntimePolicy: typeof taskRuntimePolicyService.load;
   loadProfileList: typeof profileListService.load;
   loadRepoList: typeof repoListService.load;
+  applyRepoCloneMutation: typeof repoCloneMutationService.apply;
   loadCredentialStatus: typeof credentialStatusService.load;
   loadNotifications: typeof notificationListService.load;
   applyNotificationReadMutation: typeof notificationReadMutationService.apply;
@@ -312,6 +317,7 @@ export function createDaemonHttpHandler(
     loadTaskRuntimePolicy: (id) => taskRuntimePolicyService.load(id),
     loadProfileList: () => profileListService.load(),
     loadRepoList: () => repoListService.load(),
+    applyRepoCloneMutation: (body) => repoCloneMutationService.apply(body),
     loadCredentialStatus: () => credentialStatusService.load(),
     loadNotifications: (url) => notificationListService.load(url),
     applyNotificationReadMutation: (notificationId) =>
@@ -913,6 +919,48 @@ export function createDaemonHttpHandler(
           error instanceof Error ? error.message : "unknown",
         );
         writeJson(response, 500, { error: "profile_list_failed" });
+      }
+      return;
+    }
+
+    if (url.pathname === "/repos/clone") {
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "repository-clone",
+        { label: "Project" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      let body: unknown;
+      try {
+        body = await webRequest.json();
+      } catch {
+        writeJson(response, 400, {
+          error: "Request body must be valid JSON",
+        });
+        return;
+      }
+
+      try {
+        writeJson(response, 201, await dependencies.applyRepoCloneMutation(body));
+      } catch (error) {
+        if (error instanceof RepoCloneInputError) {
+          writeJson(response, 400, { error: error.message });
+          return;
+        }
+        writeJson(response, 400, {
+          error:
+            error instanceof Error ? error.message : "Could not add the GitHub project",
+        });
       }
       return;
     }

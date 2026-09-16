@@ -125,6 +125,9 @@ function dependencies(
     loadRepoList: vi.fn(async () => ({
       repos: [{ id: "repo-1", templates: [], settings: {} }],
     })) as never,
+    applyRepoCloneMutation: vi.fn(async () => ({
+      repo: { id: "repo-1", name: "proj" },
+    })) as never,
     loadCredentialStatus: vi.fn(() => ({
       credentials: [{ capability: "github", status: "ready" }],
     })) as never,
@@ -1212,6 +1215,54 @@ describe("daemon HTTP router", () => {
 
     expect(output.status()).toBe(500);
     expect(output.json()).toEqual({ error: "repo_list_failed" });
+  });
+
+  it("rejects repo clone POST without the human mutation gate", async () => {
+    const applyRepoCloneMutation = vi.fn(async () => ({
+      repo: { id: "repo-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyRepoCloneMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/repos/clone",
+        {},
+        '{"githubUrl":"https://github.com/o/r"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyRepoCloneMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts repo clone POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("repository-clone");
+    const payload = { repo: { id: "repo-1", name: "proj" } };
+    const applyRepoCloneMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyRepoCloneMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/repos/clone",
+        authorizedHumanHeaders(nonce, cookie, "repository-clone"),
+        '{"githubUrl":"https://github.com/o/r"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(201);
+    expect(output.json()).toEqual(payload);
+    expect(applyRepoCloneMutation).toHaveBeenCalledWith({
+      githubUrl: "https://github.com/o/r",
+    });
   });
 
   it("does not expose repository listing on unsupported methods", async () => {
