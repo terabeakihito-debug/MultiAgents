@@ -55,6 +55,10 @@ import {
   NotificationInputError,
 } from "../core/notification-list-service";
 import { notificationPreferencesService } from "../core/notification-preferences-service";
+import {
+  NotificationInputError as NotificationPreferencesInputError,
+  notificationPreferencesMutationService,
+} from "../core/notification-preferences-mutation-service";
 import { profileListService } from "../core/profile-list-service";
 import { repoListService } from "../core/repo-list-service";
 import {
@@ -125,6 +129,7 @@ type DaemonHttpDependencies = {
   loadDashboardTasks: typeof dashboardTasksService.load;
   loadRuntimeSandboxStatus: typeof runtimeSandboxStatusService.load;
   loadNotificationPreferences: typeof notificationPreferencesService.load;
+  applyNotificationPreferencesMutation: typeof notificationPreferencesMutationService.apply;
   loadRetentionPolicy: typeof retentionPolicyService.load;
   applyRetentionPolicyMutation: typeof retentionPolicyMutationService.apply;
   loadCleanupCandidates: typeof cleanupCandidatesService.load;
@@ -169,6 +174,8 @@ export function createDaemonHttpHandler(
     loadDashboardTasks: (url) => dashboardTasksService.load(url),
     loadRuntimeSandboxStatus: () => runtimeSandboxStatusService.load(),
     loadNotificationPreferences: () => notificationPreferencesService.load(),
+    applyNotificationPreferencesMutation: (body) =>
+      notificationPreferencesMutationService.apply(body),
     loadRetentionPolicy: () => retentionPolicyService.load(),
     applyRetentionPolicyMutation: (body) =>
       retentionPolicyMutationService.apply(body),
@@ -702,16 +709,60 @@ export function createDaemonHttpHandler(
       return;
     }
 
-    if (request.method === "GET" && url.pathname === "/notification-preferences") {
-      try {
-        writeJson(response, 200, dependencies.loadNotificationPreferences());
-      } catch (error) {
-        console.error(
-          "daemon_notification_preferences_failed",
-          error instanceof Error ? error.message : "unknown",
-        );
-        writeJson(response, 500, { error: "notification_preferences_failed" });
+    if (url.pathname === "/notification-preferences") {
+      if (request.method === "GET") {
+        try {
+          writeJson(response, 200, dependencies.loadNotificationPreferences());
+        } catch (error) {
+          console.error(
+            "daemon_notification_preferences_failed",
+            error instanceof Error ? error.message : "unknown",
+          );
+          writeJson(response, 500, { error: "notification_preferences_failed" });
+        }
+        return;
       }
+
+      if (request.method === "POST") {
+        const webRequest = await toWebRequestWithBody(request);
+        const rejection = dependencies.rejectHumanMutation(
+          webRequest,
+          "notification-preferences",
+          { label: "Notification" },
+        );
+        if (rejection) {
+          await writeWebResponse(response, rejection);
+          return;
+        }
+
+        let body: unknown;
+        try {
+          body = await webRequest.json();
+        } catch {
+          writeJson(response, 400, {
+            error: "Request body must be valid JSON",
+          });
+          return;
+        }
+
+        try {
+          writeJson(
+            response,
+            200,
+            dependencies.applyNotificationPreferencesMutation(body),
+          );
+        } catch (error) {
+          writeJson(response, error instanceof NotificationPreferencesInputError ? 400 : 500, {
+            error:
+              error instanceof Error
+                ? error.message
+                : "Preferences update failed",
+          });
+        }
+        return;
+      }
+
+      writeJson(response, 404, { error: "Not found" });
       return;
     }
 

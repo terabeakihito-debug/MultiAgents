@@ -213,6 +213,9 @@ function dependencies(
     createStateBackup: vi.fn(async () => ({
       backup: { backupId: "b-new", verified: false },
     })) as never,
+    applyNotificationPreferencesMutation: vi.fn(() => ({
+      preferences: { taskInactive: true },
+    })) as never,
     ...overrides,
   };
 }
@@ -1472,18 +1475,54 @@ describe("daemon HTTP router", () => {
     expect(output.json()).toEqual({ error: "notification_preferences_failed" });
   });
 
-  it("does not expose notification preferences mutations on the daemon", async () => {
-    const loadNotificationPreferences = vi.fn() as never;
+  it("rejects notification preferences POST without the human mutation gate", async () => {
+    const applyNotificationPreferencesMutation = vi.fn(() => ({
+      preferences: { taskInactive: true },
+    })) as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ loadNotificationPreferences }),
+      dependencies({ applyNotificationPreferencesMutation }),
     );
     const output = response();
 
-    await handler(request("POST", "/notification-preferences"), output.value);
+    await handler(
+      postJsonRequest(
+        "/notification-preferences",
+        {},
+        '{"taskInactive":true}',
+      ),
+      output.value,
+    );
 
-    expect(output.status()).toBe(404);
-    expect(output.json()).toEqual({ error: "Not found" });
-    expect(loadNotificationPreferences).not.toHaveBeenCalled();
+    expect(output.status()).toBe(403);
+    expect(applyNotificationPreferencesMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts notification preferences POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce(
+      "notification-preferences",
+    );
+    const payload = { preferences: { taskInactive: false } };
+    const applyNotificationPreferencesMutation = vi.fn(() => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationPreferencesMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/notification-preferences",
+        authorizedHumanHeaders(nonce, cookie, "notification-preferences"),
+        '{"taskInactive":false}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyNotificationPreferencesMutation).toHaveBeenCalledWith({
+      taskInactive: false,
+    });
   });
 
   it("rejects a non-loopback Host header on notification preferences", async () => {
