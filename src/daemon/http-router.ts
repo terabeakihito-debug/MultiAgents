@@ -71,6 +71,10 @@ import { humanSessionService } from "../core/human-session-service";
 import { maintenanceStateService } from "../core/maintenance-state-service";
 import { retentionPolicyService } from "../core/retention-policy-service";
 import { stateBackupsService } from "../core/state-backups-service";
+import {
+  BackupValidationError,
+  stateBackupValidateService,
+} from "../core/state-backup-validate-service";
 import { taskService } from "../core/task-service";
 import {
   healthReadiness,
@@ -106,6 +110,7 @@ type DaemonHttpDependencies = {
   loadOutboundSlackSettings: typeof outboundSlackSettingsService.load;
   loadMaintenanceState: typeof maintenanceStateService.load;
   loadStateBackups: typeof stateBackupsService.load;
+  loadStateBackupValidate: typeof stateBackupValidateService.load;
 };
 
 export function createDaemonHttpHandler(
@@ -138,6 +143,8 @@ export function createDaemonHttpHandler(
     loadOutboundSlackSettings: () => outboundSlackSettingsService.load(),
     loadMaintenanceState: () => maintenanceStateService.load(),
     loadStateBackups: () => stateBackupsService.load(),
+    loadStateBackupValidate: (backupId) =>
+      stateBackupValidateService.load(backupId),
   },
 ) {
   return async function handleDaemonHttp(
@@ -194,6 +201,38 @@ export function createDaemonHttpHandler(
           error instanceof Error ? error.message : "unknown",
         );
         writeJson(response, 500, { error: "maintenance_state_failed" });
+      }
+      return;
+    }
+
+    const stateBackupValidateId = matchStateBackupValidatePath(url.pathname);
+    if (stateBackupValidateId) {
+      if (request.method !== "GET") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          dependencies.loadStateBackupValidate(stateBackupValidateId),
+        );
+      } catch (error) {
+        if (error instanceof BackupValidationError) {
+          writeJson(response, 400, { error: error.message });
+          return;
+        }
+        console.error(
+          "daemon_state_backup_validate_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, {
+          error:
+            error instanceof Error
+              ? error.message
+              : "Backup validation failed",
+        });
       }
       return;
     }
@@ -791,6 +830,11 @@ function isLoopbackHost(hostHeader: string) {
   } catch {
     return false;
   }
+}
+
+function matchStateBackupValidatePath(pathname: string) {
+  const match = /^\/state\/backups\/([^/]+)\/validate$/.exec(pathname);
+  return decodePathSegment(match?.[1]);
 }
 
 function matchRepoLeafPath(pathname: string, leaf: "profile" | "templates" | "pulls") {

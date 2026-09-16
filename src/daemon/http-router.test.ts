@@ -180,6 +180,9 @@ function dependencies(
       backups: [{ backupId: "b-1" }],
       latest: { backupId: "b-1" },
     })) as never,
+    loadStateBackupValidate: vi.fn((backupId: string) => ({
+      backup: { backupId, verified: true },
+    })) as never,
     ...overrides,
   };
 }
@@ -353,18 +356,53 @@ describe("daemon HTTP router", () => {
     expect(loadStateBackups).not.toHaveBeenCalled();
   });
 
-  it("does not treat backup validate as the backups list", async () => {
+  it("serves state backup validate through the core validate boundary", async () => {
+    const payload = {
+      backup: { backupId: "b-1", verified: true },
+    };
+    const loadStateBackupValidate = vi.fn(() => payload) as never;
     const loadStateBackups = vi.fn() as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ loadStateBackups }),
+      dependencies({ loadStateBackupValidate, loadStateBackups }),
     );
     const output = response();
 
     await handler(request("GET", "/state/backups/b-1/validate"), output.value);
 
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(loadStateBackupValidate).toHaveBeenCalledWith("b-1");
+    expect(loadStateBackups).not.toHaveBeenCalled();
+  });
+
+  it("maps backup validation client errors to 400", async () => {
+    const { BackupValidationError } = await import("../server/state-backup");
+    const loadStateBackupValidate = vi.fn(() => {
+      throw new BackupValidationError("Backup metadata not found");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadStateBackupValidate }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/state/backups/b-1/validate"), output.value);
+
+    expect(output.status()).toBe(400);
+    expect(output.json()).toEqual({ error: "Backup metadata not found" });
+  });
+
+  it("does not expose backup validate mutation on the daemon", async () => {
+    const loadStateBackupValidate = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadStateBackupValidate }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/state/backups/b-1/validate"), output.value);
+
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Not found" });
-    expect(loadStateBackups).not.toHaveBeenCalled();
+    expect(loadStateBackupValidate).not.toHaveBeenCalled();
   });
 
   it("rejects a non-loopback Host header on state backups", async () => {
