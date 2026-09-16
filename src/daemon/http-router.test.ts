@@ -220,6 +220,9 @@ function dependencies(
       configured: true,
       config: { enabled: true },
     })) as never,
+    applyRepoProfileMutation: vi.fn(async () => ({
+      profile: { repoId: "repo-1", profileId: "safe_default" },
+    })) as never,
     ...overrides,
   };
 }
@@ -925,18 +928,56 @@ describe("daemon HTTP router", () => {
     expect(output.json()).toEqual({ error: "repo_profile_failed" });
   });
 
-  it("does not expose repository profile mutations on the daemon", async () => {
-    const loadRepoProfile = vi.fn() as never;
+  it("rejects repository profile POST without the human mutation gate", async () => {
+    const applyRepoProfileMutation = vi.fn(async () => ({
+      profile: { repoId: "repo-1" },
+    })) as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ loadRepoProfile }),
+      dependencies({ applyRepoProfileMutation }),
     );
     const output = response();
 
-    await handler(request("POST", "/repos/repo-1/profile"), output.value);
+    await handler(
+      postJsonRequest(
+        "/repos/repo-1/profile",
+        {},
+        '{"confirmation":true,"name":"safe_default","enabled":true}',
+      ),
+      output.value,
+    );
 
-    expect(output.status()).toBe(404);
-    expect(output.json()).toEqual({ error: "Not found" });
-    expect(loadRepoProfile).not.toHaveBeenCalled();
+    expect(output.status()).toBe(403);
+    expect(applyRepoProfileMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts repository profile POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("profile-save");
+    const payload = {
+      profile: { repoId: "repo-1", profileId: "safe_default" },
+    };
+    const applyRepoProfileMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyRepoProfileMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/repos/repo-1/profile",
+        authorizedHumanHeaders(nonce, cookie, "profile-save"),
+        '{"confirmation":true,"name":"safe_default","enabled":true}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyRepoProfileMutation).toHaveBeenCalledWith("repo-1", {
+      confirmation: true,
+      name: "safe_default",
+      enabled: true,
+    });
   });
 
   it("does not treat repository templates as repository profile", async () => {

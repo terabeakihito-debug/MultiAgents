@@ -69,6 +69,7 @@ import {
   repoProfileService,
   RepoProfileNotFoundError,
 } from "../core/repo-profile-service";
+import { repoProfileMutationService } from "../core/repo-profile-mutation-service";
 import {
   repoPullsService,
   RepoPullsRequestError,
@@ -140,6 +141,7 @@ type DaemonHttpDependencies = {
   applyCleanupPreviewMutation: typeof cleanupPreviewMutationService.apply;
   applyCleanupExecuteMutation: typeof cleanupExecuteMutationService.apply;
   loadRepoProfile: typeof repoProfileService.load;
+  applyRepoProfileMutation: typeof repoProfileMutationService.apply;
   loadRepoTemplates: typeof repoTemplatesService.load;
   loadRepoPulls: typeof repoPullsService.load;
   issueHumanSession: typeof humanSessionService.issue;
@@ -190,6 +192,8 @@ export function createDaemonHttpHandler(
     applyCleanupExecuteMutation: (body) =>
       cleanupExecuteMutationService.apply(body),
     loadRepoProfile: (repoId) => repoProfileService.load(repoId),
+    applyRepoProfileMutation: (repoId, body) =>
+      repoProfileMutationService.apply(repoId, body),
     loadRepoTemplates: (repoId) => repoTemplatesService.load(repoId),
     loadRepoPulls: (repoId) => repoPullsService.load(repoId),
     issueHumanSession: (webRequest) => humanSessionService.issue(webRequest),
@@ -511,28 +515,65 @@ export function createDaemonHttpHandler(
 
     const repoProfileId = matchRepoLeafPath(url.pathname, "profile");
     if (repoProfileId) {
-      if (request.method !== "GET") {
-        writeJson(response, 404, { error: "Not found" });
+      if (request.method === "GET") {
+        try {
+          writeJson(
+            response,
+            200,
+            await dependencies.loadRepoProfile(repoProfileId),
+          );
+        } catch (error) {
+          if (error instanceof RepoProfileNotFoundError) {
+            writeJson(response, 404, { error: error.message });
+            return;
+          }
+          console.error(
+            "daemon_repo_profile_failed",
+            error instanceof Error ? error.message : "unknown",
+          );
+          writeJson(response, 500, { error: "repo_profile_failed" });
+        }
         return;
       }
 
-      try {
-        writeJson(
-          response,
-          200,
-          await dependencies.loadRepoProfile(repoProfileId),
+      if (request.method === "POST") {
+        const webRequest = await toWebRequestWithBody(request);
+        const rejection = dependencies.rejectHumanMutation(
+          webRequest,
+          "profile-save",
+          { label: "Profile" },
         );
-      } catch (error) {
-        if (error instanceof RepoProfileNotFoundError) {
-          writeJson(response, 404, { error: error.message });
+        if (rejection) {
+          await writeWebResponse(response, rejection);
           return;
         }
-        console.error(
-          "daemon_repo_profile_failed",
-          error instanceof Error ? error.message : "unknown",
-        );
-        writeJson(response, 500, { error: "repo_profile_failed" });
+
+        let body: unknown;
+        try {
+          body = await webRequest.json();
+        } catch {
+          writeJson(response, 400, {
+            error: "Request body must be valid JSON",
+          });
+          return;
+        }
+
+        try {
+          writeJson(
+            response,
+            200,
+            await dependencies.applyRepoProfileMutation(repoProfileId, body),
+          );
+        } catch (error) {
+          writeJson(response, 400, {
+            error:
+              error instanceof Error ? error.message : "Profile update failed",
+          });
+        }
+        return;
       }
+
+      writeJson(response, 404, { error: "Not found" });
       return;
     }
 
