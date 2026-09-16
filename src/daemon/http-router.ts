@@ -37,6 +37,10 @@ import {
 } from "../core/task-sandbox-policy-service";
 import { credentialStatusService } from "../core/credential-status-service";
 import {
+  findingsQueueService,
+  RemediationQueueQueryError,
+} from "../core/findings-queue-service";
+import {
   notificationListService,
   NotificationInputError,
 } from "../core/notification-list-service";
@@ -63,6 +67,7 @@ type DaemonHttpDependencies = {
   loadRepoList: typeof repoListService.load;
   loadCredentialStatus: typeof credentialStatusService.load;
   loadNotifications: typeof notificationListService.load;
+  loadFindingsQueue: typeof findingsQueueService.load;
 };
 
 export function createDaemonHttpHandler(
@@ -81,6 +86,7 @@ export function createDaemonHttpHandler(
     loadRepoList: () => repoListService.load(),
     loadCredentialStatus: () => credentialStatusService.load(),
     loadNotifications: (url) => notificationListService.load(url),
+    loadFindingsQueue: (url) => findingsQueueService.load(url),
   },
 ) {
   return async function handleDaemonHttp(
@@ -167,6 +173,23 @@ export function createDaemonHttpHandler(
           error instanceof Error ? error.message : "unknown",
         );
         writeJson(response, 500, { error: "notification_list_failed" });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/findings/queue") {
+      try {
+        writeJson(response, 200, dependencies.loadFindingsQueue(url));
+      } catch (error) {
+        if (error instanceof RemediationQueueQueryError) {
+          writeJson(response, 400, { error: error.message });
+          return;
+        }
+        console.error(
+          "daemon_findings_queue_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "findings_queue_failed" });
       }
       return;
     }

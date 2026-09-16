@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { describe, expect, it, vi } from "vitest";
 import { TaskCiNotFoundError } from "../core/task-ci-service";
+import { RemediationQueueQueryError } from "../core/findings-queue-service";
 import { NotificationInputError } from "../core/notification-list-service";
 import {
   TaskPrConflictError,
@@ -114,6 +115,12 @@ function dependencies(
     loadNotifications: vi.fn(() => ({
       notifications: [{ id: "n-1" }],
       unreadCount: 1,
+    })) as never,
+    loadFindingsQueue: vi.fn(() => ({
+      findings: [{ findingId: "f-1" }],
+      counts: { total: 1 },
+      limit: 100,
+      offset: 0,
     })) as never,
     ...overrides,
   };
@@ -403,6 +410,93 @@ describe("daemon HTTP router", () => {
       error: "This API is available only on localhost",
     });
     expect(loadNotifications).not.toHaveBeenCalled();
+  });
+
+  it("serves the findings queue through the core findings-queue boundary", async () => {
+    const payload = {
+      findings: [{ findingId: "f-1" }],
+      counts: { total: 1 },
+      limit: 50,
+      offset: 0,
+    };
+    const loadFindingsQueue = vi.fn(() => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadFindingsQueue }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/findings/queue?limit=50"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadFindingsQueue).toHaveBeenCalledTimes(1);
+    const calledUrl = (loadFindingsQueue as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as URL;
+    expect(calledUrl.pathname).toBe("/findings/queue");
+    expect(calledUrl.searchParams.get("limit")).toBe("50");
+  });
+
+  it("returns 400 when findings queue query parameters are invalid", async () => {
+    const loadFindingsQueue = vi.fn(() => {
+      throw new RemediationQueueQueryError("Invalid sort order");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadFindingsQueue }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/findings/queue?sort=bad"), output.value);
+
+    expect(output.status()).toBe(400);
+    expect(output.json()).toEqual({ error: "Invalid sort order" });
+  });
+
+  it("returns a stable error when findings queue loading fails unexpectedly", async () => {
+    const loadFindingsQueue = vi.fn(() => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadFindingsQueue }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/findings/queue"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "findings_queue_failed" });
+  });
+
+  it("does not expose findings queue on unsupported methods", async () => {
+    const loadFindingsQueue = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadFindingsQueue }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/findings/queue"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadFindingsQueue).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on findings queue", async () => {
+    const loadFindingsQueue = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadFindingsQueue }),
+    );
+    const output = response();
+    const incoming = request("GET", "/findings/queue");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadFindingsQueue).not.toHaveBeenCalled();
   });
 
   it("serves the task list through the core task boundary", async () => {
