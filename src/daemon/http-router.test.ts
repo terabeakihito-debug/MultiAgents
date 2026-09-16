@@ -140,6 +140,7 @@ function dependencies(
       notificationId: "n-1",
       status: "dismissed",
     })) as never,
+    applyNotificationReadAllMutation: vi.fn(() => ({ updated: 2 })) as never,
     loadFindingsQueue: vi.fn(() => ({
       findings: [{ findingId: "f-1" }],
       counts: { total: 1 },
@@ -2113,6 +2114,60 @@ describe("daemon HTTP router", () => {
 
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Notification not found" });
+  });
+
+  it("rejects notification read-all POST without the human mutation gate", async () => {
+    const applyNotificationReadAllMutation = vi.fn(() => ({ updated: 1 })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationReadAllMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/notifications/read-all", {}, ""),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyNotificationReadAllMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts notification read-all POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce(
+      "notification-read-all",
+    );
+    const applyNotificationReadAllMutation = vi.fn(() => ({ updated: 4 })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationReadAllMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/notifications/read-all",
+        authorizedHumanHeaders(nonce, cookie, "notification-read-all"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual({ updated: 4 });
+    expect(applyNotificationReadAllMutation).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not expose notification read-all on unsupported methods", async () => {
+    const applyNotificationReadAllMutation = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationReadAllMutation }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/notifications/read-all"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(applyNotificationReadAllMutation).not.toHaveBeenCalled();
   });
 
   it("rejects notification dismiss POST without the human mutation gate", async () => {

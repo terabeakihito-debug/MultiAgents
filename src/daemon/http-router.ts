@@ -88,6 +88,7 @@ import {
   notificationPreferencesMutationService,
 } from "../core/notification-preferences-mutation-service";
 import { notificationDismissMutationService } from "../core/notification-dismiss-mutation-service";
+import { notificationReadAllMutationService } from "../core/notification-read-all-mutation-service";
 import { notificationReadMutationService } from "../core/notification-read-mutation-service";
 import { profileListService } from "../core/profile-list-service";
 import { repoListService } from "../core/repo-list-service";
@@ -176,6 +177,7 @@ type DaemonHttpDependencies = {
   loadNotifications: typeof notificationListService.load;
   applyNotificationReadMutation: typeof notificationReadMutationService.apply;
   applyNotificationDismissMutation: typeof notificationDismissMutationService.apply;
+  applyNotificationReadAllMutation: typeof notificationReadAllMutationService.apply;
   loadFindingsQueue: typeof findingsQueueService.load;
   loadOperationsOverview: typeof operationsOverviewService.load;
   loadDashboardTasks: typeof dashboardTasksService.load;
@@ -245,6 +247,8 @@ export function createDaemonHttpHandler(
       notificationReadMutationService.apply(notificationId),
     applyNotificationDismissMutation: (notificationId) =>
       notificationDismissMutationService.apply(notificationId),
+    applyNotificationReadAllMutation: () =>
+      notificationReadAllMutationService.apply(),
     loadFindingsQueue: (url) => findingsQueueService.load(url),
     loadOperationsOverview: () => operationsOverviewService.load(),
     loadDashboardTasks: (url) => dashboardTasksService.load(url),
@@ -1206,6 +1210,27 @@ export function createDaemonHttpHandler(
       }
 
       writeJson(response, 404, { error: "Not found" });
+      return;
+    }
+
+    if (url.pathname === "/notifications/read-all") {
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "notification-read-all",
+        { label: "Notification" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      writeJson(response, 200, dependencies.applyNotificationReadAllMutation());
       return;
     }
 
