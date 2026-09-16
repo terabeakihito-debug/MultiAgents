@@ -198,27 +198,41 @@ function dependencies(
     createTaskFromBody: vi.fn(async () => ({
       task: { id: "task-new", repoId: "repo-1" },
     })) as never,
+    initializeTaskDeleteRecovery: vi.fn(async () => undefined) as never,
+    parseTaskDeleteBody: vi.fn(() => ({})) as never,
+    removeTask: vi.fn(async () => undefined) as never,
     ...overrides,
   };
 }
 
 const MAINTENANCE_ORIGIN = "http://127.0.0.1:3000";
 
+function mutationRequest(
+  method: "POST" | "DELETE",
+  path: string,
+  headers: Record<string, string>,
+  jsonBody = "",
+): IncomingMessage {
+  const stream = Readable.from(
+    jsonBody ? [Buffer.from(jsonBody)] : [],
+  );
+  return Object.assign(stream, {
+    method,
+    url: path,
+    headers: {
+      host: "127.0.0.1:3000",
+      ...(jsonBody ? { "content-type": "application/json" } : {}),
+      ...headers,
+    },
+  }) as unknown as IncomingMessage;
+}
+
 function postJsonRequest(
   path: string,
   headers: Record<string, string>,
   jsonBody: string,
 ): IncomingMessage {
-  const stream = Readable.from([Buffer.from(jsonBody)]);
-  return Object.assign(stream, {
-    method: "POST",
-    url: path,
-    headers: {
-      host: "127.0.0.1:3000",
-      "content-type": "application/json",
-      ...headers,
-    },
-  }) as unknown as IncomingMessage;
+  return mutationRequest("POST", path, headers, jsonBody);
 }
 
 function postMaintenanceRequest(
@@ -2001,7 +2015,56 @@ describe("daemon HTTP router", () => {
     expect(output.json()).toEqual({ error: "task_detail_failed" });
   });
 
-  it("does not expose task detail mutations", async () => {
+  it("rejects task delete without the human mutation gate", async () => {
+    const removeTask = vi.fn(async () => undefined) as never;
+    const handler = createDaemonHttpHandler(dependencies({ removeTask }));
+    const output = response();
+
+    await handler(
+      mutationRequest("DELETE", "/tasks/task-1", {}),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(removeTask).not.toHaveBeenCalled();
+  });
+
+  it("accepts task delete after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("task-delete");
+    const initializeTaskDeleteRecovery = vi.fn(async () => undefined) as never;
+    const parseTaskDeleteBody = vi.fn(() => ({ confirmedPrCleanup: true })) as never;
+    const removeTask = vi.fn(async () => undefined) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({
+        initializeTaskDeleteRecovery,
+        parseTaskDeleteBody,
+        removeTask,
+      }),
+    );
+    const output = response();
+
+    await handler(
+      mutationRequest(
+        "DELETE",
+        "/tasks/task-1",
+        authorizedHumanHeaders(nonce, cookie, "task-delete"),
+        '{"confirmedPrCleanup":true}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(204);
+    expect(initializeTaskDeleteRecovery).toHaveBeenCalledTimes(1);
+    expect(parseTaskDeleteBody).toHaveBeenCalledWith(
+      '{"confirmedPrCleanup":true}',
+    );
+    expect(removeTask).toHaveBeenCalledWith("task-1", {
+      confirmedPrCleanup: true,
+    });
+  });
+
+  it("does not expose unsupported task detail mutations", async () => {
     const loadTaskDetail = vi.fn(async () => ({
       task: { id: "task-1" },
       diff: { patch: "" },
@@ -2010,14 +2073,12 @@ describe("daemon HTTP router", () => {
     const handler = createDaemonHttpHandler(
       dependencies({ loadTaskDetail }),
     );
+    const output = response();
 
-    for (const method of ["POST", "DELETE"] as const) {
-      const output = response();
-      await handler(request(method, "/tasks/task-1"), output.value);
-      expect(output.status()).toBe(404);
-      expect(output.json()).toEqual({ error: "Not found" });
-    }
+    await handler(request("POST", "/tasks/task-1"), output.value);
 
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
     expect(loadTaskDetail).not.toHaveBeenCalled();
   });
 

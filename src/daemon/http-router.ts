@@ -77,6 +77,10 @@ import {
   TaskRequestError,
   taskCreateMutationService,
 } from "../core/task-create-mutation-service";
+import {
+  TaskCleanupRequestError,
+  taskDeleteMutationService,
+} from "../core/task-delete-mutation-service";
 import { maintenanceStateService } from "../core/maintenance-state-service";
 import { toWebRequestWithBody } from "./incoming-request";
 import { retentionPolicyService } from "../core/retention-policy-service";
@@ -121,6 +125,9 @@ type DaemonHttpDependencies = {
   applyMaintenanceMutation: typeof maintenanceMutationService.apply;
   initializeTaskRecovery: typeof taskCreateMutationService.initialize;
   createTaskFromBody: typeof taskCreateMutationService.createFromBody;
+  initializeTaskDeleteRecovery: typeof taskDeleteMutationService.initialize;
+  parseTaskDeleteBody: typeof taskDeleteMutationService.parseDeleteBody;
+  removeTask: typeof taskDeleteMutationService.removeTask;
   loadOutboundSlackSettings: typeof outboundSlackSettingsService.load;
   loadMaintenanceState: typeof maintenanceStateService.load;
   loadStateBackups: typeof stateBackupsService.load;
@@ -159,6 +166,11 @@ export function createDaemonHttpHandler(
     applyMaintenanceMutation: (body) => maintenanceMutationService.apply(body),
     initializeTaskRecovery: () => taskCreateMutationService.initialize(),
     createTaskFromBody: (body) => taskCreateMutationService.createFromBody(body),
+    initializeTaskDeleteRecovery: () => taskDeleteMutationService.initialize(),
+    parseTaskDeleteBody: (rawBody) =>
+      taskDeleteMutationService.parseDeleteBody(rawBody),
+    removeTask: (id, cleanupRequest) =>
+      taskDeleteMutationService.removeTask(id, cleanupRequest),
     loadOutboundSlackSettings: () => outboundSlackSettingsService.load(),
     loadMaintenanceState: () => maintenanceStateService.load(),
     loadStateBackups: () => stateBackupsService.load(),
@@ -839,28 +851,65 @@ export function createDaemonHttpHandler(
 
     const taskId = matchTaskIdPath(url.pathname);
     if (taskId) {
-      if (request.method !== "GET") {
-        writeJson(response, 404, { error: "Not found" });
+      if (request.method === "GET") {
+        try {
+          const detail = await dependencies.loadTaskDetail(taskId);
+          const body = detail.error
+            ? { diff: detail.diff, task: detail.task, error: detail.error }
+            : { diff: detail.diff, task: detail.task };
+          writeJson(response, detail.conflict ? 409 : 200, body);
+        } catch (error) {
+          if (error instanceof TaskDetailNotFoundError) {
+            writeJson(response, 404, { error: "Task not found" });
+            return;
+          }
+          console.error(
+            "daemon_task_detail_failed",
+            error instanceof Error ? error.message : "unknown",
+          );
+          writeJson(response, 500, { error: "task_detail_failed" });
+        }
         return;
       }
 
-      try {
-        const detail = await dependencies.loadTaskDetail(taskId);
-        const body = detail.error
-          ? { diff: detail.diff, task: detail.task, error: detail.error }
-          : { diff: detail.diff, task: detail.task };
-        writeJson(response, detail.conflict ? 409 : 200, body);
-      } catch (error) {
-        if (error instanceof TaskDetailNotFoundError) {
-          writeJson(response, 404, { error: "Task not found" });
+      if (request.method === "DELETE") {
+        const webRequest = await toWebRequestWithBody(request);
+        const rejection = dependencies.rejectHumanMutation(
+          webRequest,
+          "task-delete",
+          { method: "DELETE", label: "Task cleanup" },
+        );
+        if (rejection) {
+          await writeWebResponse(response, rejection);
           return;
         }
-        console.error(
-          "daemon_task_detail_failed",
-          error instanceof Error ? error.message : "unknown",
-        );
-        writeJson(response, 500, { error: "task_detail_failed" });
+
+        await dependencies.initializeTaskDeleteRecovery();
+
+        let cleanupRequest;
+        try {
+          const rawBody = await webRequest.text();
+          cleanupRequest = dependencies.parseTaskDeleteBody(rawBody);
+        } catch (error) {
+          if (error instanceof TaskCleanupRequestError) {
+            writeJson(response, 400, { error: "Invalid cleanup request" });
+            return;
+          }
+          throw error;
+        }
+
+        try {
+          await dependencies.removeTask(taskId, cleanupRequest);
+          writeEmpty(response, 204);
+        } catch (error) {
+          writeJson(response, 409, {
+            error: error instanceof Error ? error.message : "Cleanup failed",
+          });
+        }
+        return;
       }
+
+      writeJson(response, 404, { error: "Not found" });
       return;
     }
 
@@ -877,6 +926,12 @@ function writeJson(
   response.setHeader("Content-Type", "application/json");
   response.setHeader("Cache-Control", "no-store");
   response.end(JSON.stringify(body));
+}
+
+function writeEmpty(response: ServerResponse, statusCode: number) {
+  response.statusCode = statusCode;
+  response.setHeader("Cache-Control", "no-store");
+  response.end();
 }
 
 function toWebRequest(request: IncomingMessage) {
