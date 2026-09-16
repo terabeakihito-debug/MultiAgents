@@ -78,6 +78,7 @@ import {
   repoTemplatesService,
   RepoTemplatesNotFoundError,
 } from "../core/repo-templates-service";
+import { repoTemplatesMutationService } from "../core/repo-templates-mutation-service";
 import { humanSessionService } from "../core/human-session-service";
 import { humanMutationGateService } from "../core/human-mutation-gate-service";
 import {
@@ -143,6 +144,7 @@ type DaemonHttpDependencies = {
   loadRepoProfile: typeof repoProfileService.load;
   applyRepoProfileMutation: typeof repoProfileMutationService.apply;
   loadRepoTemplates: typeof repoTemplatesService.load;
+  applyRepoTemplatesMutation: typeof repoTemplatesMutationService.apply;
   loadRepoPulls: typeof repoPullsService.load;
   issueHumanSession: typeof humanSessionService.issue;
   rejectHumanMutation: typeof humanMutationGateService.reject;
@@ -195,6 +197,8 @@ export function createDaemonHttpHandler(
     applyRepoProfileMutation: (repoId, body) =>
       repoProfileMutationService.apply(repoId, body),
     loadRepoTemplates: (repoId) => repoTemplatesService.load(repoId),
+    applyRepoTemplatesMutation: (repoId, body) =>
+      repoTemplatesMutationService.apply(repoId, body),
     loadRepoPulls: (repoId) => repoPullsService.load(repoId),
     issueHumanSession: (webRequest) => humanSessionService.issue(webRequest),
     rejectHumanMutation: (webRequest, action, options) =>
@@ -579,28 +583,67 @@ export function createDaemonHttpHandler(
 
     const repoTemplatesId = matchRepoLeafPath(url.pathname, "templates");
     if (repoTemplatesId) {
-      if (request.method !== "GET") {
-        writeJson(response, 404, { error: "Not found" });
+      if (request.method === "GET") {
+        try {
+          writeJson(
+            response,
+            200,
+            await dependencies.loadRepoTemplates(repoTemplatesId),
+          );
+        } catch (error) {
+          if (error instanceof RepoTemplatesNotFoundError) {
+            writeJson(response, 404, { error: error.message });
+            return;
+          }
+          console.error(
+            "daemon_repo_templates_failed",
+            error instanceof Error ? error.message : "unknown",
+          );
+          writeJson(response, 500, { error: "repo_templates_failed" });
+        }
         return;
       }
 
-      try {
-        writeJson(
-          response,
-          200,
-          await dependencies.loadRepoTemplates(repoTemplatesId),
+      if (request.method === "POST") {
+        const webRequest = await toWebRequestWithBody(request);
+        const rejection = dependencies.rejectHumanMutation(
+          webRequest,
+          "template-save",
+          { label: "Task template" },
         );
-      } catch (error) {
-        if (error instanceof RepoTemplatesNotFoundError) {
-          writeJson(response, 404, { error: error.message });
+        if (rejection) {
+          await writeWebResponse(response, rejection);
           return;
         }
-        console.error(
-          "daemon_repo_templates_failed",
-          error instanceof Error ? error.message : "unknown",
-        );
-        writeJson(response, 500, { error: "repo_templates_failed" });
+
+        let body: unknown;
+        try {
+          body = await webRequest.json();
+        } catch {
+          writeJson(response, 400, {
+            error: "Request body must be valid JSON",
+          });
+          return;
+        }
+
+        try {
+          writeJson(
+            response,
+            200,
+            await dependencies.applyRepoTemplatesMutation(repoTemplatesId, body),
+          );
+        } catch (error) {
+          writeJson(response, 400, {
+            error:
+              error instanceof Error
+                ? error.message
+                : "Task template settings update failed",
+          });
+        }
+        return;
       }
+
+      writeJson(response, 404, { error: "Not found" });
       return;
     }
 

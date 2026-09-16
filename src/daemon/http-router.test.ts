@@ -223,6 +223,10 @@ function dependencies(
     applyRepoProfileMutation: vi.fn(async () => ({
       profile: { repoId: "repo-1", profileId: "safe_default" },
     })) as never,
+    applyRepoTemplatesMutation: vi.fn(async () => ({
+      templates: [{ templateId: "bug_fix", enabled: true }],
+      settings: { defaultTemplateId: "bug_fix" },
+    })) as never,
     ...overrides,
   };
 }
@@ -1050,18 +1054,58 @@ describe("daemon HTTP router", () => {
     expect(output.json()).toEqual({ error: "repo_templates_failed" });
   });
 
-  it("does not expose repository template mutations on the daemon", async () => {
-    const loadRepoTemplates = vi.fn() as never;
+  it("rejects repository templates POST without the human mutation gate", async () => {
+    const applyRepoTemplatesMutation = vi.fn(async () => ({
+      templates: [],
+      settings: { defaultTemplateId: "bug_fix" },
+    })) as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ loadRepoTemplates }),
+      dependencies({ applyRepoTemplatesMutation }),
     );
     const output = response();
 
-    await handler(request("POST", "/repos/repo-1/templates"), output.value);
+    await handler(
+      postJsonRequest(
+        "/repos/repo-1/templates",
+        {},
+        '{"confirmation":true,"templateId":"bug_fix","enabled":true}',
+      ),
+      output.value,
+    );
 
-    expect(output.status()).toBe(404);
-    expect(output.json()).toEqual({ error: "Not found" });
-    expect(loadRepoTemplates).not.toHaveBeenCalled();
+    expect(output.status()).toBe(403);
+    expect(applyRepoTemplatesMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts repository templates POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("template-save");
+    const payload = {
+      templates: [{ templateId: "bug_fix", enabled: true }],
+      settings: { defaultTemplateId: "bug_fix" },
+    };
+    const applyRepoTemplatesMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyRepoTemplatesMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/repos/repo-1/templates",
+        authorizedHumanHeaders(nonce, cookie, "template-save"),
+        '{"confirmation":true,"templateId":"bug_fix","enabled":true}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyRepoTemplatesMutation).toHaveBeenCalledWith("repo-1", {
+      confirmation: true,
+      templateId: "bug_fix",
+      enabled: true,
+    });
   });
 
   it("does not treat repository pulls as repository templates", async () => {
