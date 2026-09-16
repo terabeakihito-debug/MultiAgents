@@ -12,6 +12,10 @@ import {
   TaskFindingsLoadError,
 } from "../core/task-findings-service";
 import {
+  FindingAcceptInputError,
+  findingAcceptMutationService,
+} from "../core/finding-accept-mutation-service";
+import {
   TaskFindingsExtractInputError,
   taskFindingsExtractMutationService,
 } from "../core/task-findings-extract-mutation-service";
@@ -139,6 +143,7 @@ type DaemonHttpDependencies = {
   loadTaskProfile: typeof taskProfileService.load;
   loadTaskFindings: typeof taskFindingsService.load;
   applyTaskFindingsExtractMutation: typeof taskFindingsExtractMutationService.apply;
+  applyFindingAcceptMutation: typeof findingAcceptMutationService.apply;
   loadTaskCi: typeof taskCiService.load;
   loadTaskPr: typeof taskPrService.load;
   loadTaskSandboxPolicy: typeof taskSandboxPolicyService.load;
@@ -194,6 +199,8 @@ export function createDaemonHttpHandler(
     loadTaskFindings: (id) => taskFindingsService.load(id),
     applyTaskFindingsExtractMutation: (taskId, body) =>
       taskFindingsExtractMutationService.apply(taskId, body),
+    applyFindingAcceptMutation: (findingId, body) =>
+      findingAcceptMutationService.apply(findingId, body),
     loadTaskCi: (id) => taskCiService.load(id),
     loadTaskPr: (id) => taskPrService.load(id),
     loadTaskSandboxPolicy: (id) => taskSandboxPolicyService.load(id),
@@ -1183,6 +1190,53 @@ export function createDaemonHttpHandler(
       return;
     }
 
+    const findingAcceptId = matchFindingAcceptPath(url.pathname);
+    if (findingAcceptId) {
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "finding-accept",
+        { label: "Finding" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      let body: unknown;
+      try {
+        body = await webRequest.json();
+      } catch {
+        writeJson(response, 400, {
+          error: "Request body must be valid JSON",
+        });
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          await dependencies.applyFindingAcceptMutation(findingAcceptId, body),
+        );
+      } catch (error) {
+        if (error instanceof FindingAcceptInputError) {
+          writeJson(response, 400, { error: error.message });
+          return;
+        }
+        writeJson(response, 409, {
+          error:
+            error instanceof Error ? error.message : "Finding acceptance failed",
+        });
+      }
+      return;
+    }
+
     if (request.method === "GET" && url.pathname === "/findings/queue") {
       try {
         writeJson(response, 200, dependencies.loadFindingsQueue(url));
@@ -1768,6 +1822,11 @@ function matchTaskIdPath(pathname: string) {
 
 function matchTaskFindingsExtractPath(pathname: string) {
   const match = /^\/tasks\/([^/]+)\/findings\/extract$/.exec(pathname);
+  return decodePathSegment(match?.[1]);
+}
+
+function matchFindingAcceptPath(pathname: string) {
+  const match = /^\/findings\/([^/]+)\/accept$/.exec(pathname);
   return decodePathSegment(match?.[1]);
 }
 

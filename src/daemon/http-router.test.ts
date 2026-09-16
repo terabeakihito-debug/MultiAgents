@@ -257,6 +257,11 @@ function dependencies(
     applyTaskFindingsExtractMutation: vi.fn(async () => ({
       findings: [{ findingId: "f-1" }],
     })) as never,
+    applyFindingAcceptMutation: vi.fn(async () => ({
+      finding: { findingId: "f-1", status: "accepted" },
+      remediation: null,
+      history: [],
+    })) as never,
     ...overrides,
   };
 }
@@ -3191,6 +3196,72 @@ describe("daemon HTTP router", () => {
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Not found" });
     expect(loadTaskFindings).not.toHaveBeenCalled();
+  });
+
+  it("rejects finding accept POST without the human mutation gate", async () => {
+    const applyFindingAcceptMutation = vi.fn(async () => ({
+      finding: { findingId: "f-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyFindingAcceptMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/findings/f-1/accept",
+        {},
+        '{"confirmed":true}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyFindingAcceptMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts finding accept POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("finding-accept");
+    const payload = {
+      finding: { findingId: "f-1", status: "accepted" },
+      remediation: { findingId: "f-1" },
+      history: [{ type: "finding_accepted" }],
+    };
+    const applyFindingAcceptMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyFindingAcceptMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/findings/f-1/accept",
+        authorizedHumanHeaders(nonce, cookie, "finding-accept"),
+        '{"confirmed":true}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyFindingAcceptMutation).toHaveBeenCalledWith("f-1", {
+      confirmed: true,
+    });
+  });
+
+  it("does not treat finding accept as findings queue read", async () => {
+    const loadFindingsQueue = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadFindingsQueue }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/findings/f-1/accept"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadFindingsQueue).not.toHaveBeenCalled();
   });
 
   it("rejects a non-loopback Host header on task findings", async () => {
