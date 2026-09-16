@@ -241,6 +241,9 @@ function dependencies(
     applyTaskCreatePrMutation: vi.fn(async () => ({
       task: { id: "task-1", prNumber: 42 },
     })) as never,
+    applyTaskFetchReviewMutation: vi.fn(async () => ({
+      task: { id: "task-1", status: "reviewed" },
+    })) as never,
     applyRetentionPolicyMutation: vi.fn(() => ({ preset: "balanced" })) as never,
     applyCleanupPreviewMutation: vi.fn(async () => ({
       selected: [],
@@ -3040,6 +3043,48 @@ describe("daemon HTTP router", () => {
 
     expect(output.status()).toBe(500);
     expect(output.json()).toEqual({ error: "task_detail_failed" });
+  });
+
+  it("rejects task fetch-review POST without the human mutation gate", async () => {
+    const applyTaskFetchReviewMutation = vi.fn(async () => ({
+      task: { id: "task-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskFetchReviewMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/tasks/task-1/fetch-review", {}, ""),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyTaskFetchReviewMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts task fetch-review POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("task-fetch-review");
+    const payload = { task: { id: "task-1", status: "reviewed" } };
+    const applyTaskFetchReviewMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskFetchReviewMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/fetch-review",
+        authorizedHumanHeaders(nonce, cookie, "task-fetch-review"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyTaskFetchReviewMutation).toHaveBeenCalledWith("task-1");
   });
 
   it("rejects task create-pr POST without the human mutation gate", async () => {

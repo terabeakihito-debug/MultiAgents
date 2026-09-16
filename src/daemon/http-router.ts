@@ -147,6 +147,10 @@ import {
   ApprovalError as TaskCreatePrApprovalError,
   taskCreatePrMutationService,
 } from "../core/task-create-pr-mutation-service";
+import {
+  ApprovalError as TaskFetchReviewApprovalError,
+  taskFetchReviewMutationService,
+} from "../core/task-fetch-review-mutation-service";
 import { taskPrepareApprovalMutationService } from "../core/task-prepare-approval-mutation-service";
 import {
   TaskCleanupRequestError,
@@ -247,6 +251,7 @@ type DaemonHttpDependencies = {
   applyTaskApplyReviewMutation: typeof taskApplyReviewMutationService.apply;
   applyTaskPrepareApprovalMutation: typeof taskPrepareApprovalMutationService.apply;
   applyTaskCreatePrMutation: typeof taskCreatePrMutationService.apply;
+  applyTaskFetchReviewMutation: typeof taskFetchReviewMutationService.apply;
   loadOutboundSlackSettings: typeof outboundSlackSettingsService.load;
   applyOutboundSlackSettingsMutation: typeof outboundSlackSettingsMutationService.apply;
   loadMaintenanceState: typeof maintenanceStateService.load;
@@ -348,6 +353,8 @@ export function createDaemonHttpHandler(
       taskPrepareApprovalMutationService.apply(taskId),
     applyTaskCreatePrMutation: (taskId) =>
       taskCreatePrMutationService.apply(taskId),
+    applyTaskFetchReviewMutation: (taskId) =>
+      taskFetchReviewMutationService.apply(taskId),
     loadOutboundSlackSettings: () => outboundSlackSettingsService.load(),
     applyOutboundSlackSettingsMutation: (body) =>
       outboundSlackSettingsMutationService.apply(body),
@@ -2135,6 +2142,43 @@ export function createDaemonHttpHandler(
       return;
     }
 
+    const taskFetchReviewId = matchTaskFetchReviewPath(url.pathname);
+    if (taskFetchReviewId) {
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "task-fetch-review",
+        { label: "PR review fetch" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          await dependencies.applyTaskFetchReviewMutation(taskFetchReviewId),
+        );
+      } catch (error) {
+        writeJson(
+          response,
+          error instanceof TaskFetchReviewApprovalError ? error.statusCode : 409,
+          {
+            error:
+              error instanceof Error ? error.message : "PR review fetch failed",
+          },
+        );
+      }
+      return;
+    }
+
     const taskCreatePrId = matchTaskCreatePrPath(url.pathname);
     if (taskCreatePrId) {
       if (request.method !== "POST") {
@@ -2567,6 +2611,11 @@ function matchTaskPrepareApprovalPath(pathname: string) {
 
 function matchTaskCreatePrPath(pathname: string) {
   const match = /^\/tasks\/([^/]+)\/create-pr$/.exec(pathname);
+  return decodePathSegment(match?.[1]);
+}
+
+function matchTaskFetchReviewPath(pathname: string) {
+  const match = /^\/tasks\/([^/]+)\/fetch-review$/.exec(pathname);
   return decodePathSegment(match?.[1]);
 }
 
