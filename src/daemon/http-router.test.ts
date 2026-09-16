@@ -228,6 +228,9 @@ function dependencies(
     applyTaskApproveMutation: vi.fn(async () => ({
       task: { id: "task-1", status: "open" },
     })) as never,
+    applyTaskApproveReworkMutation: vi.fn(async () => ({
+      task: { id: "task-1", status: "open" },
+    })) as never,
     applyRetentionPolicyMutation: vi.fn(() => ({ preset: "balanced" })) as never,
     applyCleanupPreviewMutation: vi.fn(async () => ({
       selected: [],
@@ -3027,6 +3030,56 @@ describe("daemon HTTP router", () => {
 
     expect(output.status()).toBe(500);
     expect(output.json()).toEqual({ error: "task_detail_failed" });
+  });
+
+  it("rejects task approve-rework POST without the human mutation gate", async () => {
+    const applyTaskApproveReworkMutation = vi.fn(async () => ({
+      task: { id: "task-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskApproveReworkMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/approve-rework",
+        {},
+        '{"approved":true,"diffHash":"abc","approvalId":"ap-1"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyTaskApproveReworkMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts task approve-rework POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("task-approve-rework");
+    const payload = { task: { id: "task-1", status: "rework" } };
+    const applyTaskApproveReworkMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskApproveReworkMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/approve-rework",
+        authorizedHumanHeaders(nonce, cookie, "task-approve-rework"),
+        '{"approved":true,"diffHash":"abc","approvalId":"ap-1"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyTaskApproveReworkMutation).toHaveBeenCalledWith("task-1", {
+      approved: true,
+      diffHash: "abc",
+      approvalId: "ap-1",
+    });
   });
 
   it("rejects task approve POST without the human mutation gate", async () => {
