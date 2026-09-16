@@ -131,6 +131,10 @@ function dependencies(
       tasks: [{ id: "task-1" }],
       counts: {},
     })) as never,
+    loadRuntimeSandboxStatus: vi.fn(async () => ({
+      statusCode: 200,
+      body: { status: "enforced", backend: "bubblewrap" },
+    })) as never,
     ...overrides,
   };
 }
@@ -652,6 +656,101 @@ describe("daemon HTTP router", () => {
       error: "This API is available only on localhost",
     });
     expect(loadDashboardTasks).not.toHaveBeenCalled();
+  });
+
+  it("serves runtime sandbox status through the core sandbox-status boundary", async () => {
+    const payload = {
+      statusCode: 200,
+      body: {
+        status: "enforced",
+        backend: "bubblewrap",
+        policyVersion: 3,
+      },
+    };
+    const loadRuntimeSandboxStatus = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRuntimeSandboxStatus }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/runtime/sandbox-status"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload.body);
+    expect(loadRuntimeSandboxStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns 503 when runtime sandbox status is unavailable", async () => {
+    const loadRuntimeSandboxStatus = vi.fn(async () => ({
+      statusCode: 503,
+      body: {
+        status: "unavailable",
+        error: "OS sandbox unavailable. Task execution blocked.",
+        failureCode: "namespace_unsupported",
+      },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRuntimeSandboxStatus }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/runtime/sandbox-status"), output.value);
+
+    expect(output.status()).toBe(503);
+    expect(output.json()).toEqual({
+      status: "unavailable",
+      error: "OS sandbox unavailable. Task execution blocked.",
+      failureCode: "namespace_unsupported",
+    });
+  });
+
+  it("returns a stable error when runtime sandbox status loading fails unexpectedly", async () => {
+    const loadRuntimeSandboxStatus = vi.fn(async () => {
+      throw new Error("unexpected");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRuntimeSandboxStatus }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/runtime/sandbox-status"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "runtime_sandbox_status_failed" });
+  });
+
+  it("does not expose runtime sandbox status on unsupported methods", async () => {
+    const loadRuntimeSandboxStatus = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRuntimeSandboxStatus }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/runtime/sandbox-status"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadRuntimeSandboxStatus).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on runtime sandbox status", async () => {
+    const loadRuntimeSandboxStatus = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRuntimeSandboxStatus }),
+    );
+    const output = response();
+    const incoming = request("GET", "/runtime/sandbox-status");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadRuntimeSandboxStatus).not.toHaveBeenCalled();
   });
 
   it("serves the task list through the core task boundary", async () => {

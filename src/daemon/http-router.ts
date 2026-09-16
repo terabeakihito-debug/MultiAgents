@@ -45,6 +45,7 @@ import {
   RemediationQueueQueryError,
 } from "../core/findings-queue-service";
 import { operationsOverviewService } from "../core/operations-overview-service";
+import { runtimeSandboxStatusService } from "../core/runtime-sandbox-status-service";
 import {
   notificationListService,
   NotificationInputError,
@@ -75,6 +76,7 @@ type DaemonHttpDependencies = {
   loadFindingsQueue: typeof findingsQueueService.load;
   loadOperationsOverview: typeof operationsOverviewService.load;
   loadDashboardTasks: typeof dashboardTasksService.load;
+  loadRuntimeSandboxStatus: typeof runtimeSandboxStatusService.load;
 };
 
 export function createDaemonHttpHandler(
@@ -96,6 +98,7 @@ export function createDaemonHttpHandler(
     loadFindingsQueue: (url) => findingsQueueService.load(url),
     loadOperationsOverview: () => operationsOverviewService.load(),
     loadDashboardTasks: (url) => dashboardTasksService.load(url),
+    loadRuntimeSandboxStatus: () => runtimeSandboxStatusService.load(),
   },
 ) {
   return async function handleDaemonHttp(
@@ -229,6 +232,20 @@ export function createDaemonHttpHandler(
           error instanceof Error ? error.message : "unknown",
         );
         writeJson(response, 500, { error: "dashboard_tasks_failed" });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/runtime/sandbox-status") {
+      try {
+        const result = await dependencies.loadRuntimeSandboxStatus();
+        writeJson(response, result.statusCode, result.body);
+      } catch (error) {
+        console.error(
+          "daemon_runtime_sandbox_status_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "runtime_sandbox_status_failed" });
       }
       return;
     }
