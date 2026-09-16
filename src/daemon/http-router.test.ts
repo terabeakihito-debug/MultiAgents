@@ -231,6 +231,9 @@ function dependencies(
     applyTaskApproveReworkMutation: vi.fn(async () => ({
       task: { id: "task-1", status: "open" },
     })) as never,
+    applyTaskApplyReviewMutation: vi.fn(async () => ({
+      task: { id: "task-1", status: "open" },
+    })) as never,
     applyRetentionPolicyMutation: vi.fn(() => ({ preset: "balanced" })) as never,
     applyCleanupPreviewMutation: vi.fn(async () => ({
       selected: [],
@@ -3030,6 +3033,54 @@ describe("daemon HTTP router", () => {
 
     expect(output.status()).toBe(500);
     expect(output.json()).toEqual({ error: "task_detail_failed" });
+  });
+
+  it("rejects task apply-review POST without the human mutation gate", async () => {
+    const applyTaskApplyReviewMutation = vi.fn(async () => ({
+      task: { id: "task-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskApplyReviewMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/apply-review",
+        {},
+        '{"approved":true}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyTaskApplyReviewMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts task apply-review POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("task-apply-review");
+    const payload = { task: { id: "task-1", status: "open" } };
+    const applyTaskApplyReviewMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskApplyReviewMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/apply-review",
+        authorizedHumanHeaders(nonce, cookie, "task-apply-review"),
+        '{"approved":true}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyTaskApplyReviewMutation).toHaveBeenCalledWith("task-1", {
+      approved: true,
+    });
   });
 
   it("rejects task approve-rework POST without the human mutation gate", async () => {
