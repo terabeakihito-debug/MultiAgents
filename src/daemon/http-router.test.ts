@@ -169,6 +169,10 @@ function dependencies(
         },
       },
     )) as never,
+    loadOutboundSlackSettings: vi.fn(() => ({
+      configured: true,
+      config: { enabled: true },
+    })) as never,
     ...overrides,
   };
 }
@@ -235,6 +239,87 @@ describe("daemon HTTP router", () => {
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Not found" });
     expect(issueHumanSession).not.toHaveBeenCalled();
+  });
+
+  it("serves outbound Slack settings through the core outbound-slack-settings boundary", async () => {
+    const payload = {
+      configured: true,
+      config: { enabled: true, taskFailed: true },
+    };
+    const loadOutboundSlackSettings = vi.fn(() => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadOutboundSlackSettings }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/outbound/slack/settings"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadOutboundSlackSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a stable error when outbound Slack settings loading fails", async () => {
+    const loadOutboundSlackSettings = vi.fn(() => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadOutboundSlackSettings }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/outbound/slack/settings"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "outbound_slack_settings_failed" });
+  });
+
+  it("does not expose outbound Slack settings mutations on the daemon", async () => {
+    const loadOutboundSlackSettings = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadOutboundSlackSettings }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/outbound/slack/settings"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadOutboundSlackSettings).not.toHaveBeenCalled();
+  });
+
+  it("does not treat outbound Slack test as settings read", async () => {
+    const loadOutboundSlackSettings = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadOutboundSlackSettings }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/outbound/slack/test"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadOutboundSlackSettings).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on outbound Slack settings", async () => {
+    const loadOutboundSlackSettings = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadOutboundSlackSettings }),
+    );
+    const output = response();
+    const incoming = request("GET", "/outbound/slack/settings");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadOutboundSlackSettings).not.toHaveBeenCalled();
   });
 
   it("serves the profile catalog through the core profile-list boundary", async () => {

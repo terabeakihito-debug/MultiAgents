@@ -46,6 +46,7 @@ import {
   RemediationQueueQueryError,
 } from "../core/findings-queue-service";
 import { operationsOverviewService } from "../core/operations-overview-service";
+import { outboundSlackSettingsService } from "../core/outbound-slack-settings-service";
 import { runtimeSandboxStatusService } from "../core/runtime-sandbox-status-service";
 import {
   notificationListService,
@@ -100,6 +101,7 @@ type DaemonHttpDependencies = {
   loadRepoTemplates: typeof repoTemplatesService.load;
   loadRepoPulls: typeof repoPullsService.load;
   issueHumanSession: typeof humanSessionService.issue;
+  loadOutboundSlackSettings: typeof outboundSlackSettingsService.load;
 };
 
 export function createDaemonHttpHandler(
@@ -129,6 +131,7 @@ export function createDaemonHttpHandler(
     loadRepoTemplates: (repoId) => repoTemplatesService.load(repoId),
     loadRepoPulls: (repoId) => repoPullsService.load(repoId),
     issueHumanSession: (webRequest) => humanSessionService.issue(webRequest),
+    loadOutboundSlackSettings: () => outboundSlackSettingsService.load(),
   },
 ) {
   return async function handleDaemonHttp(
@@ -173,6 +176,19 @@ export function createDaemonHttpHandler(
         response,
         dependencies.issueHumanSession(toWebRequest(request)),
       );
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/outbound/slack/settings") {
+      try {
+        writeJson(response, 200, dependencies.loadOutboundSlackSettings());
+      } catch (error) {
+        console.error(
+          "daemon_outbound_slack_settings_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "outbound_slack_settings_failed" });
+      }
       return;
     }
 
