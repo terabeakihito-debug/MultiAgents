@@ -66,6 +66,7 @@ import {
   repoTemplatesService,
   RepoTemplatesNotFoundError,
 } from "../core/repo-templates-service";
+import { humanSessionService } from "../core/human-session-service";
 import { retentionPolicyService } from "../core/retention-policy-service";
 import { taskService } from "../core/task-service";
 import {
@@ -98,6 +99,7 @@ type DaemonHttpDependencies = {
   loadRepoProfile: typeof repoProfileService.load;
   loadRepoTemplates: typeof repoTemplatesService.load;
   loadRepoPulls: typeof repoPullsService.load;
+  issueHumanSession: typeof humanSessionService.issue;
 };
 
 export function createDaemonHttpHandler(
@@ -126,6 +128,7 @@ export function createDaemonHttpHandler(
     loadRepoProfile: (repoId) => repoProfileService.load(repoId),
     loadRepoTemplates: (repoId) => repoTemplatesService.load(repoId),
     loadRepoPulls: (repoId) => repoPullsService.load(repoId),
+    issueHumanSession: (webRequest) => humanSessionService.issue(webRequest),
   },
 ) {
   return async function handleDaemonHttp(
@@ -157,6 +160,19 @@ export function createDaemonHttpHandler(
               : "readiness_failed",
         });
       }
+      return;
+    }
+
+    if (url.pathname === "/human-session") {
+      if (request.method !== "GET") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      await writeWebResponse(
+        response,
+        dependencies.issueHumanSession(toWebRequest(request)),
+      );
       return;
     }
 
@@ -662,6 +678,34 @@ function writeJson(
   response.setHeader("Content-Type", "application/json");
   response.setHeader("Cache-Control", "no-store");
   response.end(JSON.stringify(body));
+}
+
+function toWebRequest(request: IncomingMessage) {
+  const host = request.headers.host ?? "127.0.0.1";
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(request.headers)) {
+    if (typeof value === "string") {
+      headers.set(name, value);
+    } else if (Array.isArray(value)) {
+      for (const entry of value) headers.append(name, entry);
+    }
+  }
+
+  return new Request(`http://${host}${request.url ?? "/"}`, {
+    method: request.method ?? "GET",
+    headers,
+  });
+}
+
+async function writeWebResponse(
+  response: ServerResponse,
+  webResponse: Response,
+) {
+  response.statusCode = webResponse.status;
+  webResponse.headers.forEach((value, name) => {
+    response.setHeader(name, value);
+  });
+  response.end(Buffer.from(await webResponse.arrayBuffer()));
 }
 
 

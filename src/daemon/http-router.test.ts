@@ -160,11 +160,83 @@ function dependencies(
     loadRepoPulls: vi.fn(async () => ({
       pulls: [{ number: 1, title: "Fix" }],
     })) as never,
+    issueHumanSession: vi.fn(() => Response.json(
+      { nonce: "nonce-1", expiresAt: "2026-01-01T00:02:00.000Z" },
+      {
+        headers: {
+          "Cache-Control": "no-store",
+          "Set-Cookie": "multiagents_human_session=abc; HttpOnly",
+        },
+      },
+    )) as never,
     ...overrides,
   };
 }
 
 describe("daemon HTTP router", () => {
+  it("serves human session through the core human-session boundary", async () => {
+    const webResponse = Response.json(
+      { nonce: "nonce-1", expiresAt: "2026-01-01T00:02:00.000Z" },
+      {
+        headers: {
+          "Cache-Control": "no-store",
+          "Set-Cookie": "multiagents_human_session=abc; HttpOnly",
+        },
+      },
+    );
+    const issueHumanSession = vi.fn(() => webResponse) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ issueHumanSession }),
+    );
+    const output = response();
+    const incoming = request("GET", "/human-session");
+    incoming.headers.referer = "http://127.0.0.1:3000/";
+    incoming.headers["sec-fetch-site"] = "same-origin";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.header("set-cookie")).toContain("multiagents_human_session=abc");
+    expect(output.json()).toEqual({
+      nonce: "nonce-1",
+      expiresAt: "2026-01-01T00:02:00.000Z",
+    });
+    expect(issueHumanSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("forwards human session gate failures from the shared issuer", async () => {
+    const issueHumanSession = vi.fn(() => Response.json(
+      { error: "A same-origin UI session is required" },
+      { status: 403 },
+    )) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ issueHumanSession }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/human-session"), output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "A same-origin UI session is required",
+    });
+  });
+
+  it("does not expose human session on unsupported methods", async () => {
+    const issueHumanSession = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ issueHumanSession }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/human-session"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(issueHumanSession).not.toHaveBeenCalled();
+  });
+
   it("serves the profile catalog through the core profile-list boundary", async () => {
     const catalog = {
       presets: [{ id: "safe_default" }],
