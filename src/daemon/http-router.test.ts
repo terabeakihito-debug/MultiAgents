@@ -141,6 +141,12 @@ function dependencies(
     loadRetentionPolicy: vi.fn(() => ({
       preset: "conservative",
     })) as never,
+    loadCleanupCandidates: vi.fn(async () => ({
+      candidates: [],
+      potentialSavingsBytes: 0,
+      blocked: 0,
+      preset: "conservative",
+    })) as never,
     ...overrides,
   };
 }
@@ -344,6 +350,77 @@ describe("daemon HTTP router", () => {
       error: "This API is available only on localhost",
     });
     expect(loadCredentialStatus).not.toHaveBeenCalled();
+  });
+
+  it("serves cleanup candidates through the core cleanup-candidates boundary", async () => {
+    const payload = {
+      candidates: [{ id: "worktree-1" }],
+      potentialSavingsBytes: 4096,
+      blocked: 1,
+      preset: "balanced",
+    };
+    const loadCleanupCandidates = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadCleanupCandidates }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/cleanup/candidates"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadCleanupCandidates).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a stable error when cleanup candidate loading fails", async () => {
+    const loadCleanupCandidates = vi.fn(async () => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadCleanupCandidates }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/cleanup/candidates"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "cleanup_candidates_failed" });
+  });
+
+  it("does not expose cleanup preview or execute on the candidates path", async () => {
+    const loadCleanupCandidates = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadCleanupCandidates }),
+    );
+
+    for (const method of ["POST", "DELETE"] as const) {
+      const output = response();
+      await handler(request(method, "/cleanup/candidates"), output.value);
+      expect(output.status()).toBe(404);
+      expect(output.json()).toEqual({ error: "Not found" });
+    }
+
+    expect(loadCleanupCandidates).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on cleanup candidates", async () => {
+    const loadCleanupCandidates = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadCleanupCandidates }),
+    );
+    const output = response();
+    const incoming = request("GET", "/cleanup/candidates");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadCleanupCandidates).not.toHaveBeenCalled();
   });
 
   it("serves retention policy through the core retention-policy boundary", async () => {

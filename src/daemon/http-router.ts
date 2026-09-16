@@ -39,6 +39,7 @@ import {
   dashboardTasksService,
   DashboardQueryError,
 } from "../core/dashboard-tasks-service";
+import { cleanupCandidatesService } from "../core/cleanup-candidates-service";
 import { credentialStatusService } from "../core/credential-status-service";
 import {
   findingsQueueService,
@@ -81,6 +82,7 @@ type DaemonHttpDependencies = {
   loadRuntimeSandboxStatus: typeof runtimeSandboxStatusService.load;
   loadNotificationPreferences: typeof notificationPreferencesService.load;
   loadRetentionPolicy: typeof retentionPolicyService.load;
+  loadCleanupCandidates: typeof cleanupCandidatesService.load;
 };
 
 export function createDaemonHttpHandler(
@@ -105,6 +107,7 @@ export function createDaemonHttpHandler(
     loadRuntimeSandboxStatus: () => runtimeSandboxStatusService.load(),
     loadNotificationPreferences: () => notificationPreferencesService.load(),
     loadRetentionPolicy: () => retentionPolicyService.load(),
+    loadCleanupCandidates: () => cleanupCandidatesService.load(),
   },
 ) {
   return async function handleDaemonHttp(
@@ -174,6 +177,19 @@ export function createDaemonHttpHandler(
           error instanceof Error ? error.message : "unknown",
         );
         writeJson(response, 500, { error: "credential_status_failed" });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/cleanup/candidates") {
+      try {
+        writeJson(response, 200, await dependencies.loadCleanupCandidates());
+      } catch (error) {
+        console.error(
+          "daemon_cleanup_candidates_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "cleanup_candidates_failed" });
       }
       return;
     }
