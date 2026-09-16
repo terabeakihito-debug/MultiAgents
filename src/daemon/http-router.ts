@@ -156,6 +156,11 @@ import {
   taskRefreshPrMutationService,
 } from "../core/task-refresh-pr-mutation-service";
 import {
+  ApprovalError as TaskRecoverPrApprovalError,
+  TaskRecoverPrInputError,
+  taskRecoverPrMutationService,
+} from "../core/task-recover-pr-mutation-service";
+import {
   DependencyRecoveryTaskNotFoundError,
   DependencyRecoveryUnavailableError,
   taskDependencyRecoveryInstructionsMutationService,
@@ -272,6 +277,7 @@ type DaemonHttpDependencies = {
   applyTaskReassociatePreviewMutation: typeof taskReassociatePreviewMutationService.apply;
   applyTaskReassociateMutation: typeof taskReassociateMutationService.apply;
   applyTaskDependencyRecoveryInstructionsMutation: typeof taskDependencyRecoveryInstructionsMutationService.apply;
+  applyTaskRecoverPrMutation: typeof taskRecoverPrMutationService.apply;
   loadOutboundSlackSettings: typeof outboundSlackSettingsService.load;
   applyOutboundSlackSettingsMutation: typeof outboundSlackSettingsMutationService.apply;
   loadMaintenanceState: typeof maintenanceStateService.load;
@@ -385,6 +391,8 @@ export function createDaemonHttpHandler(
       taskReassociateMutationService.apply(taskId, body),
     applyTaskDependencyRecoveryInstructionsMutation: (taskId) =>
       taskDependencyRecoveryInstructionsMutationService.apply(taskId),
+    applyTaskRecoverPrMutation: (body) =>
+      taskRecoverPrMutationService.apply(body),
     loadOutboundSlackSettings: () => outboundSlackSettingsService.load(),
     applyOutboundSlackSettingsMutation: (body) =>
       outboundSlackSettingsMutationService.apply(body),
@@ -1845,6 +1853,52 @@ export function createDaemonHttpHandler(
           error instanceof Error ? error.message : "unknown",
         );
         writeJson(response, 500, { error: "runtime_sandbox_status_failed" });
+      }
+      return;
+    }
+
+    if (url.pathname === "/tasks/recover-pr") {
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "task-recover-pr",
+        { label: "PR recovery" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      let body: unknown;
+      try {
+        body = await webRequest.json();
+      } catch {
+        writeJson(response, 400, {
+          error: "Request body must be valid JSON",
+        });
+        return;
+      }
+
+      try {
+        writeJson(response, 200, await dependencies.applyTaskRecoverPrMutation(body));
+      } catch (error) {
+        if (error instanceof TaskRecoverPrInputError) {
+          writeJson(response, 400, { error: error.message });
+          return;
+        }
+        writeJson(
+          response,
+          error instanceof TaskRecoverPrApprovalError ? error.statusCode : 409,
+          {
+            error:
+              error instanceof Error ? error.message : "PR task recovery failed",
+          },
+        );
       }
       return;
     }

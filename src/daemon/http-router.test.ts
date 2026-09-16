@@ -222,6 +222,9 @@ function dependencies(
     createTaskFromBody: vi.fn(async () => ({
       task: { id: "task-new", repoId: "repo-1" },
     })) as never,
+    applyTaskRecoverPrMutation: vi.fn(async () => ({
+      task: { id: "task-1", prNumber: 42 },
+    })) as never,
     initializeTaskDeleteRecovery: vi.fn(async () => undefined) as never,
     parseTaskDeleteBody: vi.fn(() => ({})) as never,
     removeTask: vi.fn(async () => undefined) as never,
@@ -2794,6 +2797,55 @@ describe("daemon HTTP router", () => {
 
     expect(output.status()).toBe(500);
     expect(output.json()).toEqual({ error: "task_list_failed" });
+  });
+
+  it("rejects task recover-pr POST without the human mutation gate", async () => {
+    const applyTaskRecoverPrMutation = vi.fn(async () => ({
+      task: { id: "task-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskRecoverPrMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/recover-pr",
+        {},
+        '{"repoId":"repo-1","prNumber":42}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyTaskRecoverPrMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts task recover-pr POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("task-recover-pr");
+    const payload = { task: { id: "task-1", prNumber: 42 } };
+    const applyTaskRecoverPrMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskRecoverPrMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/recover-pr",
+        authorizedHumanHeaders(nonce, cookie, "task-recover-pr"),
+        '{"repoId":"repo-1","prNumber":42}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyTaskRecoverPrMutation).toHaveBeenCalledWith({
+      repoId: "repo-1",
+      prNumber: 42,
+    });
   });
 
   it("rejects task create POST without the human mutation gate", async () => {
