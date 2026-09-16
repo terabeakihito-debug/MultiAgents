@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "rootDir": "src",
+    "outDir": "dist-daemon",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "types": ["node"]
+  },
+  "include": [
+    "src/daemon/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    ".next",
+    "dist-daemon",
+    "**/*.test.ts",
+    "**/*.test.tsx"
+  ]
+}

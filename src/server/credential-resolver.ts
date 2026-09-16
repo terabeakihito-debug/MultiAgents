@@ -1,4 +1,3 @@
-import "server-only";
 import { inspect } from "node:util";
 import {
   credentialCapabilities,
