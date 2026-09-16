@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { RuntimePolicy } from "../runtime/types";
+import { RUNTIME_POLICY_VERSION, type RuntimePolicy } from "../runtime/types";
 import type { PublicOsSandboxPolicy } from "../server/os-sandbox";
 import { type RepoTask } from "../server/tasks";
 import {
@@ -67,7 +67,7 @@ describe("task runtime policy service", () => {
     );
 
     await expect(service.load(task.id)).resolves.toEqual({
-      runtimePolicyVersion: 2,
+      runtimePolicyVersion: RUNTIME_POLICY_VERSION,
       taskType: "bug_fix",
       allAgentsReadOnly: false,
       worktreeRequired: true,
