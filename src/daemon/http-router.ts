@@ -54,6 +54,10 @@ import {
 import { notificationPreferencesService } from "../core/notification-preferences-service";
 import { profileListService } from "../core/profile-list-service";
 import { repoListService } from "../core/repo-list-service";
+import {
+  repoProfileService,
+  RepoProfileNotFoundError,
+} from "../core/repo-profile-service";
 import { retentionPolicyService } from "../core/retention-policy-service";
 import { taskService } from "../core/task-service";
 import {
@@ -83,6 +87,7 @@ type DaemonHttpDependencies = {
   loadNotificationPreferences: typeof notificationPreferencesService.load;
   loadRetentionPolicy: typeof retentionPolicyService.load;
   loadCleanupCandidates: typeof cleanupCandidatesService.load;
+  loadRepoProfile: typeof repoProfileService.load;
 };
 
 export function createDaemonHttpHandler(
@@ -108,6 +113,7 @@ export function createDaemonHttpHandler(
     loadNotificationPreferences: () => notificationPreferencesService.load(),
     loadRetentionPolicy: () => retentionPolicyService.load(),
     loadCleanupCandidates: () => cleanupCandidatesService.load(),
+    loadRepoProfile: (repoId) => repoProfileService.load(repoId),
   },
 ) {
   return async function handleDaemonHttp(
@@ -164,6 +170,33 @@ export function createDaemonHttpHandler(
           error instanceof Error ? error.message : "unknown",
         );
         writeJson(response, 500, { error: "repo_list_failed" });
+      }
+      return;
+    }
+
+    const repoProfileId = matchRepoLeafPath(url.pathname, "profile");
+    if (repoProfileId) {
+      if (request.method !== "GET") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          await dependencies.loadRepoProfile(repoProfileId),
+        );
+      } catch (error) {
+        if (error instanceof RepoProfileNotFoundError) {
+          writeJson(response, 404, { error: error.message });
+          return;
+        }
+        console.error(
+          "daemon_repo_profile_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "repo_profile_failed" });
       }
       return;
     }
@@ -602,8 +635,14 @@ function isLoopbackHost(hostHeader: string) {
   }
 }
 
+function matchRepoLeafPath(pathname: string, leaf: "profile" | "templates" | "pulls") {
+  const match = /^\/repos\/([^/]+)\/([^/]+)$/.exec(pathname);
+  if (!match || match[2] !== leaf) return;
+  return decodePathSegment(match[1]);
+}
+
 function matchTaskIdPath(pathname: string) {
-  return decodeTaskIdSegment(/^\/tasks\/([^/]+)$/.exec(pathname)?.[1]);
+  return decodePathSegment(/^\/tasks\/([^/]+)$/.exec(pathname)?.[1]);
 }
 
 function matchTaskLeafPath(
@@ -619,10 +658,10 @@ function matchTaskLeafPath(
 ) {
   const match = /^\/tasks\/([^/]+)\/([^/]+)$/.exec(pathname);
   if (!match || match[2] !== leaf) return;
-  return decodeTaskIdSegment(match[1]);
+  return decodePathSegment(match[1]);
 }
 
-function decodeTaskIdSegment(rawId: string | undefined) {
+function decodePathSegment(rawId: string | undefined) {
   if (!rawId) return;
 
   try {

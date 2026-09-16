@@ -2,6 +2,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { describe, expect, it, vi } from "vitest";
 import { TaskCiNotFoundError } from "../core/task-ci-service";
 import { DashboardQueryError } from "../core/dashboard-tasks-service";
+import { RepoProfileNotFoundError } from "../core/repo-profile-service";
 import { RemediationQueueQueryError } from "../core/findings-queue-service";
 import { NotificationInputError } from "../core/notification-list-service";
 import {
@@ -147,6 +148,9 @@ function dependencies(
       blocked: 0,
       preset: "conservative",
     })) as never,
+    loadRepoProfile: vi.fn(async () => ({
+      profile: { repoId: "repo-1", profileId: "safe_default" },
+    })) as never,
     ...overrides,
   };
 }
@@ -284,6 +288,101 @@ describe("daemon HTTP router", () => {
       error: "This API is available only on localhost",
     });
     expect(loadRepoList).not.toHaveBeenCalled();
+  });
+
+  it("serves repository profile through the core repo-profile boundary", async () => {
+    const payload = { profile: { repoId: "repo-1", profileId: "safe_default" } };
+    const loadRepoProfile = vi.fn(async () => payload) as never;
+    const loadRepoList = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoProfile, loadRepoList }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/repos/repo-1/profile"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe("application/json");
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadRepoProfile).toHaveBeenCalledWith("repo-1");
+    expect(loadRepoList).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 when the repository profile lookup fails", async () => {
+    const loadRepoProfile = vi.fn(async () => {
+      throw new RepoProfileNotFoundError("Repository not found");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoProfile }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/repos/missing/profile"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Repository not found" });
+  });
+
+  it("returns a stable error when repository profile loading fails unexpectedly", async () => {
+    const loadRepoProfile = vi.fn(async () => {
+      throw new Error("database failed");
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoProfile }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/repos/repo-1/profile"), output.value);
+
+    expect(output.status()).toBe(500);
+    expect(output.json()).toEqual({ error: "repo_profile_failed" });
+  });
+
+  it("does not expose repository profile mutations on the daemon", async () => {
+    const loadRepoProfile = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoProfile }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/repos/repo-1/profile"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadRepoProfile).not.toHaveBeenCalled();
+  });
+
+  it("does not treat repository templates as repository profile", async () => {
+    const loadRepoProfile = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoProfile }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/repos/repo-1/templates"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadRepoProfile).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-loopback Host header on repository profile", async () => {
+    const loadRepoProfile = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadRepoProfile }),
+    );
+    const output = response();
+    const incoming = request("GET", "/repos/repo-1/profile");
+    incoming.headers.host = "attacker.example";
+
+    await handler(incoming, output.value);
+
+    expect(output.status()).toBe(403);
+    expect(output.json()).toEqual({
+      error: "This API is available only on localhost",
+    });
+    expect(loadRepoProfile).not.toHaveBeenCalled();
   });
 
   it("serves credential status through the core credential-status boundary", async () => {
