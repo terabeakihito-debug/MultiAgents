@@ -13,6 +13,7 @@ describe("dependency recovery UI presentation", () => {
   it("keeps managed paths out of initial UI source and requests instructions only after an explicit button action", async () => {
     const page = await readFile(new URL("./page.tsx", import.meta.url), "utf8");
     expect(page).toContain("Dependencies required");
+    expect(page).toContain("Open recovery actions");
     expect(page).toContain("Show setup command");
     expect(page).toContain("Recheck approval snapshot");
     expect(page).toContain("refreshDiff(task)");
