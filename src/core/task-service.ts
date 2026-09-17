@@ -6,6 +6,7 @@ export type TaskCreateRequest = {
   repoId: string;
   templateId?: string;
   prompt?: string;
+  autonomous?: boolean;
 };
 
 export type TaskRequestErrorCode =
@@ -32,11 +33,14 @@ export function parseTaskCreateRequest(input: unknown): TaskCreateRequest {
   if (typeof body.repoId !== "string") {
     throw new TaskRequestError("repository_required", "Repository is required");
   }
-  if (Object.keys(body).some((key) => !["repoId", "templateId", "prompt"].includes(key))) {
+  if (Object.keys(body).some((key) => !["repoId", "templateId", "prompt", "autonomous"].includes(key))) {
     throw new TaskRequestError("forbidden_field", "Task creation contains a forbidden field");
   }
   if (body.templateId !== undefined && typeof body.templateId !== "string") {
     throw new TaskRequestError("template_invalid", "Task template is invalid");
+  }
+  if (body.autonomous !== undefined && typeof body.autonomous !== "boolean") {
+    throw new TaskRequestError("forbidden_field", "Autonomous execution flag is invalid");
   }
   if (
     body.prompt !== undefined &&
@@ -48,6 +52,7 @@ export function parseTaskCreateRequest(input: unknown): TaskCreateRequest {
     repoId: body.repoId,
     templateId: body.templateId as string | undefined,
     prompt: body.prompt as string | undefined,
+    ...(body.autonomous === undefined ? {} : { autonomous: body.autonomous as boolean }),
   };
 }
 
@@ -76,6 +81,7 @@ export function createTaskService(dependencies: TaskDependencies = {
       const task = await dependencies.create(request.repoId, {
         templateId: request.templateId,
         prompt: request.prompt,
+        ...(request.autonomous === undefined ? {} : { autonomous: request.autonomous }),
       });
       return dependencies.toPublic(task);
     },

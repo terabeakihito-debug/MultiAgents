@@ -122,6 +122,14 @@ describe("Phase 8 SQLite state and audit history", () => {
     expect(getTaskHistory(task.id).events.filter((event) => event.type === "step_rerun")).toHaveLength(4);
   });
 
+  it("persists the autonomous execution choice", async () => {
+    const { task } = await repositoryTask();
+    task.autonomous = true;
+    persistTask(task);
+    reloadTasksFromStoreForTests();
+    expect(getTask(task.id)?.autonomous).toBe(true);
+  });
+
   it("reloads a failed review before manually recovering every persisted step", async () => {
     const { allowedRoot, task } = await repositoryTask();
     const flowId = "restart-recovery-flow";

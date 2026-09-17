@@ -323,6 +323,7 @@ export class StateStore {
     task.template = template;
     const payload = redactKnownSecretsInValue({
       reviewReady: task.reviewReady,
+      autonomous: task.autonomous,
       validation: task.validation,
       dependencyRecovery: task.dependencyRecovery,
       secretFindings: task.secretFindings,
@@ -1193,6 +1194,7 @@ export class StateStore {
       flowId: optionalString(row.flow_id), flowStatus: optionalString(row.flow_status),
       finalOutput: optionalString(row.final_output), flowSteps: steps.map(rowToFlowStep),
       reviewReady: payload.reviewReady === true, diffHash: optionalString(row.diff_hash),
+      autonomous: payload.autonomous === true,
       approvalState: String(row.approval_state) as RepoTask["approvalState"],
       approvalPurpose: optionalString(row.approval_purpose) as RepoTask["approvalPurpose"],
       approvalId: optionalString(row.approval_id), validation: array(payload.validation),

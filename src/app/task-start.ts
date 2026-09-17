@@ -47,14 +47,16 @@ export function resolveStartTemplate(repo: StartRepository | undefined, explicit
   return { source: enabled.length ? "selection_required" : "none_enabled" };
 }
 
+export type TaskStartForm = Readonly<{ repoId: string; templateId: string; prompt: string; autonomous?: boolean; explicitOverrideId?: string }>;
+
 export type TaskStartSubmissionOptions = {
-  form: Readonly<{ repoId: string; templateId: string; prompt: string; explicitOverrideId?: string }>;
+  form: TaskStartForm;
   acquire: () => boolean;
   release: () => void;
   setBusy: (busy: boolean) => void;
   clearError: () => void;
   setError: (error: string) => void;
-  request: (form: Readonly<{ repoId: string; templateId: string; prompt: string; explicitOverrideId?: string }>) => Promise<void>;
+  request: (form: TaskStartForm) => Promise<void>;
 };
 
 export async function submitTaskStart({ form, acquire, release, setBusy, clearError, setError, request }: TaskStartSubmissionOptions) {
