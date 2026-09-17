@@ -151,7 +151,7 @@ let tasksLoaded = false;
 let recoveryPromise: Promise<void> | undefined;
 
 const transitions: Record<TaskStatus, readonly TaskStatus[]> = {
-  draft: ["reviewed"],
+  draft: ["reviewed", "validation_failed"],
   reviewed: ["draft", "awaiting_approval"],
   awaiting_approval: ["draft", "validating"],
   validating: ["committing", "committing_rework", "validation_failed", "secret_scan_failed", "approval_invalidated"],
