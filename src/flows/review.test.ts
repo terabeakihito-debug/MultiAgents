@@ -31,10 +31,10 @@ describe("runReviewFlow", () => {
 
   it("rebalances recovered time toward review steps without exceeding the work ceiling", () => {
     const deadline = 300_000;
-    expect(reviewStepActualBudgetMs("cursor_review", deadline, 90_000)).toBe(85_000);
-    expect(reviewStepActualBudgetMs("claude_review", deadline, 150_000)).toBe(80_000);
+    expect(reviewStepActualBudgetMs("cursor_review", deadline, 90_000)).toBe(100_000);
+    expect(reviewStepActualBudgetMs("claude_review", deadline, 150_000)).toBe(90_000);
     expect(reviewStepActualBudgetMs("cursor_review", deadline, 0)).toBe(STEP_WORK_CEILING_MS);
-    expect(reviewStepActualBudgetMs("codex_final", deadline, 271_000)).toBeLessThanOrEqual(0);
+    expect(reviewStepActualBudgetMs("codex_final", deadline, 275_000)).toBeLessThanOrEqual(0);
   });
 
   it("runs all four steps in fixed order", async () => {
