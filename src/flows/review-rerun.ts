@@ -1,12 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { agents as defaultAgents } from "../agents";
 import { flowStepIds, rerunnableStepIds, type AgentAdapter, type AgentId, type FlowStep, type RerunnableStepId, type ReviewRerunEvent, type ReviewRerunResult } from "../agents/types";
-import { MAX_FLOW_MS, claudePrompt, cursorPrompt, draftPrompt, finalPrompt } from "./review";
+import { isReviewFlowTimeoutAbortReason, isReviewStepBudgetAbortReason, reviewFlowTimeoutAbortReason, reviewStepBudgetAbortReason } from "../agents/abort-origin";
+import { MAX_FLOW_MS, claudePrompt, cursorPrompt, draftPrompt, finalPrompt, reviewStepActualBudgetMs } from "./review";
 import { createEventStream } from "./event-stream";
 import type { RolePolicy } from "../profiles/policy";
 import type { RuntimePolicy } from "../runtime/types";
 import { buildGenericRuntimePolicy } from "../server/runtime-policy";
-import { reviewFlowTimeoutAbortReason } from "../agents/abort-origin";
+import { withProviderWorkBoundary } from "../server/provider-work-boundary";
 
 export const MAX_STEP_OUTPUT_CHARS = 1_000_000;
 type AgentSet = Record<AgentId, AgentAdapter>;
@@ -23,7 +24,7 @@ type RerunOptions = {
   roles?: RolePolicy;
   fingerprint?: () => Promise<string>;
   runtimePolicies?: Record<AgentId, RuntimePolicy>;
-  executeAgent?: (agent: AgentId, prompt: string, signal: AbortSignal, stepId: RerunnableStepId) => Promise<import("../agents/types").AgentResult>;
+  executeAgent?: (agent: AgentId, prompt: string, signal: AbortSignal, stepId: RerunnableStepId, onProviderWorkStart?: () => boolean | void, onChildClose?: () => void) => Promise<import("../agents/types").AgentResult>;
 };
 
 export type ReviewRerunRequest = { prompt: string; flowId: string; stepId: RerunnableStepId; steps: FlowStep[] };
@@ -72,6 +73,7 @@ export async function rerunReviewStep(request: ReviewRerunRequest, options: Reru
   const target = steps.find((step) => step.id === request.stepId)!;
   const previousOutput = target.output;
   const controller = new AbortController();
+  const rerunDeadlineMs = now() + (options.maxRerunMs ?? MAX_FLOW_MS);
   let timedOut = false;
   const abortFromRequest = () => controller.abort(options.signal?.reason);
   options.signal?.addEventListener("abort", abortFromRequest, { once: true });
@@ -91,6 +93,38 @@ export async function rerunReviewStep(request: ReviewRerunRequest, options: Reru
     target.inputSummary = `${input.length.toLocaleString("en-US")} characters`;
     options.log?.({ flowId: request.flowId, rerunId, stepId: request.stepId, agent: target.agent, status: "running" });
     emit(options.onEvent, { type: "rerun_step_started", flowId: request.flowId, rerunId, step: { ...target } });
+    const stepController = new AbortController();
+    const abortFromParent = () => stepController.abort(controller.signal.reason);
+    controller.signal.addEventListener("abort", abortFromParent, { once: true });
+    if (controller.signal.aborted) abortFromParent();
+    let budgetTimer: NodeJS.Timeout | undefined;
+    let workStarted = false;
+    let childClosed = false;
+    let stepBudgetExceeded = false;
+    const startWorkBudget = () => {
+      if (workStarted || stepController.signal.aborted) return !stepController.signal.aborted;
+      workStarted = true;
+      const budgetMs = Math.min(
+        reviewStepActualBudgetMs(request.stepId, now() + MAX_FLOW_MS, now()),
+        Math.max(0, rerunDeadlineMs - now()),
+      );
+      if (budgetMs <= 0) {
+        stepBudgetExceeded = true;
+        stepController.abort(reviewStepBudgetAbortReason());
+        return false;
+      }
+      budgetTimer = setTimeout(() => {
+        stepBudgetExceeded = true;
+        stepController.abort(reviewStepBudgetAbortReason());
+      }, budgetMs);
+      budgetTimer.unref();
+      return true;
+    };
+    const stopWorkBudgetAtChildClose = () => {
+      if (childClosed) return;
+      childClosed = true;
+      if (budgetTimer) clearTimeout(budgetTimer);
+    };
     const policy = options.runtimePolicies?.[target.agent] ?? buildGenericRuntimePolicy(target.agent);
     const configuredRole = policy.role;
     if (configuredRole === "disabled") {
@@ -99,9 +133,13 @@ export async function rerunReviewStep(request: ReviewRerunRequest, options: Reru
       target.error = `${target.agent} is disabled by the task profile`;
     }
     try {
+      if (!options.executeAgent && adapters[target.agent].supportsProviderWorkBoundary !== true) startWorkBudget();
+      const operation = () => configuredRole === "disabled" ? undefined : options.executeAgent
+        ? options.executeAgent(target.agent, input, stepController.signal, request.stepId, startWorkBudget, stopWorkBudgetAtChildClose)
+        : adapters[target.agent].run(input, { signal: stepController.signal, policy, onChildClose: stopWorkBudgetAtChildClose });
       const result = configuredRole === "disabled" ? undefined : options.executeAgent
-        ? await options.executeAgent(target.agent, input, controller.signal, request.stepId)
-        : await adapters[target.agent].run(input, { signal: controller.signal, policy });
+        ? await operation()
+        : await withProviderWorkBoundary(startWorkBudget, operation);
       if (!result) {
         // Disabled roles are never executed.
       } else if (result.status === "completed") {
@@ -113,13 +151,18 @@ export async function rerunReviewStep(request: ReviewRerunRequest, options: Reru
         target.output = previousOutput;
         target.error = `Re-run failed: ${result.error ?? "Agent execution failed"}`;
         target.runtimeViolation = result.runtimeViolation;
-        target.terminationReason = result.terminationReason;
+        target.terminationReason = result.terminationReason ?? rerunAbortTerminationReason(stepController.signal, stepBudgetExceeded);
       }
     } catch (error) {
       target.status = "error";
       target.output = previousOutput;
       target.error = `Re-run failed: ${error instanceof Error ? error.message : "Agent execution failed"}`;
+      target.terminationReason = rerunAbortTerminationReason(stepController.signal, stepBudgetExceeded);
+    } finally {
+      if (budgetTimer) clearTimeout(budgetTimer);
+      controller.signal.removeEventListener("abort", abortFromParent);
     }
+    if (target.terminationReason === "step_budget_exhausted") target.error = "Review step budget exhausted.";
     const end = now();
     target.completedAt = new Date(end).toISOString();
     target.durationMs = Math.max(0, end - start);
@@ -134,6 +177,12 @@ export async function rerunReviewStep(request: ReviewRerunRequest, options: Reru
     clearTimeout(timeout);
     options.signal?.removeEventListener("abort", abortFromRequest);
   }
+}
+
+function rerunAbortTerminationReason(signal: AbortSignal, stepBudgetExceeded: boolean): FlowStep["terminationReason"] {
+  if (stepBudgetExceeded || isReviewStepBudgetAbortReason(signal.reason)) return "step_budget_exhausted";
+  if (isReviewFlowTimeoutAbortReason(signal.reason)) return "flow_aborted";
+  return signal.aborted ? "request_aborted" : undefined;
 }
 
 export function createReviewRerunStream(request: ReviewRerunRequest, requestSignal: AbortSignal, runner = rerunReviewStep, options: { cwd?: string; roles?: RolePolicy; fingerprint?: () => Promise<string>; runtimePolicies?: Record<AgentId, RuntimePolicy>; executeAgent?: RerunOptions["executeAgent"]; onComplete?: (result: ReviewRerunResult) => void; onEvent?: (event: ReviewRerunEvent) => void } = {}) {
