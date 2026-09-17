@@ -6,6 +6,7 @@ import { DashboardQueryError } from "../core/dashboard-tasks-service";
 import { RepoProfileNotFoundError } from "../core/repo-profile-service";
 import { RepoPullsRequestError } from "../core/repo-pulls-service";
 import { RepoTemplatesNotFoundError } from "../core/repo-templates-service";
+import { FindingDetailNotFoundError } from "../core/finding-detail-service";
 import { RemediationQueueQueryError } from "../core/findings-queue-service";
 import { NotificationInputError } from "../core/notification-list-service";
 import {
@@ -165,6 +166,11 @@ function dependencies(
       counts: { total: 1 },
       limit: 100,
       offset: 0,
+    })) as never,
+    loadFindingDetail: vi.fn(() => ({
+      finding: { findingId: "f-1" },
+      remediation: { findingId: "f-1", status: "open" },
+      history: [],
     })) as never,
     loadOperationsOverview: vi.fn(async () => ({
       overall: "ok",
@@ -2716,6 +2722,54 @@ describe("daemon HTTP router", () => {
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Not found" });
     expect(loadFindingsQueue).not.toHaveBeenCalled();
+  });
+
+  it("serves finding detail through the core finding-detail boundary", async () => {
+    const payload = {
+      finding: { findingId: "f-1" },
+      remediation: { findingId: "f-1", status: "open" },
+      history: [{ event: "created" }],
+    };
+    const loadFindingDetail = vi.fn(() => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadFindingDetail }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/findings/f-1"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadFindingDetail).toHaveBeenCalledWith("f-1");
+  });
+
+  it("returns 404 when finding detail is missing", async () => {
+    const loadFindingDetail = vi.fn(() => {
+      throw new FindingDetailNotFoundError();
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadFindingDetail }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/findings/missing"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Finding not found" });
+  });
+
+  it("does not expose finding detail on unsupported methods", async () => {
+    const loadFindingDetail = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadFindingDetail }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/findings/f-1"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(loadFindingDetail).not.toHaveBeenCalled();
   });
 
   it("rejects a non-loopback Host header on findings queue", async () => {

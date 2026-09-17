@@ -68,6 +68,10 @@ import { cleanupExecuteMutationService } from "../core/cleanup-execute-mutation-
 import { cleanupPreviewMutationService } from "../core/cleanup-preview-mutation-service";
 import { credentialStatusService } from "../core/credential-status-service";
 import {
+  FindingDetailNotFoundError,
+  findingDetailService,
+} from "../core/finding-detail-service";
+import {
   findingsQueueService,
   RemediationQueueQueryError,
 } from "../core/findings-queue-service";
@@ -257,6 +261,7 @@ type DaemonHttpDependencies = {
   applyNotificationSlackMarkDeliveredMutation: typeof notificationSlackMarkDeliveredMutationService.apply;
   applyNotificationSlackDeliveryDismissMutation: typeof notificationSlackDeliveryDismissMutationService.apply;
   loadFindingsQueue: typeof findingsQueueService.load;
+  loadFindingDetail: typeof findingDetailService.load;
   loadOperationsOverview: typeof operationsOverviewService.load;
   applyOperationsProviderRefreshMutation: typeof operationsProviderRefreshMutationService.apply;
   applyOperationsProviderAcknowledgeMutation: typeof operationsProviderAcknowledgeMutationService.apply;
@@ -353,6 +358,7 @@ export function createDaemonHttpHandler(
     applyNotificationSlackDeliveryDismissMutation: (notificationId) =>
       notificationSlackDeliveryDismissMutationService.apply(notificationId),
     loadFindingsQueue: (url) => findingsQueueService.load(url),
+    loadFindingDetail: (findingId) => findingDetailService.load(findingId),
     loadOperationsOverview: () => operationsOverviewService.load(),
     applyOperationsProviderRefreshMutation: () =>
       operationsProviderRefreshMutationService.apply(),
@@ -1999,6 +2005,30 @@ export function createDaemonHttpHandler(
       return;
     }
 
+    const findingDetailId = matchFindingDetailPath(url.pathname);
+    if (findingDetailId) {
+      if (request.method !== "GET") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          dependencies.loadFindingDetail(findingDetailId),
+        );
+      } catch (error) {
+        writeJson(response, 404, {
+          error:
+            error instanceof Error
+              ? error.message
+              : "Could not load finding",
+        });
+      }
+      return;
+    }
+
     if (request.method === "GET" && url.pathname === "/operations/overview") {
       try {
         writeJson(response, 200, await dependencies.loadOperationsOverview());
@@ -3197,6 +3227,11 @@ function matchTaskDependencyRecoveryInstructionsPath(pathname: string) {
 
 function matchTaskFindingsExtractPath(pathname: string) {
   const match = /^\/tasks\/([^/]+)\/findings\/extract$/.exec(pathname);
+  return decodePathSegment(match?.[1]);
+}
+
+function matchFindingDetailPath(pathname: string) {
+  const match = /^\/findings\/([^/]+)$/.exec(pathname);
   return decodePathSegment(match?.[1]);
 }
 
