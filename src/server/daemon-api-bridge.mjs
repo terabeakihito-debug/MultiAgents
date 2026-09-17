@@ -33,8 +33,8 @@ export function createDaemonApiBridge(options = {}) {
   const loadHandler =
     options.loadHandler ??
     (async () => {
-      const module = await import(daemonRouterPath);
-      return module.createDaemonHttpHandler();
+      const daemonModule = await import(daemonRouterPath);
+      return daemonModule.createDaemonHttpHandler();
     });
 
   /** @type {Promise<(request: import("node:http").IncomingMessage, response: import("node:http").ServerResponse) => Promise<void>> | undefined} */

@@ -11,7 +11,7 @@ const daemonRouterPath = join(
 let handlerPromise;
 
 async function loadDaemonHandler() {
-  handlerPromise ??= import(daemonRouterPath).then((module) =>
+  handlerPromise ??= import(/* webpackIgnore: true */ /* turbopackIgnore: true */ daemonRouterPath).then((module) =>
     module.createDaemonHttpHandler(),
   );
   return handlerPromise;
@@ -97,7 +97,7 @@ function createWebResponseCollector() {
           },
         });
         return new Response(readable, {
-          status: statusCode,
+          status: response.statusCode,
           headers: Object.fromEntries(headers.entries()),
         });
       }
