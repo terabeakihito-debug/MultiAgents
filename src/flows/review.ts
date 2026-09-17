@@ -49,11 +49,10 @@ const downstreamMinimumWorkMs: Partial<Record<FlowStepId, number>> = {
   codex_final: 30_000,
 };
 
-// Keep the initial implementation step at the established 90s ceiling so the
-// final-step reserve reduction benefits the two independent review steps rather
-// than letting the draft consume the recovered time.
+// Keep 10s of slack below the 120s budget available at flow start while giving
+// the initial implementation step enough time for a normal Codex response.
 const stepWorkCeilingMs: Partial<Record<FlowStepId, number>> = {
-  codex_draft: 90_000,
+  codex_draft: 110_000,
 };
 
 /**

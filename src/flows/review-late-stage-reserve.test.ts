@@ -9,7 +9,7 @@ function completed(agent: AgentResult["agent"], output: string): AgentResult {
 describe("late-stage review reserve", () => {
   it("keeps enough Claude work time for the observed UI-shaped schedule", () => {
     const deadline = 300_000;
-    expect(reviewStepActualBudgetMs("codex_draft", deadline, 0)).toBe(90_000);
+    expect(reviewStepActualBudgetMs("codex_draft", deadline, 0)).toBe(110_000);
     expect(reviewStepActualBudgetMs("cursor_review", deadline, 85_000)).toBe(90_000);
     expect(reviewStepActualBudgetMs("claude_review", deadline, 150_000)).toBe(80_000);
     expect(reviewStepActualBudgetMs("codex_final", deadline, 230_000)).toBe(40_000);

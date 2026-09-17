@@ -49,7 +49,7 @@ describe("rerunReviewStep", () => {
         });
       },
     });
-    await vi.advanceTimersByTimeAsync(90_000);
+    await vi.advanceTimersByTimeAsync(110_000);
     const result = await promise;
     expect(result.steps[0]).toMatchObject({ status: "error", terminationReason: "step_budget_exhausted", error: "Review step budget exhausted." });
     vi.useRealTimers();
