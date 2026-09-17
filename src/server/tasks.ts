@@ -82,6 +82,7 @@ export type RepoTask = {
   worktreeAvailable: boolean;
   status: TaskStatus;
   prompt: string;
+  autonomous?: boolean;
   reviewReady: boolean;
   diffHash?: string;
   approvalId?: string;
@@ -181,7 +182,7 @@ const transitions: Record<TaskStatus, readonly TaskStatus[]> = {
   archived: [],
 };
 
-export async function createTask(repoId: string, options: { allowedRoot?: string; worktreeRoot?: string; templateId?: string; prompt?: string; sourceFindingId?: string; sourceTaskId?: string } = {}): Promise<RepoTask> {
+export async function createTask(repoId: string, options: { allowedRoot?: string; worktreeRoot?: string; templateId?: string; prompt?: string; autonomous?: boolean; sourceFindingId?: string; sourceTaskId?: string } = {}): Promise<RepoTask> {
   loadPersistedTasks();
   const allowedRoot = options.allowedRoot ?? ALLOWED_ROOT;
   const repo = await validateRepository(repoId, allowedRoot);
@@ -190,6 +191,7 @@ export async function createTask(repoId: string, options: { allowedRoot?: string
   const profile = taskProfileSnapshot(await getOrCreateRepoProfile(repoId, allowedRoot));
   requireUsableTaskProfile(profile, repoId);
   const template = await selectTaskTemplate(repoId, options.templateId, profile, allowedRoot);
+  if (options.autonomous === true && template.readOnly) throw new Error("Autonomous execution requires a writable task template");
   if (options.prompt !== undefined && (typeof options.prompt !== "string" || options.prompt.length > 20_000)) throw new Error("Task prompt is invalid");
   if ((options.sourceFindingId !== undefined && !/^[0-9a-f-]{36}$/i.test(options.sourceFindingId)) || (options.sourceTaskId !== undefined && !/^[0-9a-f-]{36}$/i.test(options.sourceTaskId))) throw new Error("Task source linkage is invalid");
   if (Boolean(options.sourceFindingId) !== Boolean(options.sourceTaskId)) throw new Error("Task source linkage must include both finding and task IDs");
@@ -223,6 +225,7 @@ export async function createTask(repoId: string, options: { allowedRoot?: string
     worktreeAvailable: false,
     status: "draft",
     prompt: options.prompt?.trim() ?? "",
+    autonomous: options.autonomous === true,
     reviewReady: false,
     approvalState: "unavailable",
     originalTaskAvailable: true,
@@ -408,6 +411,7 @@ export function publicTask(task: RepoTask) {
     ciMessage: task.ciMessage,
     error: task.error,
     prompt: task.prompt,
+    autonomous: task.autonomous,
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
     flowId: task.flowId,

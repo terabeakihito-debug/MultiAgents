@@ -12,6 +12,8 @@ describe("task service", () => {
       templateId: "template",
       prompt: "do work",
     });
+    expect(parseTaskCreateRequest({ repoId: "repo", autonomous: true })).toMatchObject({ repoId: "repo", autonomous: true });
+    expect(() => parseTaskCreateRequest({ repoId: "repo", autonomous: "yes" })).toThrow("Autonomous execution flag is invalid");
     expect(() => parseTaskCreateRequest({})).toThrowError(TaskRequestError);
     expect(() => parseTaskCreateRequest({ forbidden: true })).toThrow("Repository is required");
     expect(() => parseTaskCreateRequest({ repoId: "repo", forbidden: true })).toThrow("Task creation contains a forbidden field");
@@ -45,5 +47,14 @@ describe("task service", () => {
     expect(initializeRecovery).toHaveBeenCalledTimes(1);
     expect(create).toHaveBeenCalledWith("repo", { templateId: "template", prompt: "do work" });
     expect(toPublic).toHaveBeenCalledWith(task);
+  });
+
+  it("passes the autonomous flag only when requested", async () => {
+    const initializeRecovery = vi.fn(async () => undefined);
+    const create = vi.fn(async () => task);
+    const service = createTaskService({ initializeRecovery, list: vi.fn(() => []), create, toPublic: vi.fn(() => projectedTask) } as unknown as Parameters<typeof createTaskService>[0]);
+
+    await service.create({ repoId: "repo", prompt: "do work", autonomous: true });
+    expect(create).toHaveBeenCalledWith("repo", { prompt: "do work", autonomous: true });
   });
 });
