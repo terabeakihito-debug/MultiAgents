@@ -120,6 +120,7 @@ export function attentionPresentation(task: {
   worktreeStatus: string;
   canReassociate?: boolean;
   canRefreshPr?: boolean;
+  dependencyRecovery?: "dependency_setup_required";
 }): AttentionPresentation {
   if (task.worktreeStatus === "missing") {
     return task.canReassociate
@@ -130,6 +131,7 @@ export function attentionPresentation(task: {
   if (task.recoveryStatus === "invalid" || task.worktreeStatus === "invalid") {
     return { label: "安全に再開できない状態です", explanation: task.recoveryMessage ? `安全に再開できない状態です。${task.recoveryMessage}` : "安全に再開できない状態です。詳細を確認してください。", action: "open" };
   }
+  if (task.dependencyRecovery === "dependency_setup_required") return { label: "依存関係の準備が必要", explanation: "依存関係が未導入です。タスクを開いて復旧操作を実行してください。", action: "open" };
   if (task.status === "validation_failed" || task.status === "secret_scan_failed") return { label: taskStatusLabel(task.status), explanation: "安全チェックで停止しました。詳細を確認してから次の操作を選んでください。", action: "open" };
   if (task.status === "ci_failed") return { label: "CIで停止", explanation: "CIの確認で停止しました。PRと詳細を確認してください。", action: task.canRefreshPr ? "refresh_pr" : "open" };
   if (task.status === "pr_failed") return { label: "PR作成に失敗", explanation: "PRの作成で停止しました。詳細を確認してから再試行してください。", action: "open" };

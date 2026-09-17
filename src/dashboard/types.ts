@@ -44,6 +44,7 @@ export type DashboardTask = {
   createdAt: string;
   updatedAt: string;
   inactive: boolean;
+  dependencyRecovery?: "dependency_setup_required";
   recoveryStatus: string;
   recoveryMessage?: string;
   worktreeStatus: string;

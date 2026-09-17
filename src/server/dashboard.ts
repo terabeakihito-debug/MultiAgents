@@ -147,6 +147,7 @@ async function dashboardTask(row: DashboardRow, now: Date): Promise<DashboardTas
     prNumber: row.prNumber, prUrl, prState: typeof review.state === "string" ? review.state : undefined,
     createdAt: row.createdAt, updatedAt: row.updatedAt,
     inactive: now.getTime() - Date.parse(row.updatedAt) >= INACTIVE_AFTER_MS,
+    dependencyRecovery: row.payload.dependencyRecovery === "dependency_setup_required" ? "dependency_setup_required" : undefined,
     recoveryStatus: row.recoveryStatus, recoveryMessage: row.recoveryMessage, worktreeStatus: row.worktreeStatus,
     // This is task metadata, not a filesystem measurement, so it remains safe
     // for the hot path. Detailed inventory fields belong to Operations.

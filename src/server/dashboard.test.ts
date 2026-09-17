@@ -54,6 +54,12 @@ describe("Phase 9 dashboard query", () => {
     expect(result.tasks[0].worktreeAgeHours).toBe(Math.max(0, (now.getTime() - Date.parse(result.tasks[0].updatedAt)) / 3_600_000));
   });
 
+  it("exposes dependency recovery to the dashboard presentation", async () => {
+    store.saveTask(task("13111111-1111-4111-8111-111111111111", "draft", { flowStatus: "error", dependencyRecovery: "dependency_setup_required" }));
+    const result = await getDashboard(query(), new Date("2026-01-01T00:00:01.000Z"));
+    expect(result.tasks[0]).toMatchObject({ dependencyRecovery: "dependency_setup_required", bucket: "needs_attention" });
+  });
+
   it("keeps cheap worktree age but omits Operations-only filesystem inventory metadata", async () => {
     const item = task("12111111-1111-4111-8111-111111111111", "draft", { updatedAt: "2026-01-01T00:00:00.000Z" });
     store.saveTask(item);

@@ -58,6 +58,7 @@ describe("task presentation labels", () => {
     expect(attentionPresentation({ status: "commit_failed", bucket: "needs_attention", recoveryStatus: "orphaned", worktreeStatus: "available" })).toMatchObject({ action: "open", explanation: "作業領域との関連を確認する必要があります。詳細を確認してください。" });
     expect(attentionPresentation({ status: "commit_failed", bucket: "needs_attention", recoveryStatus: "invalid", recoveryMessage: "復旧前に履歴を確認してください。", worktreeStatus: "invalid" }).explanation).toContain("復旧前に履歴を確認してください。");
     expect(attentionPresentation({ status: "validation_failed", bucket: "needs_attention", recoveryStatus: "needs_attention", worktreeStatus: "available" }).explanation).toContain("安全チェック");
+    expect(attentionPresentation({ status: "draft", bucket: "needs_attention", recoveryStatus: "recoverable", worktreeStatus: "available", dependencyRecovery: "dependency_setup_required" })).toMatchObject({ label: "依存関係の準備が必要", action: "open" });
     expect(attentionPresentation({ status: "pr_failed", bucket: "needs_attention", recoveryStatus: "needs_attention", worktreeStatus: "available" }).explanation).toContain("PRの作成");
     expect(attentionPresentation({ status: "ci_failed", bucket: "needs_attention", recoveryStatus: "needs_attention", worktreeStatus: "available", canRefreshPr: true }).action).toBe("refresh_pr");
   });
