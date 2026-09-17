@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "npm run daemon:build && node server.mjs --dev",
-    "build": "next build",
+    "build": "npm run daemon:build && next build",
     "start": "npm run daemon:build && NODE_ENV=production node server.mjs",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
