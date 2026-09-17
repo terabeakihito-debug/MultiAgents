@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { agents as defaultAgents } from "../agents";
 import { flowStepIds, rerunnableStepIds, type AgentAdapter, type AgentId, type FlowStep, type RerunnableStepId, type ReviewRerunEvent, type ReviewRerunResult } from "../agents/types";
 import { isReviewFlowTimeoutAbortReason, isReviewStepBudgetAbortReason, reviewFlowTimeoutAbortReason, reviewStepBudgetAbortReason } from "../agents/abort-origin";
-import { MAX_FLOW_MS, claudePrompt, cursorPrompt, draftPrompt, finalPrompt, reviewStepActualBudgetMs } from "./review";
+import { MAX_FLOW_MS, claudePrompt, cursorPrompt, draftPrompt, finalPrompt, reviewStepWorkCeilingMs } from "./review";
 import { createEventStream } from "./event-stream";
 import type { RolePolicy } from "../profiles/policy";
 import type { RuntimePolicy } from "../runtime/types";
@@ -23,6 +23,8 @@ type RerunOptions = {
   cwd?: string;
   roles?: RolePolicy;
   fingerprint?: () => Promise<string>;
+  getDiff?: () => Promise<string>;
+  repositoryReadOnly?: boolean;
   runtimePolicies?: Record<AgentId, RuntimePolicy>;
   executeAgent?: (agent: AgentId, prompt: string, signal: AbortSignal, stepId: RerunnableStepId, onProviderWorkStart?: () => boolean | void, onChildClose?: () => void) => Promise<import("../agents/types").AgentResult>;
 };
@@ -89,7 +91,8 @@ export async function rerunReviewStep(request: ReviewRerunRequest, options: Reru
     target.startedAt = new Date(start).toISOString();
     target.completedAt = undefined;
     target.durationMs = undefined;
-    const input = buildRerunPrompt(request.prompt, request.stepId, steps);
+    const diff = options.getDiff ? await options.getDiff() : "";
+    const input = buildRerunPrompt(request.prompt, request.stepId, steps, diff, options.repositoryReadOnly === true);
     target.inputSummary = `${input.length.toLocaleString("en-US")} characters`;
     options.log?.({ flowId: request.flowId, rerunId, stepId: request.stepId, agent: target.agent, status: "running" });
     emit(options.onEvent, { type: "rerun_step_started", flowId: request.flowId, rerunId, step: { ...target } });
@@ -105,7 +108,7 @@ export async function rerunReviewStep(request: ReviewRerunRequest, options: Reru
       if (workStarted || stepController.signal.aborted) return !stepController.signal.aborted;
       workStarted = true;
       const budgetMs = Math.min(
-        reviewStepActualBudgetMs(request.stepId, now() + MAX_FLOW_MS, now()),
+        reviewStepWorkCeilingMs(request.stepId),
         Math.max(0, rerunDeadlineMs - now()),
       );
       if (budgetMs <= 0) {
@@ -169,7 +172,7 @@ export async function rerunReviewStep(request: ReviewRerunRequest, options: Reru
     options.log?.({ flowId: request.flowId, rerunId, stepId: request.stepId, agent: target.agent, status: target.status, durationMs: target.durationMs });
     emit(options.onEvent, { type: target.status === "completed" ? "rerun_step_completed" : "rerun_step_error", flowId: request.flowId, rerunId, step: { ...target } });
     if (target.status === "completed") markDownstreamStale(steps, request.stepId);
-    const status = timedOut ? "timed_out" : controller.signal.aborted ? "aborted" : target.status === "completed" ? "completed" : "error";
+    const status = timedOut ? "timed_out" : controller.signal.aborted ? "aborted" : target.status === "error" ? "error" : "completed";
     const result: ReviewRerunResult = { flowId: request.flowId, rerunId, stepId: request.stepId, status, steps, finalOutput: steps[3].output };
     emit(options.onEvent, { type: status === "timed_out" ? "rerun_timed_out" : status === "aborted" ? "rerun_aborted" : "rerun_completed", flowId: request.flowId, rerunId, result });
     return result;
@@ -185,7 +188,7 @@ function rerunAbortTerminationReason(signal: AbortSignal, stepBudgetExceeded: bo
   return signal.aborted ? "request_aborted" : undefined;
 }
 
-export function createReviewRerunStream(request: ReviewRerunRequest, requestSignal: AbortSignal, runner = rerunReviewStep, options: { cwd?: string; roles?: RolePolicy; fingerprint?: () => Promise<string>; runtimePolicies?: Record<AgentId, RuntimePolicy>; executeAgent?: RerunOptions["executeAgent"]; onComplete?: (result: ReviewRerunResult) => void; onEvent?: (event: ReviewRerunEvent) => void } = {}) {
+export function createReviewRerunStream(request: ReviewRerunRequest, requestSignal: AbortSignal, runner = rerunReviewStep, options: { cwd?: string; roles?: RolePolicy; fingerprint?: () => Promise<string>; getDiff?: () => Promise<string>; repositoryReadOnly?: boolean; runtimePolicies?: Record<AgentId, RuntimePolicy>; executeAgent?: RerunOptions["executeAgent"]; onComplete?: (result: ReviewRerunResult) => void; onEvent?: (event: ReviewRerunEvent) => void } = {}) {
   const { onComplete, onEvent, ...runnerOptions } = options;
   return createEventStream(requestSignal, async ({ signal, send }) => {
     const result = await runner(request, {
@@ -199,12 +202,12 @@ export function createReviewRerunStream(request: ReviewRerunRequest, requestSign
   }, "review_rerun_event");
 }
 
-function buildRerunPrompt(prompt: string, stepId: RerunnableStepId, steps: FlowStep[]) {
+function buildRerunPrompt(prompt: string, stepId: RerunnableStepId, steps: FlowStep[], diff: string, repositoryReadOnly: boolean) {
   const draft = steps[0].output;
-  if (stepId === "codex_draft") return draftPrompt(prompt, true);
-  if (stepId === "cursor_review") return cursorPrompt(prompt, draft);
-  if (stepId === "claude_review") return claudePrompt(prompt, draft, steps[1]);
-  return finalPrompt(prompt, draft, steps[1], steps[2]);
+  if (stepId === "codex_draft") return draftPrompt(prompt, true, repositoryReadOnly);
+  if (stepId === "cursor_review") return cursorPrompt(prompt, draft, diff);
+  if (stepId === "claude_review") return claudePrompt(prompt, draft, steps[1], diff);
+  return finalPrompt(prompt, draft, steps[1], steps[2], diff, true, repositoryReadOnly);
 }
 
 function markDownstreamStale(steps: FlowStep[], stepId: RerunnableStepId) {
