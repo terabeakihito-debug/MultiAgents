@@ -39,6 +39,22 @@ describe("rerunReviewStep", () => {
     expect(result.steps[0].output).toBe("draft-new");
   });
 
+  it("passes a provider-work boundary and enforces the draft step budget on rerun", async () => {
+    vi.useFakeTimers();
+    const promise = rerunReviewStep(request("codex_draft"), {
+      executeAgent: async (id, _prompt, signal, _stepId, onProviderWorkStart) => {
+        expect(onProviderWorkStart?.()).toBe(true);
+        return new Promise((resolve) => {
+          signal.addEventListener("abort", () => resolve({ agent: id, status: "error", output: "", error: "Request was aborted" }), { once: true });
+        });
+      },
+    });
+    await vi.advanceTimersByTimeAsync(90_000);
+    const result = await promise;
+    expect(result.steps[0]).toMatchObject({ status: "error", terminationReason: "step_budget_exhausted", error: "Review step budget exhausted." });
+    vi.useRealTimers();
+  });
+
   it("replaces Cursor and marks Claude and Final stale while retaining their output", async () => {
     const result = await rerunReviewStep(request("cursor_review"), { agents: agents(async (id) => ({ agent: id, status: "completed", output: "cursor-new" })) });
     expect(result.status).toBe("completed");
