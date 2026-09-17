@@ -23,22 +23,23 @@ describe("daemon API bridge", () => {
     expect(incoming.url).toBe("/tasks");
   });
 
-  it("defaults to enabled in dev unless explicitly disabled", () => {
+  it("defaults to enabled unless MULTIAGENTS_USE_DAEMON_API=0", () => {
     const previous = process.env.MULTIAGENTS_USE_DAEMON_API;
     delete process.env.MULTIAGENTS_USE_DAEMON_API;
-    expect(isDaemonApiBridgeEnabled(true)).toBe(true);
+    expect(isDaemonApiBridgeEnabled()).toBe(true);
     process.env.MULTIAGENTS_USE_DAEMON_API = "0";
-    expect(isDaemonApiBridgeEnabled(true)).toBe(false);
+    expect(isDaemonApiBridgeEnabled()).toBe(false);
     process.env.MULTIAGENTS_USE_DAEMON_API = "1";
-    expect(isDaemonApiBridgeEnabled(false)).toBe(true);
+    expect(isDaemonApiBridgeEnabled()).toBe(true);
     if (previous === undefined) delete process.env.MULTIAGENTS_USE_DAEMON_API;
     else process.env.MULTIAGENTS_USE_DAEMON_API = previous;
   });
 
   it("delegates bridged api requests to the daemon handler", async () => {
     const handler = vi.fn(async () => undefined);
+    const previous = process.env.MULTIAGENTS_USE_DAEMON_API;
+    delete process.env.MULTIAGENTS_USE_DAEMON_API;
     const bridge = createDaemonApiBridge({
-      devMode: true,
       loadHandler: async () => handler,
     });
     const incoming = request("/api/human-session");
@@ -47,5 +48,7 @@ describe("daemon API bridge", () => {
     await expect(bridge.tryHandle(incoming, response)).resolves.toBe(true);
     expect(incoming.url).toBe("/human-session");
     expect(handler).toHaveBeenCalledWith(incoming, response);
+    if (previous === undefined) delete process.env.MULTIAGENTS_USE_DAEMON_API;
+    else process.env.MULTIAGENTS_USE_DAEMON_API = previous;
   });
 });

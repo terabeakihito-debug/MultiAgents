@@ -125,7 +125,7 @@ async function main() {
   console.info("startup_phase", JSON.stringify({ phase: "operational_init" }));
   await awaitOperationalStartup();
   const handle = app.getRequestHandler();
-  const daemonApiBridge = createDaemonApiBridge({ devMode: dev });
+  const daemonApiBridge = createDaemonApiBridge();
   server = createServer((request, response) => {
     if (!accepting) { response.statusCode = 503; response.end("shutting_down"); return; }
     void (async () => {

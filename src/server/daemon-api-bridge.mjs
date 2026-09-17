@@ -25,15 +25,11 @@ export function stripApiPrefixFromRequestUrl(request) {
   return true;
 }
 
-export function isDaemonApiBridgeEnabled(devMode = false) {
-  const value = process.env.MULTIAGENTS_USE_DAEMON_API;
-  if (value === "1") return true;
-  if (value === "0") return false;
-  return devMode;
+export function isDaemonApiBridgeEnabled() {
+  return process.env.MULTIAGENTS_USE_DAEMON_API !== "0";
 }
 
 export function createDaemonApiBridge(options = {}) {
-  const devMode = options.devMode ?? false;
   const loadHandler =
     options.loadHandler ??
     (async () => {
@@ -46,7 +42,7 @@ export function createDaemonApiBridge(options = {}) {
 
   return {
     isEnabled() {
-      return isDaemonApiBridgeEnabled(devMode);
+      return isDaemonApiBridgeEnabled();
     },
     async tryHandle(request, response) {
       if (!this.isEnabled()) return false;
