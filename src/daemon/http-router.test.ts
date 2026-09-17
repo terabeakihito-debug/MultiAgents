@@ -170,6 +170,9 @@ function dependencies(
       overall: "ok",
       database: { status: "ok" },
     })) as never,
+    applyOperationsProviderRefreshMutation: vi.fn(async () => ({
+      providers: [{ provider: "claude", status: "compatible" }],
+    })) as never,
     loadDashboardTasks: vi.fn(async () => ({
       tasks: [{ id: "task-1" }],
       counts: {},
@@ -2773,6 +2776,76 @@ describe("daemon HTTP router", () => {
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Not found" });
     expect(loadOperationsOverview).not.toHaveBeenCalled();
+  });
+
+  it("rejects operations provider refresh POST without the human mutation gate", async () => {
+    const applyOperationsProviderRefreshMutation = vi.fn(async () => ({
+      providers: [],
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyOperationsProviderRefreshMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/operations/providers/refresh", {}, "{}"),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyOperationsProviderRefreshMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts operations provider refresh POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce(
+      "operations-provider-refresh",
+    );
+    const payload = {
+      providers: [{ provider: "claude", status: "compatible" }],
+    };
+    const applyOperationsProviderRefreshMutation = vi.fn(
+      async () => payload,
+    ) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyOperationsProviderRefreshMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/operations/providers/refresh",
+        authorizedHumanHeaders(nonce, cookie, "operations-provider-refresh"),
+        "{}",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(applyOperationsProviderRefreshMutation).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not expose provider acknowledge on the daemon yet", async () => {
+    const applyOperationsProviderRefreshMutation = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyOperationsProviderRefreshMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/operations/providers/claude/acknowledge",
+        {},
+        "{}",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(applyOperationsProviderRefreshMutation).not.toHaveBeenCalled();
   });
 
   it("rejects a non-loopback Host header on operations overview", async () => {

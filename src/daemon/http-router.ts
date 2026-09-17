@@ -72,6 +72,7 @@ import {
   RemediationQueueQueryError,
 } from "../core/findings-queue-service";
 import { operationsOverviewService } from "../core/operations-overview-service";
+import { operationsProviderRefreshMutationService } from "../core/operations-provider-refresh-mutation-service";
 import { outboundSlackSettingsService } from "../core/outbound-slack-settings-service";
 import {
   OutboundInputError,
@@ -252,6 +253,7 @@ type DaemonHttpDependencies = {
   applyNotificationSlackDeliveryDismissMutation: typeof notificationSlackDeliveryDismissMutationService.apply;
   loadFindingsQueue: typeof findingsQueueService.load;
   loadOperationsOverview: typeof operationsOverviewService.load;
+  applyOperationsProviderRefreshMutation: typeof operationsProviderRefreshMutationService.apply;
   loadDashboardTasks: typeof dashboardTasksService.load;
   loadRuntimeSandboxStatus: typeof runtimeSandboxStatusService.load;
   loadNotificationPreferences: typeof notificationPreferencesService.load;
@@ -346,6 +348,8 @@ export function createDaemonHttpHandler(
       notificationSlackDeliveryDismissMutationService.apply(notificationId),
     loadFindingsQueue: (url) => findingsQueueService.load(url),
     loadOperationsOverview: () => operationsOverviewService.load(),
+    applyOperationsProviderRefreshMutation: () =>
+      operationsProviderRefreshMutationService.apply(),
     loadDashboardTasks: (url) => dashboardTasksService.load(url),
     loadRuntimeSandboxStatus: () => runtimeSandboxStatusService.load(),
     loadNotificationPreferences: () => notificationPreferencesService.load(),
@@ -1996,6 +2000,41 @@ export function createDaemonHttpHandler(
           error instanceof Error ? error.message : "unknown",
         );
         writeJson(response, 500, { error: "operations_overview_failed" });
+      }
+      return;
+    }
+
+    if (url.pathname === "/operations/providers/refresh") {
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "operations-provider-refresh",
+        { label: "Provider diagnostics refresh" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          await dependencies.applyOperationsProviderRefreshMutation(),
+        );
+      } catch (error) {
+        console.error(
+          "daemon_operations_provider_refresh_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, {
+          error: "operations_provider_refresh_failed",
+        });
       }
       return;
     }
