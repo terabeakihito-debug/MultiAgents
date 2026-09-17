@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { AgentAdapter, AgentId, AgentResult, AgentRunOptions, FlowStep, ReviewRerunEvent } from "../agents/types";
 import { isReviewFlowTimeoutAbortReason, reviewFlowTimeoutAbortReason } from "../agents/abort-origin";
+import { buildGenericRuntimePolicy } from "../server/runtime-policy";
 import { parseReviewRerunCommand, reconstructReviewRerunRequest, rerunReviewStep } from "./review-rerun";
 
 const completedSteps = (): FlowStep[] => [
@@ -53,6 +54,28 @@ describe("rerunReviewStep", () => {
     const result = await promise;
     expect(result.steps[0]).toMatchObject({ status: "error", terminationReason: "step_budget_exhausted", error: "Review step budget exhausted." });
     vi.useRealTimers();
+  });
+
+  it("passes the current diff and repository safety rules to rerun prompts", async () => {
+    let input = "";
+    const result = await rerunReviewStep(request("codex_final"), {
+      getDiff: async () => "current diff",
+      repositoryReadOnly: true,
+      executeAgent: async (id, prompt) => { input = prompt; return { agent: id, status: "completed", output: "final-new" }; },
+    });
+    expect(result.status).toBe("completed");
+    expect(input).toContain("current diff");
+    expect(input).toContain("provided repository in read-only mode");
+    expect(input).toContain("Do not modify files,");
+  });
+
+  it("reports a disabled rerun as completed without executing it", async () => {
+    const disabledCursor = { ...buildGenericRuntimePolicy("cursor"), role: "disabled" as const, policyClass: "disabled" as const, execution: [] };
+    const executeAgent = vi.fn(async (id: AgentId) => ({ agent: id, status: "completed" as const, output: "must not run" }));
+    const result = await rerunReviewStep(request("cursor_review"), { runtimePolicies: { cursor: disabledCursor } as never, executeAgent });
+    expect(result.status).toBe("completed");
+    expect(result.steps[1]).toMatchObject({ status: "skipped", error: "cursor is disabled by the task profile" });
+    expect(executeAgent).not.toHaveBeenCalled();
   });
 
   it("replaces Cursor and marks Claude and Final stale while retaining their output", async () => {
