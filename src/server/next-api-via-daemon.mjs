@@ -46,15 +46,17 @@ export async function createIncomingMessageFromWebRequest(request) {
 function createWebResponseCollector() {
   /** @type {import("node:stream/web").ReadableStreamDefaultController<Uint8Array> | undefined} */
   let streamController;
+  const pendingStreamChunks = [];
+  let streamDone = false;
+  let streamError;
+  let resolveStreamingHeaders;
+  const streamingHeaders = new Promise((resolve) => {
+    resolveStreamingHeaders = resolve;
+  });
   const chunks = [];
   /** @type {Map<string, string>} */
   const headers = new Map();
   let streaming = false;
-  /** @type {(() => void) | undefined} */
-  let resolveDone;
-  const done = new Promise((resolve) => {
-    resolveDone = () => resolve(undefined);
-  });
 
   const response = {
     statusCode: 200,
@@ -62,13 +64,16 @@ function createWebResponseCollector() {
       headers.set(name.toLowerCase(), value);
       if (name.toLowerCase() === "content-type" && String(value).includes("text/event-stream")) {
         streaming = true;
+        resolveStreamingHeaders?.();
       }
       return response;
     },
     write(chunk) {
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       if (streaming) {
-        streamController?.enqueue(new Uint8Array(buffer));
+        const value = new Uint8Array(buffer);
+        if (streamController) streamController.enqueue(value);
+        else pendingStreamChunks.push(value);
       } else {
         chunks.push(buffer);
       }
@@ -79,21 +84,32 @@ function createWebResponseCollector() {
         response.write(chunk);
       }
       if (streaming) {
+        streamDone = true;
         streamController?.close();
       }
-      resolveDone?.();
       return response;
     },
   };
 
   return {
     response,
-    done,
+    streamingHeaders,
+    isStreaming() {
+      return streaming;
+    },
+    fail(error) {
+      streamError = error;
+      streamController?.error(error);
+    },
     toWebResponse() {
       if (streaming) {
         const readable = new ReadableStream({
           start(controller) {
             streamController = controller;
+            for (const chunk of pendingStreamChunks) controller.enqueue(chunk);
+            pendingStreamChunks.length = 0;
+            if (streamError) controller.error(streamError);
+            else if (streamDone) controller.close();
           },
         });
         return new Response(readable, {
@@ -116,7 +132,9 @@ export async function handleNextApiViaDaemon(request) {
   const incoming = await createIncomingMessageFromWebRequest(request);
   const collector = createWebResponseCollector();
   const handler = await loadDaemonHandler();
-  await handler(incoming, collector.response);
-  await collector.done;
+  const handlerPromise = handler(incoming, collector.response);
+  handlerPromise.catch((error) => collector.fail(error));
+  await Promise.race([collector.streamingHeaders, handlerPromise]);
+  if (!collector.isStreaming()) await handlerPromise;
   return collector.toWebResponse();
 }
