@@ -3,9 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "node server.mjs --dev",
+    "dev": "npm run daemon:build && node server.mjs --dev",
     "build": "next build",
-    "start": "NODE_ENV=production node server.mjs",
+    "start": "npm run daemon:build && NODE_ENV=production node server.mjs",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --config vitest.heavy.config.ts && vitest run --config vitest.light.config.ts",

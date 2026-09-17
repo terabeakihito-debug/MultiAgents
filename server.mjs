@@ -2,6 +2,7 @@ import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import next from "next";
 import { installNextCloseAudit } from "./src/server/next-close-audit.mjs";
+import { createDaemonApiBridge } from "./src/server/daemon-api-bridge.mjs";
 
 const dev = process.argv.includes("--dev");
 const port = Number.parseInt(process.env.PORT || "3000", 10);
@@ -124,10 +125,30 @@ async function main() {
   console.info("startup_phase", JSON.stringify({ phase: "operational_init" }));
   await awaitOperationalStartup();
   const handle = app.getRequestHandler();
+  const daemonApiBridge = createDaemonApiBridge();
   server = createServer((request, response) => {
     if (!accepting) { response.statusCode = 503; response.end("shutting_down"); return; }
-    void handle(request, response);
+    void (async () => {
+      try {
+        if (await daemonApiBridge.tryHandle(request, response)) return;
+      } catch (error) {
+        console.error(
+          "daemon_api_bridge_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        response.statusCode = 500;
+        response.end("daemon_api_bridge_failed");
+        return;
+      }
+      void handle(request, response);
+    })();
   });
+  if (daemonApiBridge.isEnabled()) {
+    console.info(
+      "daemon_api_bridge",
+      JSON.stringify({ enabled: true, mode: dev ? "development" : "production" }),
+    );
+  }
   // Instrumentation has completed the explicit ownership/RUNNING assertion.
   const api = globalThis[shutdownApiKey];
   if (!api?.requestShutdown) throw new Error("startup readiness failed: lifecycle shutdown bridge missing");

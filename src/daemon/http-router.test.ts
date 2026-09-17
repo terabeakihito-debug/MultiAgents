@@ -1,10 +1,12 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { Readable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { TaskCiNotFoundError } from "../core/task-ci-service";
 import { DashboardQueryError } from "../core/dashboard-tasks-service";
 import { RepoProfileNotFoundError } from "../core/repo-profile-service";
 import { RepoPullsRequestError } from "../core/repo-pulls-service";
 import { RepoTemplatesNotFoundError } from "../core/repo-templates-service";
+import { FindingDetailNotFoundError } from "../core/finding-detail-service";
 import { RemediationQueueQueryError } from "../core/findings-queue-service";
 import { NotificationInputError } from "../core/notification-list-service";
 import {
@@ -26,7 +28,12 @@ import {
   TaskSandboxPolicyNotFoundError,
   TaskSandboxPolicyUnavailableError,
 } from "../core/task-sandbox-policy-service";
+import { humanMutationGateService } from "../core/human-mutation-gate-service";
 import { createDaemonHttpHandler } from "./http-router";
+import {
+  clearHumanMutationSessionsForTests,
+  issueHumanMutationNonce,
+} from "../server/request-security";
 
 function request(
   method: string,
@@ -51,8 +58,14 @@ function response() {
       headers.set(name.toLowerCase(), headerValue);
       return value;
     },
-    end(chunk?: string) {
-      body = chunk ?? "";
+    write(chunk: string | Buffer) {
+      body += typeof chunk === "string" ? chunk : chunk.toString();
+      return true;
+    },
+    end(chunk?: string | Buffer) {
+      if (chunk !== undefined) {
+        body += typeof chunk === "string" ? chunk : chunk.toString();
+      }
       return value;
     },
   } as unknown as ServerResponse;
@@ -113,6 +126,16 @@ function dependencies(
     loadRepoList: vi.fn(async () => ({
       repos: [{ id: "repo-1", templates: [], settings: {} }],
     })) as never,
+    applyRepoCloneMutation: vi.fn(async () => ({
+      repo: { id: "repo-1", name: "proj" },
+    })) as never,
+    applyRepoCreateMutation: vi.fn(async () => ({
+      repo: { id: "repo-1", name: "new-proj" },
+      needsInitialCommit: true,
+    })) as never,
+    applyRepoInitializeMutation: vi.fn(async () => ({
+      repo: { id: "repo-1", name: "my-proj" },
+    })) as never,
     loadCredentialStatus: vi.fn(() => ({
       credentials: [{ capability: "github", status: "ready" }],
     })) as never,
@@ -120,15 +143,45 @@ function dependencies(
       notifications: [{ id: "n-1" }],
       unreadCount: 1,
     })) as never,
+    applyNotificationReadMutation: vi.fn(() => ({
+      notificationId: "n-1",
+      status: "read",
+    })) as never,
+    applyNotificationDismissMutation: vi.fn(() => ({
+      notificationId: "n-1",
+      status: "dismissed",
+    })) as never,
+    applyNotificationReadAllMutation: vi.fn(() => ({ updated: 2 })) as never,
+    applyNotificationSlackRetryMutation: vi.fn(async () => ({
+      delivery: { deliveryId: "d-1", status: "pending" },
+    })) as never,
+    applyNotificationSlackMarkDeliveredMutation: vi.fn(() => ({
+      delivery: { deliveryId: "d-1", status: "delivered" },
+    })) as never,
+    applyNotificationSlackDeliveryDismissMutation: vi.fn(() => ({
+      delivery: { deliveryId: "d-1", status: "suppressed" },
+    })) as never,
     loadFindingsQueue: vi.fn(() => ({
       findings: [{ findingId: "f-1" }],
       counts: { total: 1 },
       limit: 100,
       offset: 0,
     })) as never,
+    loadFindingDetail: vi.fn(() => ({
+      finding: { findingId: "f-1" },
+      remediation: { findingId: "f-1", status: "open" },
+      history: [],
+    })) as never,
     loadOperationsOverview: vi.fn(async () => ({
       overall: "ok",
       database: { status: "ok" },
+    })) as never,
+    applyOperationsProviderRefreshMutation: vi.fn(async () => ({
+      providers: [{ provider: "claude", status: "compatible" }],
+    })) as never,
+    applyOperationsProviderAcknowledgeMutation: vi.fn(async () => ({
+      provider: "claude",
+      version: "1.2.3",
     })) as never,
     loadDashboardTasks: vi.fn(async () => ({
       tasks: [{ id: "task-1" }],
@@ -183,11 +236,469 @@ function dependencies(
     loadStateBackupValidate: vi.fn((backupId: string) => ({
       backup: { backupId, verified: true },
     })) as never,
+    rejectHumanMutation: (webRequest, action, options) =>
+      humanMutationGateService.reject(webRequest, action, options),
+    applyMaintenanceMutation: vi.fn(async () => ({
+      state: "RUNNING",
+    })) as never,
+    initializeTaskRecovery: vi.fn(async () => undefined) as never,
+    createTaskFromBody: vi.fn(async () => ({
+      task: { id: "task-new", repoId: "repo-1" },
+    })) as never,
+    applyTaskRecoverPrMutation: vi.fn(async () => ({
+      task: { id: "task-1", prNumber: 42 },
+    })) as never,
+    initializeTaskDeleteRecovery: vi.fn(async () => undefined) as never,
+    parseTaskDeleteBody: vi.fn(() => ({})) as never,
+    removeTask: vi.fn(async () => undefined) as never,
+    applyTaskApproveMutation: vi.fn(async () => ({
+      task: { id: "task-1", status: "open" },
+    })) as never,
+    applyTaskApproveReworkMutation: vi.fn(async () => ({
+      task: { id: "task-1", status: "open" },
+    })) as never,
+    applyTaskApplyReviewMutation: vi.fn(async () => ({
+      task: { id: "task-1", status: "open" },
+    })) as never,
+    applyTaskPrepareApprovalMutation: vi.fn(async () => ({
+      status: 200,
+      body: { diff: {}, task: { id: "task-1" } },
+    })) as never,
+    applyTaskCreatePrMutation: vi.fn(async () => ({
+      task: { id: "task-1", prNumber: 42 },
+    })) as never,
+    applyTaskFetchReviewMutation: vi.fn(async () => ({
+      task: { id: "task-1", status: "reviewed" },
+    })) as never,
+    applyTaskRefreshPrMutation: vi.fn(async () => ({
+      task: { id: "task-1", prNumber: 42 },
+    })) as never,
+    applyTaskResumeMutation: vi.fn(async () => ({
+      status: 200,
+      body: { task: { id: "task-1" } },
+    })) as never,
+    applyTaskReassociatePreviewMutation: vi.fn(async () => ({
+      preview: { fingerprint: "fp-1" },
+    })) as never,
+    applyTaskReassociateMutation: vi.fn(async () => ({
+      task: { id: "task-1" },
+    })) as never,
+    applyTaskDependencyRecoveryInstructionsMutation: vi.fn(async () => ({
+      steps: ["npm install"],
+    })) as never,
+    applyRetentionPolicyMutation: vi.fn(() => ({ preset: "balanced" })) as never,
+    applyCleanupPreviewMutation: vi.fn(async () => ({
+      selected: [],
+      estimatedBytes: 0,
+    })) as never,
+    applyCleanupExecuteMutation: vi.fn(async () => ({
+      completed: [],
+      estimatedBytes: 0,
+    })) as never,
+    createStateBackup: vi.fn(async () => ({
+      backup: { backupId: "b-new", verified: false },
+    })) as never,
+    applyNotificationPreferencesMutation: vi.fn(() => ({
+      preferences: { taskInactive: true },
+    })) as never,
+    applyOutboundSlackSettingsMutation: vi.fn(() => ({
+      configured: true,
+      config: { enabled: true },
+    })) as never,
+    applyOutboundSlackTestMutation: vi.fn(async () => ({
+      outcome: "delivered" as const,
+      body: { status: "delivered" as const },
+    })) as never,
+    applyRepoProfileMutation: vi.fn(async () => ({
+      profile: { repoId: "repo-1", profileId: "safe_default" },
+    })) as never,
+    applyRepoTemplatesMutation: vi.fn(async () => ({
+      templates: [{ templateId: "bug_fix", enabled: true }],
+      settings: { defaultTemplateId: "bug_fix" },
+    })) as never,
+    applyAgentRunMutation: vi.fn(async () => ({
+      status: "completed",
+      output: "done",
+    })) as never,
+    applyAgentParallelRunMutation: vi.fn(async () => ({
+      results: [{ status: "completed" }],
+    })) as never,
+    applyReviewFlowMutation: vi.fn(async () => ({
+      flowId: "flow-1",
+      steps: [],
+    })) as never,
+    prepareReviewRerun: vi.fn(async () => ({
+      kind: "error",
+      status: 400,
+      body: { error: "A valid taskId is required" },
+    })) as never,
+    prepareReviewFlowStream: vi.fn(async () => ({
+      kind: "error",
+      status: 400,
+      body: { error: "Prompt is required" },
+    })) as never,
+    applyTaskFindingsExtractMutation: vi.fn(async () => ({
+      findings: [{ findingId: "f-1" }],
+    })) as never,
+    applyFindingAcceptMutation: vi.fn(async () => ({
+      finding: { findingId: "f-1", status: "accepted" },
+      remediation: null,
+      history: [],
+    })) as never,
+    applyFindingDismissMutation: vi.fn(async () => ({
+      finding: { findingId: "f-1", status: "dismissed" },
+      remediation: null,
+      history: [],
+    })) as never,
+    applyFindingConvertMutation: vi.fn(async () => ({
+      finding: { findingId: "f-1", status: "converted" },
+      task: { id: "task-2" },
+      remediation: null,
+      history: [],
+    })) as never,
+    applyFindingResolveMutation: vi.fn(async () => ({
+      finding: { findingId: "f-1", resolvedAt: "now" },
+      remediation: null,
+      history: [],
+    })) as never,
+    applyFindingPriorityMutation: vi.fn(async () => ({
+      finding: { findingId: "f-1", humanPriority: "urgent" },
+      remediation: null,
+      history: [],
+    })) as never,
     ...overrides,
   };
 }
 
+const MAINTENANCE_ORIGIN = "http://127.0.0.1:3000";
+
+function mutationRequest(
+  method: "POST" | "DELETE",
+  path: string,
+  headers: Record<string, string>,
+  jsonBody = "",
+): IncomingMessage {
+  const stream = Readable.from(
+    jsonBody ? [Buffer.from(jsonBody)] : [],
+  );
+  return Object.assign(stream, {
+    method,
+    url: path,
+    headers: {
+      host: "127.0.0.1:3000",
+      ...(jsonBody ? { "content-type": "application/json" } : {}),
+      ...headers,
+    },
+  }) as unknown as IncomingMessage;
+}
+
+function postJsonRequest(
+  path: string,
+  headers: Record<string, string>,
+  jsonBody: string,
+): IncomingMessage {
+  return mutationRequest("POST", path, headers, jsonBody);
+}
+
+function postMaintenanceRequest(
+  headers: Record<string, string>,
+  jsonBody = '{"enabled":false}',
+): IncomingMessage {
+  return postJsonRequest("/maintenance", headers, jsonBody);
+}
+
+async function issuedHumanMutationNonce(
+  action = "maintenance-mode",
+  now = Date.now(),
+) {
+  const nonceResponse = issueHumanMutationNonce(
+    new Request(`${MAINTENANCE_ORIGIN}/human-session`, {
+      headers: {
+        host: "127.0.0.1:3000",
+        referer: `${MAINTENANCE_ORIGIN}/`,
+        "sec-fetch-site": "same-origin",
+      },
+    }),
+    now,
+  );
+  const payload = (await nonceResponse.json()) as { nonce: string };
+  return {
+    nonce: payload.nonce,
+    cookie: nonceResponse.headers.get("set-cookie")!.split(";")[0],
+    action,
+  };
+}
+
+async function issuedMaintenanceNonce(now = Date.now()) {
+  return issuedHumanMutationNonce("maintenance-mode", now);
+}
+
+function authorizedHumanHeaders(
+  nonce: string,
+  cookie: string,
+  action: string,
+) {
+  return {
+    origin: MAINTENANCE_ORIGIN,
+    "sec-fetch-site": "same-origin",
+    "x-multiagents-human-action": action,
+    "x-multiagents-human-nonce": nonce,
+    cookie,
+  };
+}
+
 describe("daemon HTTP router", () => {
+  it("rejects review flow POST without the human mutation gate", async () => {
+    const applyReviewFlowMutation = vi.fn(async () => ({
+      flowId: "flow-1",
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyReviewFlowMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/flows/review", {}, '{"prompt":"Review this"}'),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyReviewFlowMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts review flow POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("review-run");
+    const payload = { flowId: "flow-1", steps: [{ stepId: "s1" }] };
+    const applyReviewFlowMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyReviewFlowMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/flows/review",
+        authorizedHumanHeaders(nonce, cookie, "review-run"),
+        '{"prompt":"Review this"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyReviewFlowMutation).toHaveBeenCalledWith(
+      { prompt: "Review this" },
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+  });
+
+  it("rejects review rerun POST without the human mutation gate", async () => {
+    const prepareReviewRerun = vi.fn(async () => ({
+      kind: "stream",
+      stream: new ReadableStream(),
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ prepareReviewRerun }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/flows/review/rerun",
+        {},
+        '{"taskId":"00000000-0000-4000-8000-000000000001","stepId":"codex_draft"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(prepareReviewRerun).not.toHaveBeenCalled();
+  });
+
+  it("accepts review rerun POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("review-rerun");
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("event: test\n\n"));
+        controller.close();
+      },
+    });
+    const prepareReviewRerun = vi.fn(async () => ({
+      kind: "stream",
+      stream,
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ prepareReviewRerun }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/flows/review/rerun",
+        authorizedHumanHeaders(nonce, cookie, "review-rerun"),
+        '{"taskId":"00000000-0000-4000-8000-000000000001","stepId":"codex_draft"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe(
+      "text/event-stream; charset=utf-8",
+    );
+    expect(prepareReviewRerun).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects review flow stream POST without the human mutation gate", async () => {
+    const prepareReviewFlowStream = vi.fn(async () => ({
+      kind: "stream",
+      stream: new ReadableStream(),
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ prepareReviewFlowStream }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/flows/review/stream", {}, '{"prompt":"Review this"}'),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(prepareReviewFlowStream).not.toHaveBeenCalled();
+  });
+
+  it("accepts review flow stream POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("review-run");
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("event: test\n\n"));
+        controller.close();
+      },
+    });
+    const prepareReviewFlowStream = vi.fn(async () => ({
+      kind: "stream",
+      stream,
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ prepareReviewFlowStream }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/flows/review/stream",
+        authorizedHumanHeaders(nonce, cookie, "review-run"),
+        '{"prompt":"Review this"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.header("content-type")).toBe(
+      "text/event-stream; charset=utf-8",
+    );
+    expect(prepareReviewFlowStream).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects agent run POST without the human mutation gate", async () => {
+    const applyAgentRunMutation = vi.fn(async () => ({
+      status: "completed",
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyAgentRunMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/agents/codex", {}, '{"prompt":"hello"}'),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyAgentRunMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts agent run POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("agent-run");
+    const payload = { status: "completed", output: "analysis" };
+    const applyAgentRunMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyAgentRunMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/agents/codex",
+        authorizedHumanHeaders(nonce, cookie, "agent-run"),
+        '{"prompt":"hello"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyAgentRunMutation).toHaveBeenCalledWith(
+      "codex",
+      { prompt: "hello" },
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+  });
+
+  it("rejects parallel agent run POST without the human mutation gate", async () => {
+    const applyAgentParallelRunMutation = vi.fn(async () => ({
+      results: [],
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyAgentParallelRunMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/agents/parallel", {}, '{"prompt":"hello"}'),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyAgentParallelRunMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts parallel agent run POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("agent-run");
+    const payload = {
+      results: [
+        { status: "completed", output: "a" },
+        { status: "completed", output: "b" },
+      ],
+    };
+    const applyAgentParallelRunMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyAgentParallelRunMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/agents/parallel",
+        authorizedHumanHeaders(nonce, cookie, "agent-run"),
+        '{"prompt":"hello"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyAgentParallelRunMutation).toHaveBeenCalledWith(
+      { prompt: "hello" },
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+  });
+
   it("serves human session through the core human-session boundary", async () => {
     const webResponse = Response.json(
       { nonce: "nonce-1", expiresAt: "2026-01-01T00:02:00.000Z" },
@@ -293,18 +804,42 @@ describe("daemon HTTP router", () => {
     expect(output.json()).toEqual({ error: "maintenance_state_failed" });
   });
 
-  it("does not expose maintenance mutations on the daemon", async () => {
-    const loadMaintenanceState = vi.fn() as never;
+  it("rejects maintenance POST without the human mutation gate", async () => {
+    const applyMaintenanceMutation = vi.fn(async () => ({
+      state: "RUNNING",
+    })) as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ loadMaintenanceState }),
+      dependencies({ applyMaintenanceMutation }),
     );
     const output = response();
 
-    await handler(request("POST", "/maintenance"), output.value);
+    await handler(postMaintenanceRequest({}), output.value);
 
-    expect(output.status()).toBe(404);
-    expect(output.json()).toEqual({ error: "Not found" });
-    expect(loadMaintenanceState).not.toHaveBeenCalled();
+    expect(output.status()).toBe(403);
+    expect(applyMaintenanceMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts maintenance POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedMaintenanceNonce();
+    const applyMaintenanceMutation = vi.fn(async () => ({
+      state: "RUNNING",
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyMaintenanceMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postMaintenanceRequest(
+        authorizedHumanHeaders(nonce, cookie, "maintenance-mode"),
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual({ state: "RUNNING" });
+    expect(applyMaintenanceMutation).toHaveBeenCalledWith({ enabled: false });
   });
 
   it("serves state backups through the core state-backups boundary", async () => {
@@ -342,18 +877,48 @@ describe("daemon HTTP router", () => {
     expect(output.json()).toEqual({ error: "state_backups_failed" });
   });
 
-  it("does not expose state backup creation on the daemon", async () => {
-    const loadStateBackups = vi.fn() as never;
+  it("rejects state backup create POST without the human mutation gate", async () => {
+    const createStateBackup = vi.fn(async () => ({
+      backup: { backupId: "b-new" },
+    })) as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ loadStateBackups }),
+      dependencies({ createStateBackup }),
     );
     const output = response();
 
-    await handler(request("POST", "/state/backups"), output.value);
+    await handler(
+      postJsonRequest("/state/backups", {}, ""),
+      output.value,
+    );
 
-    expect(output.status()).toBe(404);
-    expect(output.json()).toEqual({ error: "Not found" });
-    expect(loadStateBackups).not.toHaveBeenCalled();
+    expect(output.status()).toBe(403);
+    expect(createStateBackup).not.toHaveBeenCalled();
+  });
+
+  it("accepts state backup create POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("state-backup");
+    const backupPayload = {
+      backup: { backupId: "b-new", verified: false },
+    };
+    const createStateBackup = vi.fn(async () => backupPayload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ createStateBackup }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/state/backups",
+        authorizedHumanHeaders(nonce, cookie, "state-backup"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(201);
+    expect(output.json()).toEqual(backupPayload);
+    expect(createStateBackup).toHaveBeenCalledTimes(1);
   });
 
   it("serves state backup validate through the core validate boundary", async () => {
@@ -391,18 +956,48 @@ describe("daemon HTTP router", () => {
     expect(output.json()).toEqual({ error: "Backup metadata not found" });
   });
 
-  it("does not expose backup validate mutation on the daemon", async () => {
-    const loadStateBackupValidate = vi.fn() as never;
+  it("rejects backup validate POST without the human mutation gate", async () => {
+    const loadStateBackupValidate = vi.fn(() => ({
+      backup: { backupId: "b-1", verified: true },
+    })) as never;
     const handler = createDaemonHttpHandler(
       dependencies({ loadStateBackupValidate }),
     );
     const output = response();
 
-    await handler(request("POST", "/state/backups/b-1/validate"), output.value);
+    await handler(
+      postJsonRequest("/state/backups/b-1/validate", {}, ""),
+      output.value,
+    );
 
-    expect(output.status()).toBe(404);
-    expect(output.json()).toEqual({ error: "Not found" });
+    expect(output.status()).toBe(403);
     expect(loadStateBackupValidate).not.toHaveBeenCalled();
+  });
+
+  it("accepts backup validate POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce(
+      "state-backup-validate",
+    );
+    const payload = { backup: { backupId: "b-1", verified: true } };
+    const loadStateBackupValidate = vi.fn(() => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadStateBackupValidate }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/state/backups/b-1/validate",
+        authorizedHumanHeaders(nonce, cookie, "state-backup-validate"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(loadStateBackupValidate).toHaveBeenCalledWith("b-1");
   });
 
   it("rejects a non-loopback Host header on state backups", async () => {
@@ -458,18 +1053,58 @@ describe("daemon HTTP router", () => {
     expect(output.json()).toEqual({ error: "outbound_slack_settings_failed" });
   });
 
-  it("does not expose outbound Slack settings mutations on the daemon", async () => {
-    const loadOutboundSlackSettings = vi.fn() as never;
+  it("rejects outbound Slack settings POST without the human mutation gate", async () => {
+    const applyOutboundSlackSettingsMutation = vi.fn(() => ({
+      configured: true,
+      config: { enabled: true },
+    })) as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ loadOutboundSlackSettings }),
+      dependencies({ applyOutboundSlackSettingsMutation }),
     );
     const output = response();
 
-    await handler(request("POST", "/outbound/slack/settings"), output.value);
+    await handler(
+      postJsonRequest(
+        "/outbound/slack/settings",
+        {},
+        '{"enabled":true}',
+      ),
+      output.value,
+    );
 
-    expect(output.status()).toBe(404);
-    expect(output.json()).toEqual({ error: "Not found" });
-    expect(loadOutboundSlackSettings).not.toHaveBeenCalled();
+    expect(output.status()).toBe(403);
+    expect(applyOutboundSlackSettingsMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts outbound Slack settings POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce(
+      "outbound-preferences",
+    );
+    const payload = {
+      configured: true,
+      config: { enabled: true, webhookUrl: "https://hooks.example" },
+    };
+    const applyOutboundSlackSettingsMutation = vi.fn(() => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyOutboundSlackSettingsMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/outbound/slack/settings",
+        authorizedHumanHeaders(nonce, cookie, "outbound-preferences"),
+        '{"enabled":true}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyOutboundSlackSettingsMutation).toHaveBeenCalledWith({
+      enabled: true,
+    });
   });
 
   it("does not treat outbound Slack test as settings read", async () => {
@@ -484,6 +1119,51 @@ describe("daemon HTTP router", () => {
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Not found" });
     expect(loadOutboundSlackSettings).not.toHaveBeenCalled();
+  });
+
+  it("rejects outbound Slack test POST without the human mutation gate", async () => {
+    const applyOutboundSlackTestMutation = vi.fn(async () => ({
+      outcome: "delivered" as const,
+      body: { status: "delivered" as const },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyOutboundSlackTestMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/outbound/slack/test", {}, "{}"),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyOutboundSlackTestMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts outbound Slack test POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("outbound-test");
+    const applyOutboundSlackTestMutation = vi.fn(async () => ({
+      outcome: "delivered" as const,
+      body: { status: "delivered" as const },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyOutboundSlackTestMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/outbound/slack/test",
+        authorizedHumanHeaders(nonce, cookie, "outbound-test"),
+        "{}",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual({ status: "delivered" });
+    expect(applyOutboundSlackTestMutation).toHaveBeenCalledTimes(1);
   });
 
   it("rejects a non-loopback Host header on outbound Slack settings", async () => {
@@ -606,6 +1286,150 @@ describe("daemon HTTP router", () => {
     expect(output.json()).toEqual({ error: "repo_list_failed" });
   });
 
+  it("rejects repo create POST without the human mutation gate", async () => {
+    const applyRepoCreateMutation = vi.fn(async () => ({
+      repo: { id: "repo-1" },
+      needsInitialCommit: true,
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyRepoCreateMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/repos/create",
+        {},
+        '{"projectName":"my-proj"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyRepoCreateMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts repo create POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("repository-create");
+    const payload = {
+      repo: { id: "repo-1", name: "my-proj" },
+      needsInitialCommit: true,
+    };
+    const applyRepoCreateMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyRepoCreateMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/repos/create",
+        authorizedHumanHeaders(nonce, cookie, "repository-create"),
+        '{"projectName":"my-proj","createReadme":true}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(201);
+    expect(output.json()).toEqual(payload);
+    expect(applyRepoCreateMutation).toHaveBeenCalledWith({
+      projectName: "my-proj",
+      createReadme: true,
+    });
+  });
+
+  it("rejects repo clone POST without the human mutation gate", async () => {
+    const applyRepoCloneMutation = vi.fn(async () => ({
+      repo: { id: "repo-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyRepoCloneMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/repos/clone",
+        {},
+        '{"githubUrl":"https://github.com/o/r"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyRepoCloneMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts repo clone POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("repository-clone");
+    const payload = { repo: { id: "repo-1", name: "proj" } };
+    const applyRepoCloneMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyRepoCloneMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/repos/clone",
+        authorizedHumanHeaders(nonce, cookie, "repository-clone"),
+        '{"githubUrl":"https://github.com/o/r"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(201);
+    expect(output.json()).toEqual(payload);
+    expect(applyRepoCloneMutation).toHaveBeenCalledWith({
+      githubUrl: "https://github.com/o/r",
+    });
+  });
+
+  it("rejects repo initialize POST without the human mutation gate", async () => {
+    const applyRepoInitializeMutation = vi.fn(async () => ({
+      repo: { id: "repo-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyRepoInitializeMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/repos/repo-1/initialize", {}, "{}"),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyRepoInitializeMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts repo initialize POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } =
+      await issuedHumanMutationNonce("repository-initialize");
+    const payload = { repo: { id: "repo-1", name: "my-proj" } };
+    const applyRepoInitializeMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyRepoInitializeMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/repos/repo-1/initialize",
+        authorizedHumanHeaders(nonce, cookie, "repository-initialize"),
+        "{}",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyRepoInitializeMutation).toHaveBeenCalledWith("repo-1");
+  });
+
   it("does not expose repository listing on unsupported methods", async () => {
     const loadRepoList = vi.fn() as never;
     const handler = createDaemonHttpHandler(
@@ -687,18 +1511,56 @@ describe("daemon HTTP router", () => {
     expect(output.json()).toEqual({ error: "repo_profile_failed" });
   });
 
-  it("does not expose repository profile mutations on the daemon", async () => {
-    const loadRepoProfile = vi.fn() as never;
+  it("rejects repository profile POST without the human mutation gate", async () => {
+    const applyRepoProfileMutation = vi.fn(async () => ({
+      profile: { repoId: "repo-1" },
+    })) as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ loadRepoProfile }),
+      dependencies({ applyRepoProfileMutation }),
     );
     const output = response();
 
-    await handler(request("POST", "/repos/repo-1/profile"), output.value);
+    await handler(
+      postJsonRequest(
+        "/repos/repo-1/profile",
+        {},
+        '{"confirmation":true,"name":"safe_default","enabled":true}',
+      ),
+      output.value,
+    );
 
-    expect(output.status()).toBe(404);
-    expect(output.json()).toEqual({ error: "Not found" });
-    expect(loadRepoProfile).not.toHaveBeenCalled();
+    expect(output.status()).toBe(403);
+    expect(applyRepoProfileMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts repository profile POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("profile-save");
+    const payload = {
+      profile: { repoId: "repo-1", profileId: "safe_default" },
+    };
+    const applyRepoProfileMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyRepoProfileMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/repos/repo-1/profile",
+        authorizedHumanHeaders(nonce, cookie, "profile-save"),
+        '{"confirmation":true,"name":"safe_default","enabled":true}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyRepoProfileMutation).toHaveBeenCalledWith("repo-1", {
+      confirmation: true,
+      name: "safe_default",
+      enabled: true,
+    });
   });
 
   it("does not treat repository templates as repository profile", async () => {
@@ -771,18 +1633,58 @@ describe("daemon HTTP router", () => {
     expect(output.json()).toEqual({ error: "repo_templates_failed" });
   });
 
-  it("does not expose repository template mutations on the daemon", async () => {
-    const loadRepoTemplates = vi.fn() as never;
+  it("rejects repository templates POST without the human mutation gate", async () => {
+    const applyRepoTemplatesMutation = vi.fn(async () => ({
+      templates: [],
+      settings: { defaultTemplateId: "bug_fix" },
+    })) as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ loadRepoTemplates }),
+      dependencies({ applyRepoTemplatesMutation }),
     );
     const output = response();
 
-    await handler(request("POST", "/repos/repo-1/templates"), output.value);
+    await handler(
+      postJsonRequest(
+        "/repos/repo-1/templates",
+        {},
+        '{"confirmation":true,"templateId":"bug_fix","enabled":true}',
+      ),
+      output.value,
+    );
 
-    expect(output.status()).toBe(404);
-    expect(output.json()).toEqual({ error: "Not found" });
-    expect(loadRepoTemplates).not.toHaveBeenCalled();
+    expect(output.status()).toBe(403);
+    expect(applyRepoTemplatesMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts repository templates POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("template-save");
+    const payload = {
+      templates: [{ templateId: "bug_fix", enabled: true }],
+      settings: { defaultTemplateId: "bug_fix" },
+    };
+    const applyRepoTemplatesMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyRepoTemplatesMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/repos/repo-1/templates",
+        authorizedHumanHeaders(nonce, cookie, "template-save"),
+        '{"confirmation":true,"templateId":"bug_fix","enabled":true}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyRepoTemplatesMutation).toHaveBeenCalledWith("repo-1", {
+      confirmation: true,
+      templateId: "bug_fix",
+      enabled: true,
+    });
   });
 
   it("does not treat repository pulls as repository templates", async () => {
@@ -1038,6 +1940,102 @@ describe("daemon HTTP router", () => {
     expect(loadCleanupCandidates).not.toHaveBeenCalled();
   });
 
+  it("rejects cleanup preview POST without the human mutation gate", async () => {
+    const applyCleanupPreviewMutation = vi.fn(async () => ({
+      selected: [],
+      estimatedBytes: 0,
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyCleanupPreviewMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/cleanup/preview", {}, '{"candidateIds":[]}'),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyCleanupPreviewMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts cleanup preview POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("cleanup-preview");
+    const previewPayload = {
+      selected: [{ id: "notification:n-1" }],
+      estimatedBytes: 10,
+    };
+    const applyCleanupPreviewMutation = vi.fn(async () => previewPayload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyCleanupPreviewMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/cleanup/preview",
+        authorizedHumanHeaders(nonce, cookie, "cleanup-preview"),
+        '{"candidateIds":["notification:n-1"]}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(previewPayload);
+    expect(applyCleanupPreviewMutation).toHaveBeenCalledWith({
+      candidateIds: ["notification:n-1"],
+    });
+  });
+
+  it("rejects cleanup execute POST without the human mutation gate", async () => {
+    const applyCleanupExecuteMutation = vi.fn(async () => ({
+      completed: [],
+      estimatedBytes: 0,
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyCleanupExecuteMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/cleanup/execute", {}, '{"candidateIds":[]}'),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyCleanupExecuteMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts cleanup execute POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("cleanup-execute");
+    const executePayload = {
+      completed: ["notification:n-1"],
+      estimatedBytes: 10,
+    };
+    const applyCleanupExecuteMutation = vi.fn(async () => executePayload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyCleanupExecuteMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/cleanup/execute",
+        authorizedHumanHeaders(nonce, cookie, "cleanup-execute"),
+        '{"candidateIds":["notification:n-1"]}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(executePayload);
+    expect(applyCleanupExecuteMutation).toHaveBeenCalledWith({
+      candidateIds: ["notification:n-1"],
+    });
+  });
+
   it("rejects a non-loopback Host header on cleanup candidates", async () => {
     const loadCleanupCandidates = vi.fn() as never;
     const handler = createDaemonHttpHandler(
@@ -1088,18 +2086,49 @@ describe("daemon HTTP router", () => {
     expect(output.json()).toEqual({ error: "retention_policy_failed" });
   });
 
-  it("does not expose retention policy mutations on the daemon", async () => {
-    const loadRetentionPolicy = vi.fn() as never;
+  it("rejects retention policy POST without the human mutation gate", async () => {
+    const applyRetentionPolicyMutation = vi.fn(() => ({
+      preset: "balanced",
+    })) as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ loadRetentionPolicy }),
+      dependencies({ applyRetentionPolicyMutation }),
     );
     const output = response();
 
-    await handler(request("POST", "/retention-policy"), output.value);
+    await handler(
+      postJsonRequest("/retention-policy", {}, '{"preset":"balanced"}'),
+      output.value,
+    );
 
-    expect(output.status()).toBe(404);
-    expect(output.json()).toEqual({ error: "Not found" });
-    expect(loadRetentionPolicy).not.toHaveBeenCalled();
+    expect(output.status()).toBe(403);
+    expect(applyRetentionPolicyMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts retention policy POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("retention-policy");
+    const applyRetentionPolicyMutation = vi.fn(() => ({
+      preset: "balanced",
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyRetentionPolicyMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/retention-policy",
+        authorizedHumanHeaders(nonce, cookie, "retention-policy"),
+        '{"preset":"balanced"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual({ preset: "balanced" });
+    expect(applyRetentionPolicyMutation).toHaveBeenCalledWith({
+      preset: "balanced",
+    });
   });
 
   it("rejects a non-loopback Host header on retention policy", async () => {
@@ -1154,18 +2183,54 @@ describe("daemon HTTP router", () => {
     expect(output.json()).toEqual({ error: "notification_preferences_failed" });
   });
 
-  it("does not expose notification preferences mutations on the daemon", async () => {
-    const loadNotificationPreferences = vi.fn() as never;
+  it("rejects notification preferences POST without the human mutation gate", async () => {
+    const applyNotificationPreferencesMutation = vi.fn(() => ({
+      preferences: { taskInactive: true },
+    })) as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ loadNotificationPreferences }),
+      dependencies({ applyNotificationPreferencesMutation }),
     );
     const output = response();
 
-    await handler(request("POST", "/notification-preferences"), output.value);
+    await handler(
+      postJsonRequest(
+        "/notification-preferences",
+        {},
+        '{"taskInactive":true}',
+      ),
+      output.value,
+    );
 
-    expect(output.status()).toBe(404);
-    expect(output.json()).toEqual({ error: "Not found" });
-    expect(loadNotificationPreferences).not.toHaveBeenCalled();
+    expect(output.status()).toBe(403);
+    expect(applyNotificationPreferencesMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts notification preferences POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce(
+      "notification-preferences",
+    );
+    const payload = { preferences: { taskInactive: false } };
+    const applyNotificationPreferencesMutation = vi.fn(() => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationPreferencesMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/notification-preferences",
+        authorizedHumanHeaders(nonce, cookie, "notification-preferences"),
+        '{"taskInactive":false}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyNotificationPreferencesMutation).toHaveBeenCalledWith({
+      taskInactive: false,
+    });
   });
 
   it("rejects a non-loopback Host header on notification preferences", async () => {
@@ -1251,6 +2316,325 @@ describe("daemon HTTP router", () => {
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Not found" });
     expect(loadNotifications).not.toHaveBeenCalled();
+  });
+
+  it("rejects notification read POST without the human mutation gate", async () => {
+    const applyNotificationReadMutation = vi.fn(() => ({
+      notificationId: "n-1",
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationReadMutation }),
+    );
+    const output = response();
+
+    await handler(postJsonRequest("/notifications/n-1/read", {}, ""), output.value);
+
+    expect(output.status()).toBe(403);
+    expect(applyNotificationReadMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts notification read POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("notification-read");
+    const notification = { notificationId: "n-1", status: "read" };
+    const applyNotificationReadMutation = vi.fn(() => notification) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationReadMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/notifications/n-1/read",
+        authorizedHumanHeaders(nonce, cookie, "notification-read"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual({ notification });
+    expect(applyNotificationReadMutation).toHaveBeenCalledWith("n-1");
+  });
+
+  it("returns not found when notification read misses", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("notification-read");
+    const applyNotificationReadMutation = vi.fn(() => undefined);
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationReadMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/notifications/n-1/read",
+        authorizedHumanHeaders(nonce, cookie, "notification-read"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Notification not found" });
+  });
+
+  it("rejects notification slack delivery dismiss POST without the human mutation gate", async () => {
+    const applyNotificationSlackDeliveryDismissMutation = vi.fn(() => ({
+      delivery: { deliveryId: "d-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationSlackDeliveryDismissMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/notifications/n-1/deliveries/slack/dismiss",
+        {},
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyNotificationSlackDeliveryDismissMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts notification slack delivery dismiss POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("outbound-dismiss");
+    const payload = { delivery: { deliveryId: "d-1", status: "suppressed" } };
+    const applyNotificationSlackDeliveryDismissMutation = vi.fn(
+      () => payload,
+    ) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationSlackDeliveryDismissMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/notifications/n-1/deliveries/slack/dismiss",
+        authorizedHumanHeaders(nonce, cookie, "outbound-dismiss"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyNotificationSlackDeliveryDismissMutation).toHaveBeenCalledWith(
+      "n-1",
+    );
+  });
+
+  it("does not treat slack delivery dismiss as notification dismiss", async () => {
+    const applyNotificationDismissMutation = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationDismissMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/notifications/n-1/deliveries/slack/dismiss", {}, ""),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyNotificationDismissMutation).not.toHaveBeenCalled();
+  });
+
+  it("rejects notification slack mark-delivered POST without the human mutation gate", async () => {
+    const applyNotificationSlackMarkDeliveredMutation = vi.fn(() => ({
+      delivery: { deliveryId: "d-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationSlackMarkDeliveredMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/notifications/n-1/deliveries/slack/mark-delivered",
+        {},
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyNotificationSlackMarkDeliveredMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts notification slack mark-delivered POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce(
+      "outbound-mark-delivered",
+    );
+    const payload = { delivery: { deliveryId: "d-1", status: "delivered" } };
+    const applyNotificationSlackMarkDeliveredMutation = vi.fn(
+      () => payload,
+    ) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationSlackMarkDeliveredMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/notifications/n-1/deliveries/slack/mark-delivered",
+        authorizedHumanHeaders(nonce, cookie, "outbound-mark-delivered"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyNotificationSlackMarkDeliveredMutation).toHaveBeenCalledWith(
+      "n-1",
+    );
+  });
+
+  it("rejects notification slack retry POST without the human mutation gate", async () => {
+    const applyNotificationSlackRetryMutation = vi.fn(async () => ({
+      delivery: { deliveryId: "d-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationSlackRetryMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/notifications/n-1/deliveries/slack/retry", {}, ""),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyNotificationSlackRetryMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts notification slack retry POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("outbound-retry");
+    const payload = { delivery: { deliveryId: "d-1", status: "delivered" } };
+    const applyNotificationSlackRetryMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationSlackRetryMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/notifications/n-1/deliveries/slack/retry",
+        authorizedHumanHeaders(nonce, cookie, "outbound-retry"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyNotificationSlackRetryMutation).toHaveBeenCalledWith("n-1");
+  });
+
+  it("rejects notification read-all POST without the human mutation gate", async () => {
+    const applyNotificationReadAllMutation = vi.fn(() => ({ updated: 1 })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationReadAllMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/notifications/read-all", {}, ""),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyNotificationReadAllMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts notification read-all POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce(
+      "notification-read-all",
+    );
+    const applyNotificationReadAllMutation = vi.fn(() => ({ updated: 4 })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationReadAllMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/notifications/read-all",
+        authorizedHumanHeaders(nonce, cookie, "notification-read-all"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual({ updated: 4 });
+    expect(applyNotificationReadAllMutation).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not expose notification read-all on unsupported methods", async () => {
+    const applyNotificationReadAllMutation = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationReadAllMutation }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/notifications/read-all"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(applyNotificationReadAllMutation).not.toHaveBeenCalled();
+  });
+
+  it("rejects notification dismiss POST without the human mutation gate", async () => {
+    const applyNotificationDismissMutation = vi.fn(() => ({
+      notificationId: "n-1",
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationDismissMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/notifications/n-1/dismiss", {}, ""),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyNotificationDismissMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts notification dismiss POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce(
+      "notification-dismiss",
+    );
+    const notification = { notificationId: "n-1", status: "dismissed" };
+    const applyNotificationDismissMutation = vi.fn(() => notification) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyNotificationDismissMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/notifications/n-1/dismiss",
+        authorizedHumanHeaders(nonce, cookie, "notification-dismiss"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual({ notification });
+    expect(applyNotificationDismissMutation).toHaveBeenCalledWith("n-1");
   });
 
   it("rejects a non-loopback Host header on notification listing", async () => {
@@ -1340,6 +2724,54 @@ describe("daemon HTTP router", () => {
     expect(loadFindingsQueue).not.toHaveBeenCalled();
   });
 
+  it("serves finding detail through the core finding-detail boundary", async () => {
+    const payload = {
+      finding: { findingId: "f-1" },
+      remediation: { findingId: "f-1", status: "open" },
+      history: [{ event: "created" }],
+    };
+    const loadFindingDetail = vi.fn(() => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadFindingDetail }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/findings/f-1"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(loadFindingDetail).toHaveBeenCalledWith("f-1");
+  });
+
+  it("returns 404 when finding detail is missing", async () => {
+    const loadFindingDetail = vi.fn(() => {
+      throw new FindingDetailNotFoundError();
+    }) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadFindingDetail }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/findings/missing"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Finding not found" });
+  });
+
+  it("does not expose finding detail on unsupported methods", async () => {
+    const loadFindingDetail = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadFindingDetail }),
+    );
+    const output = response();
+
+    await handler(request("POST", "/findings/f-1"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(loadFindingDetail).not.toHaveBeenCalled();
+  });
+
   it("rejects a non-loopback Host header on findings queue", async () => {
     const loadFindingsQueue = vi.fn() as never;
     const handler = createDaemonHttpHandler(
@@ -1402,6 +2834,105 @@ describe("daemon HTTP router", () => {
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Not found" });
     expect(loadOperationsOverview).not.toHaveBeenCalled();
+  });
+
+  it("rejects operations provider refresh POST without the human mutation gate", async () => {
+    const applyOperationsProviderRefreshMutation = vi.fn(async () => ({
+      providers: [],
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyOperationsProviderRefreshMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/operations/providers/refresh", {}, "{}"),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyOperationsProviderRefreshMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts operations provider refresh POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce(
+      "operations-provider-refresh",
+    );
+    const payload = {
+      providers: [{ provider: "claude", status: "compatible" }],
+    };
+    const applyOperationsProviderRefreshMutation = vi.fn(
+      async () => payload,
+    ) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyOperationsProviderRefreshMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/operations/providers/refresh",
+        authorizedHumanHeaders(nonce, cookie, "operations-provider-refresh"),
+        "{}",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(applyOperationsProviderRefreshMutation).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects operations provider acknowledge POST without the human mutation gate", async () => {
+    const applyOperationsProviderAcknowledgeMutation = vi.fn(async () => ({
+      provider: "claude",
+      version: "1.2.3",
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyOperationsProviderAcknowledgeMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/operations/providers/claude/acknowledge", {}, "{}"),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyOperationsProviderAcknowledgeMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts operations provider acknowledge POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce(
+      "operations-provider-acknowledge",
+    );
+    const payload = { provider: "claude", version: "1.2.3" };
+    const applyOperationsProviderAcknowledgeMutation = vi.fn(
+      async () => payload,
+    ) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyOperationsProviderAcknowledgeMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/operations/providers/claude/acknowledge",
+        authorizedHumanHeaders(nonce, cookie, "operations-provider-acknowledge"),
+        "{}",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(applyOperationsProviderAcknowledgeMutation).toHaveBeenCalledWith(
+      "claude",
+    );
   });
 
   it("rejects a non-loopback Host header on operations overview", async () => {
@@ -1631,6 +3162,106 @@ describe("daemon HTTP router", () => {
     expect(output.json()).toEqual({ error: "task_list_failed" });
   });
 
+  it("rejects task recover-pr POST without the human mutation gate", async () => {
+    const applyTaskRecoverPrMutation = vi.fn(async () => ({
+      task: { id: "task-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskRecoverPrMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/recover-pr",
+        {},
+        '{"repoId":"repo-1","prNumber":42}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyTaskRecoverPrMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts task recover-pr POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("task-recover-pr");
+    const payload = { task: { id: "task-1", prNumber: 42 } };
+    const applyTaskRecoverPrMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskRecoverPrMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/recover-pr",
+        authorizedHumanHeaders(nonce, cookie, "task-recover-pr"),
+        '{"repoId":"repo-1","prNumber":42}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyTaskRecoverPrMutation).toHaveBeenCalledWith({
+      repoId: "repo-1",
+      prNumber: 42,
+    });
+  });
+
+  it("rejects task create POST without the human mutation gate", async () => {
+    const createTaskFromBody = vi.fn(async () => ({
+      task: { id: "task-new" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ createTaskFromBody }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/tasks", {}, '{"repoId":"repo-1"}'),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(createTaskFromBody).not.toHaveBeenCalled();
+  });
+
+  it("accepts task create POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("task-create");
+    const initializeTaskRecovery = vi.fn(async () => undefined) as never;
+    const createTaskFromBody = vi.fn(async () => ({
+      task: { id: "task-new", repoId: "repo-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ initializeTaskRecovery, createTaskFromBody }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks",
+        authorizedHumanHeaders(nonce, cookie, "task-create"),
+        '{"repoId":"repo-1","templateId":"bug_fix","prompt":"Fix"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(201);
+    expect(output.json()).toEqual({
+      task: { id: "task-new", repoId: "repo-1" },
+    });
+    expect(initializeTaskRecovery).toHaveBeenCalledTimes(1);
+    expect(createTaskFromBody).toHaveBeenCalledWith({
+      repoId: "repo-1",
+      templateId: "bug_fix",
+      prompt: "Fix",
+    });
+  });
+
   it("does not expose task listing on unsupported methods", async () => {
     const listTasks = vi.fn(async () => []) as never;
     const handler = createDaemonHttpHandler(
@@ -1638,7 +3269,7 @@ describe("daemon HTTP router", () => {
     );
     const output = response();
 
-    await handler(request("POST", "/tasks"), output.value);
+    await handler(request("DELETE", "/tasks"), output.value);
 
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Not found" });
@@ -1845,7 +3476,595 @@ describe("daemon HTTP router", () => {
     expect(output.json()).toEqual({ error: "task_detail_failed" });
   });
 
-  it("does not expose task detail mutations", async () => {
+  it("rejects dependency recovery instructions POST without the human mutation gate", async () => {
+    const applyTaskDependencyRecoveryInstructionsMutation = vi.fn(async () => ({
+      steps: [],
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskDependencyRecoveryInstructionsMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/dependency-recovery-instructions",
+        {},
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyTaskDependencyRecoveryInstructionsMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts dependency recovery instructions POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce(
+      "task-dependency-recovery-instructions",
+    );
+    const payload = { steps: ["npm ci"], workdir: "/tmp/wt" };
+    const applyTaskDependencyRecoveryInstructionsMutation = vi.fn(
+      async () => payload,
+    ) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskDependencyRecoveryInstructionsMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/dependency-recovery-instructions",
+        authorizedHumanHeaders(
+          nonce,
+          cookie,
+          "task-dependency-recovery-instructions",
+        ),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyTaskDependencyRecoveryInstructionsMutation).toHaveBeenCalledWith(
+      "task-1",
+    );
+  });
+
+  it("rejects task reassociate preview POST without the human mutation gate", async () => {
+    const applyTaskReassociatePreviewMutation = vi.fn(async () => ({
+      preview: {},
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskReassociatePreviewMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/tasks/task-1/reassociate/preview", {}, ""),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyTaskReassociatePreviewMutation).not.toHaveBeenCalled();
+  });
+
+  it("rejects task reassociate POST without the human mutation gate", async () => {
+    const applyTaskReassociateMutation = vi.fn(async () => ({
+      task: { id: "task-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskReassociateMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/reassociate",
+        {},
+        '{"confirmed":true,"fingerprint":"fp-1"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyTaskReassociateMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts task reassociate POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce(
+      "task-reassociation-confirm",
+    );
+    const payload = { task: { id: "task-1", worktreeStatus: "available" } };
+    const applyTaskReassociateMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskReassociateMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/reassociate",
+        authorizedHumanHeaders(nonce, cookie, "task-reassociation-confirm"),
+        '{"confirmed":true,"fingerprint":"fp-1"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyTaskReassociateMutation).toHaveBeenCalledWith("task-1", {
+      confirmed: true,
+      fingerprint: "fp-1",
+    });
+  });
+
+  it("does not treat reassociate confirm as preview", async () => {
+    const applyTaskReassociatePreviewMutation = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskReassociatePreviewMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/tasks/task-1/reassociate", {}, '{"confirmed":true,"fingerprint":"fp-1"}'),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyTaskReassociatePreviewMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts task reassociate preview POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce(
+      "task-reassociation-preview",
+    );
+    const payload = { preview: { fingerprint: "fp-1", candidates: [] } };
+    const applyTaskReassociatePreviewMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskReassociatePreviewMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/reassociate/preview",
+        authorizedHumanHeaders(nonce, cookie, "task-reassociation-preview"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyTaskReassociatePreviewMutation).toHaveBeenCalledWith("task-1");
+  });
+
+  it("rejects task resume POST without the human mutation gate", async () => {
+    const applyTaskResumeMutation = vi.fn(async () => ({
+      status: 200,
+      body: {},
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskResumeMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/tasks/task-1/resume", {}, ""),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyTaskResumeMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts task resume POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("task-resume");
+    const payload = {
+      status: 200,
+      body: { diff: {}, task: { id: "task-1" } },
+    };
+    const applyTaskResumeMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskResumeMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/resume",
+        authorizedHumanHeaders(nonce, cookie, "task-resume"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload.body);
+    expect(applyTaskResumeMutation).toHaveBeenCalledWith("task-1");
+  });
+
+  it("rejects task refresh-pr POST without the human mutation gate", async () => {
+    const applyTaskRefreshPrMutation = vi.fn(async () => ({
+      task: { id: "task-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskRefreshPrMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/tasks/task-1/refresh-pr", {}, ""),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyTaskRefreshPrMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts task refresh-pr POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("task-refresh-pr");
+    const payload = { task: { id: "task-1", prNumber: 42 } };
+    const applyTaskRefreshPrMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskRefreshPrMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/refresh-pr",
+        authorizedHumanHeaders(nonce, cookie, "task-refresh-pr"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyTaskRefreshPrMutation).toHaveBeenCalledWith("task-1");
+  });
+
+  it("rejects task fetch-review POST without the human mutation gate", async () => {
+    const applyTaskFetchReviewMutation = vi.fn(async () => ({
+      task: { id: "task-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskFetchReviewMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/tasks/task-1/fetch-review", {}, ""),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyTaskFetchReviewMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts task fetch-review POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("task-fetch-review");
+    const payload = { task: { id: "task-1", status: "reviewed" } };
+    const applyTaskFetchReviewMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskFetchReviewMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/fetch-review",
+        authorizedHumanHeaders(nonce, cookie, "task-fetch-review"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyTaskFetchReviewMutation).toHaveBeenCalledWith("task-1");
+  });
+
+  it("rejects task create-pr POST without the human mutation gate", async () => {
+    const applyTaskCreatePrMutation = vi.fn(async () => ({
+      task: { id: "task-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskCreatePrMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/tasks/task-1/create-pr", {}, ""),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyTaskCreatePrMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts task create-pr POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("task-create-pr");
+    const payload = { task: { id: "task-1", prNumber: 42 } };
+    const applyTaskCreatePrMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskCreatePrMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/create-pr",
+        authorizedHumanHeaders(nonce, cookie, "task-create-pr"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyTaskCreatePrMutation).toHaveBeenCalledWith("task-1");
+  });
+
+  it("rejects task prepare-approval POST without the human mutation gate", async () => {
+    const applyTaskPrepareApprovalMutation = vi.fn(async () => ({
+      status: 200,
+      body: {},
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskPrepareApprovalMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/tasks/task-1/prepare-approval", {}, ""),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyTaskPrepareApprovalMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts task prepare-approval POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce(
+      "task-prepare-approval",
+    );
+    const payload = {
+      status: 200,
+      body: {
+        diff: { approvable: true },
+        approval: { approvalId: "ap-1" },
+        task: { id: "task-1" },
+      },
+    };
+    const applyTaskPrepareApprovalMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskPrepareApprovalMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/prepare-approval",
+        authorizedHumanHeaders(nonce, cookie, "task-prepare-approval"),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload.body);
+    expect(applyTaskPrepareApprovalMutation).toHaveBeenCalledWith("task-1");
+  });
+
+  it("rejects task apply-review POST without the human mutation gate", async () => {
+    const applyTaskApplyReviewMutation = vi.fn(async () => ({
+      task: { id: "task-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskApplyReviewMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/apply-review",
+        {},
+        '{"approved":true}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyTaskApplyReviewMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts task apply-review POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("task-apply-review");
+    const payload = { task: { id: "task-1", status: "open" } };
+    const applyTaskApplyReviewMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskApplyReviewMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/apply-review",
+        authorizedHumanHeaders(nonce, cookie, "task-apply-review"),
+        '{"approved":true}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyTaskApplyReviewMutation).toHaveBeenCalledWith("task-1", {
+      approved: true,
+    });
+  });
+
+  it("rejects task approve-rework POST without the human mutation gate", async () => {
+    const applyTaskApproveReworkMutation = vi.fn(async () => ({
+      task: { id: "task-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskApproveReworkMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/approve-rework",
+        {},
+        '{"approved":true,"diffHash":"abc","approvalId":"ap-1"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyTaskApproveReworkMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts task approve-rework POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("task-approve-rework");
+    const payload = { task: { id: "task-1", status: "rework" } };
+    const applyTaskApproveReworkMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskApproveReworkMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/approve-rework",
+        authorizedHumanHeaders(nonce, cookie, "task-approve-rework"),
+        '{"approved":true,"diffHash":"abc","approvalId":"ap-1"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyTaskApproveReworkMutation).toHaveBeenCalledWith("task-1", {
+      approved: true,
+      diffHash: "abc",
+      approvalId: "ap-1",
+    });
+  });
+
+  it("rejects task approve POST without the human mutation gate", async () => {
+    const applyTaskApproveMutation = vi.fn(async () => ({
+      task: { id: "task-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskApproveMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/approve",
+        {},
+        '{"approved":true,"diffHash":"abc","approvalId":"ap-1"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyTaskApproveMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts task approve POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("task-approve");
+    const payload = { task: { id: "task-1", prNumber: 42 } };
+    const applyTaskApproveMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskApproveMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/approve",
+        authorizedHumanHeaders(nonce, cookie, "task-approve"),
+        '{"approved":true,"diffHash":"abc","approvalId":"ap-1"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyTaskApproveMutation).toHaveBeenCalledWith("task-1", {
+      approved: true,
+      diffHash: "abc",
+      approvalId: "ap-1",
+    });
+  });
+
+  it("rejects task delete without the human mutation gate", async () => {
+    const removeTask = vi.fn(async () => undefined) as never;
+    const handler = createDaemonHttpHandler(dependencies({ removeTask }));
+    const output = response();
+
+    await handler(
+      mutationRequest("DELETE", "/tasks/task-1", {}),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(removeTask).not.toHaveBeenCalled();
+  });
+
+  it("accepts task delete after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("task-delete");
+    const initializeTaskDeleteRecovery = vi.fn(async () => undefined) as never;
+    const parseTaskDeleteBody = vi.fn(() => ({ confirmedPrCleanup: true })) as never;
+    const removeTask = vi.fn(async () => undefined) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({
+        initializeTaskDeleteRecovery,
+        parseTaskDeleteBody,
+        removeTask,
+      }),
+    );
+    const output = response();
+
+    await handler(
+      mutationRequest(
+        "DELETE",
+        "/tasks/task-1",
+        authorizedHumanHeaders(nonce, cookie, "task-delete"),
+        '{"confirmedPrCleanup":true}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(204);
+    expect(initializeTaskDeleteRecovery).toHaveBeenCalledTimes(1);
+    expect(parseTaskDeleteBody).toHaveBeenCalledWith(
+      '{"confirmedPrCleanup":true}',
+    );
+    expect(removeTask).toHaveBeenCalledWith("task-1", {
+      confirmedPrCleanup: true,
+    });
+  });
+
+  it("does not expose unsupported task detail mutations", async () => {
     const loadTaskDetail = vi.fn(async () => ({
       task: { id: "task-1" },
       diff: { patch: "" },
@@ -1854,14 +4073,12 @@ describe("daemon HTTP router", () => {
     const handler = createDaemonHttpHandler(
       dependencies({ loadTaskDetail }),
     );
+    const output = response();
 
-    for (const method of ["POST", "DELETE"] as const) {
-      const output = response();
-      await handler(request(method, "/tasks/task-1"), output.value);
-      expect(output.status()).toBe(404);
-      expect(output.json()).toEqual({ error: "Not found" });
-    }
+    await handler(request("POST", "/tasks/task-1"), output.value);
 
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
     expect(loadTaskDetail).not.toHaveBeenCalled();
   });
 
@@ -2266,6 +4483,54 @@ describe("daemon HTTP router", () => {
     expect(loadTaskFindings).not.toHaveBeenCalled();
   });
 
+  it("rejects findings extract POST without the human mutation gate", async () => {
+    const applyTaskFindingsExtractMutation = vi.fn(async () => ({
+      findings: [],
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskFindingsExtractMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/findings/extract",
+        {},
+        '{"confirmed":true}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyTaskFindingsExtractMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts findings extract POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("finding-extract");
+    const payload = { findings: [{ findingId: "f-1", title: "Bug" }] };
+    const applyTaskFindingsExtractMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskFindingsExtractMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/findings/extract",
+        authorizedHumanHeaders(nonce, cookie, "finding-extract"),
+        '{"confirmed":true}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(201);
+    expect(output.json()).toEqual(payload);
+    expect(applyTaskFindingsExtractMutation).toHaveBeenCalledWith("task-1", {
+      confirmed: true,
+    });
+  });
+
   it("does not treat findings extract as the findings read", async () => {
     const loadTaskFindings = vi.fn() as never;
     const handler = createDaemonHttpHandler(
@@ -2278,6 +4543,282 @@ describe("daemon HTTP router", () => {
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Not found" });
     expect(loadTaskFindings).not.toHaveBeenCalled();
+  });
+
+  it("rejects finding accept POST without the human mutation gate", async () => {
+    const applyFindingAcceptMutation = vi.fn(async () => ({
+      finding: { findingId: "f-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyFindingAcceptMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/findings/f-1/accept",
+        {},
+        '{"confirmed":true}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyFindingAcceptMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts finding accept POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("finding-accept");
+    const payload = {
+      finding: { findingId: "f-1", status: "accepted" },
+      remediation: { findingId: "f-1" },
+      history: [{ type: "finding_accepted" }],
+    };
+    const applyFindingAcceptMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyFindingAcceptMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/findings/f-1/accept",
+        authorizedHumanHeaders(nonce, cookie, "finding-accept"),
+        '{"confirmed":true}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyFindingAcceptMutation).toHaveBeenCalledWith("f-1", {
+      confirmed: true,
+    });
+  });
+
+  it("does not treat finding accept as findings queue read", async () => {
+    const loadFindingsQueue = vi.fn() as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ loadFindingsQueue }),
+    );
+    const output = response();
+
+    await handler(request("GET", "/findings/f-1/accept"), output.value);
+
+    expect(output.status()).toBe(404);
+    expect(output.json()).toEqual({ error: "Not found" });
+    expect(loadFindingsQueue).not.toHaveBeenCalled();
+  });
+
+  it("rejects finding dismiss POST without the human mutation gate", async () => {
+    const applyFindingDismissMutation = vi.fn(async () => ({
+      finding: { findingId: "f-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyFindingDismissMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/findings/f-1/dismiss",
+        {},
+        '{"confirmed":true}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyFindingDismissMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts finding dismiss POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("finding-dismiss");
+    const payload = {
+      finding: { findingId: "f-1", status: "dismissed" },
+      remediation: { findingId: "f-1" },
+      history: [{ type: "finding_dismissed" }],
+    };
+    const applyFindingDismissMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyFindingDismissMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/findings/f-1/dismiss",
+        authorizedHumanHeaders(nonce, cookie, "finding-dismiss"),
+        '{"confirmed":true,"reason":"not applicable"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyFindingDismissMutation).toHaveBeenCalledWith("f-1", {
+      confirmed: true,
+      reason: "not applicable",
+    });
+  });
+
+  it("rejects finding convert POST without the human mutation gate", async () => {
+    const applyFindingConvertMutation = vi.fn(async () => ({
+      finding: { findingId: "f-1" },
+      task: { id: "task-2" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyFindingConvertMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/findings/f-1/convert",
+        {},
+        '{"confirmed":true,"templateId":"bug_fix","objective":"Fix it"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyFindingConvertMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts finding convert POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("finding-convert");
+    const payload = {
+      finding: { findingId: "f-1", status: "converted" },
+      task: { id: "task-2", repoId: "repo-1" },
+      remediation: { findingId: "f-1" },
+      history: [{ type: "implementation_task_created" }],
+    };
+    const applyFindingConvertMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyFindingConvertMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/findings/f-1/convert",
+        authorizedHumanHeaders(nonce, cookie, "finding-convert"),
+        '{"confirmed":true,"templateId":"bug_fix","objective":"Fix it"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(201);
+    expect(output.json()).toEqual(payload);
+    expect(applyFindingConvertMutation).toHaveBeenCalledWith("f-1", {
+      confirmed: true,
+      templateId: "bug_fix",
+      objective: "Fix it",
+    });
+  });
+
+  it("rejects finding resolve POST without the human mutation gate", async () => {
+    const applyFindingResolveMutation = vi.fn(async () => ({
+      finding: { findingId: "f-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyFindingResolveMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/findings/f-1/resolve", {}, '{"confirmed":true}'),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyFindingResolveMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts finding resolve POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("finding-resolve");
+    const payload = {
+      finding: { findingId: "f-1", resolvedAt: "now" },
+      remediation: { findingId: "f-1" },
+      history: [{ type: "finding_resolved" }],
+    };
+    const applyFindingResolveMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyFindingResolveMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/findings/f-1/resolve",
+        authorizedHumanHeaders(nonce, cookie, "finding-resolve"),
+        '{"confirmed":true}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyFindingResolveMutation).toHaveBeenCalledWith("f-1", {
+      confirmed: true,
+    });
+  });
+
+  it("rejects finding priority POST without the human mutation gate", async () => {
+    const applyFindingPriorityMutation = vi.fn(async () => ({
+      finding: { findingId: "f-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyFindingPriorityMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/findings/f-1/priority",
+        {},
+        '{"confirmed":true,"priority":"urgent"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyFindingPriorityMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts finding priority POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("finding-priority");
+    const payload = {
+      finding: { findingId: "f-1", humanPriority: "urgent" },
+      remediation: { findingId: "f-1" },
+      history: [{ type: "finding_priority_changed" }],
+    };
+    const applyFindingPriorityMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyFindingPriorityMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/findings/f-1/priority",
+        authorizedHumanHeaders(nonce, cookie, "finding-priority"),
+        '{"confirmed":true,"priority":"urgent"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyFindingPriorityMutation).toHaveBeenCalledWith("f-1", {
+      confirmed: true,
+      priority: "urgent",
+    });
   });
 
   it("rejects a non-loopback Host header on task findings", async () => {
