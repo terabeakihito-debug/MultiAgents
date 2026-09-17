@@ -207,11 +207,11 @@ export default function Home() {
     if (!activeTask) return;
     const response = await humanMutationFetch(`/api/tasks/${activeTask.id}/prepare-approval`, "task-prepare-approval", { method: "POST" });
     const data = await response.json() as { diff?: TaskDiff; task?: RepoTask; approval?: Approval; error?: string };
+    if (data.task) setTask(data.task);
     if (!data.diff) throw new Error(data.error || "Could not load diff");
     const previousHash = approval?.diffHash;
     const previousApprovalId = approval?.approvalId;
     setTaskDiff(data.diff);
-    if (data.task) setTask(data.task);
     setApproval(data.approval ?? null);
     if (!data.approval?.diffHash || data.approval.diffHash !== previousHash || data.approval.approvalId !== previousApprovalId) setReviewedDiff(false);
     await loadTaskHistory(activeTask.id);
