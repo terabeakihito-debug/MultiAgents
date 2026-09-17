@@ -15,6 +15,7 @@ describe("review rerun mutation service", () => {
       executionRoot: vi.fn(),
       createStream: vi.fn(),
       diffFingerprint: vi.fn(),
+      loadDiff: vi.fn(),
       runtimeExecutor: vi.fn(),
       recordEvent: vi.fn(),
       completeReview: vi.fn(),

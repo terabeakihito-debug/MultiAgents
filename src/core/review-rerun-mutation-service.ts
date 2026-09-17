@@ -12,6 +12,7 @@ import {
   executionPromptForTask,
   executionRootForTask,
   getTask,
+  getTaskDiff,
   initializeTaskRecovery,
   recordFlowEvent,
   requireTaskTemplate,
@@ -35,6 +36,7 @@ type ReviewRerunMutationDependencies = {
   executionRoot: typeof executionRootForTask;
   createStream: typeof createReviewRerunStream;
   diffFingerprint: typeof createDiffSnapshot;
+  loadDiff: typeof getTaskDiff;
   runtimeExecutor: typeof taskRuntimeExecutor;
   recordEvent: typeof recordFlowEvent;
   completeReview: typeof completeTaskReview;
@@ -54,6 +56,7 @@ export function createReviewRerunMutationService(
     executionRoot: executionRootForTask,
     createStream: createReviewRerunStream,
     diffFingerprint: createDiffSnapshot,
+    loadDiff: getTaskDiff,
     runtimeExecutor: taskRuntimeExecutor,
     recordEvent: recordFlowEvent,
     completeReview: completeTaskReview,
@@ -117,8 +120,13 @@ export function createReviewRerunMutationService(
           {
             cwd: dependencies.executionRoot(task),
             roles: template.roles,
+            repositoryReadOnly: template.readOnly,
             fingerprint: async () =>
               (await dependencies.diffFingerprint(task)).hash,
+            getDiff: async () => {
+              const diff = await dependencies.loadDiff(task);
+              return [diff.patch, diff.untrackedPatch].filter(Boolean).join("\n\n");
+            },
             runtimePolicies: taskRuntime.policies,
             executeAgent: dependencies.runtimeExecutor(
               taskRuntime,

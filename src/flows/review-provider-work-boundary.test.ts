@@ -34,7 +34,7 @@ describe("review provider-work budget boundary", () => {
     }
   });
 
-  it("allows an approximately 92s draft when provider work remains under the 90s work cap", async () => {
+  it("allows an approximately 92s draft when provider work remains under the draft work cap", async () => {
     vi.useFakeTimers();
     try {
       const result = await runReviewFlow("request", {
@@ -69,7 +69,7 @@ describe("review provider-work budget boundary", () => {
           if (stepId !== "codex_draft") return completed(agent, "unused");
           await vi.advanceTimersByTimeAsync(35_000);
           onProviderWorkStart?.();
-          await vi.advanceTimersByTimeAsync(86_000);
+          await vi.advanceTimersByTimeAsync(106_000);
           return signal.aborted
             ? { agent, status: "error", output: "", error: "aborted" }
             : completed(agent, "unexpected");
@@ -94,7 +94,7 @@ describe("review provider-work budget boundary", () => {
       const result = await runReviewFlow("request", {
         executeAgent: async (agent, _prompt, signal, stepId, onProviderWorkStart) => {
           if (stepId !== "codex_draft") return completed(agent, "unused");
-          await vi.advanceTimersByTimeAsync(121_000);
+          await vi.advanceTimersByTimeAsync(141_000);
           const allowed = onProviderWorkStart?.();
           if (allowed === false) return { agent, status: "error", output: "", error: "rejected before provider work" };
           providerWorkEntered = true;
