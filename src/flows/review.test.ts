@@ -23,7 +23,7 @@ const fail = (agent: AgentId, error = "failed"): AgentResult => ({ agent, status
 describe("runReviewFlow", () => {
   it("plans the initial draft budget while reserving every downstream step", () => {
     const deadline = 300_000;
-    expect(reviewStepActualBudgetMs("codex_draft", deadline, 0)).toBe(90_000);
+    expect(reviewStepActualBudgetMs("codex_draft", deadline, 0)).toBe(110_000);
     expect(reviewStepActualBudgetMs("cursor_review", deadline, 100_000)).toBeGreaterThanOrEqual(45_000);
     expect(reviewStepActualBudgetMs("claude_review", deadline, 155_000)).toBeGreaterThanOrEqual(45_000);
     expect(reviewStepActualBudgetMs("codex_final", deadline, 210_000)).toBeGreaterThanOrEqual(45_000);
@@ -185,7 +185,7 @@ describe("runReviewFlow", () => {
     const { adapters } = setup({});
     adapters.codex.run = vi.fn((_prompt: string, options?: AgentRunOptions) => new Promise<AgentResult>((resolve) => options?.signal?.addEventListener("abort", () => resolve(fail("codex", "Request was aborted")), { once: true })));
     const pending = runReviewFlow("request", { agents: adapters });
-    await vi.advanceTimersByTimeAsync(90_000);
+    await vi.advanceTimersByTimeAsync(110_000);
     const result = await pending;
     expect(result.steps[0]).toMatchObject({ status: "error", terminationReason: "step_budget_exhausted", error: "Review step budget exhausted." });
     vi.useRealTimers();
