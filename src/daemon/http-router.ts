@@ -67,10 +67,7 @@ import { cleanupCandidatesService } from "../core/cleanup-candidates-service";
 import { cleanupExecuteMutationService } from "../core/cleanup-execute-mutation-service";
 import { cleanupPreviewMutationService } from "../core/cleanup-preview-mutation-service";
 import { credentialStatusService } from "../core/credential-status-service";
-import {
-  FindingDetailNotFoundError,
-  findingDetailService,
-} from "../core/finding-detail-service";
+import { findingDetailService } from "../core/finding-detail-service";
 import {
   findingsQueueService,
   RemediationQueueQueryError,
