@@ -16,6 +16,7 @@ import {
   prepareApproval,
   ProcessExecutionError,
   runHardenedProcess,
+  runProjectValidation,
   runServerGitMutation,
   scanSecrets,
   summarizeStderr,
@@ -488,6 +489,17 @@ describe("Phase 5 approval and PR state machine", () => {
     expect(task.status).toBe("validation_failed");
     expect(task.dependencyRecovery).toBe("dependency_setup_required");
     expect(publicTask(task)).toMatchObject({ dependencyRecovery: { reason: "dependency_setup_required", recheckAvailable: true } });
+  });
+
+  it("records dependency recovery when autonomous validation starts from draft", async () => {
+    const { task } = await createRepo();
+    await writeFile(join(task.worktreePath, "package.json"), JSON.stringify({ scripts: { lint: "eslint ." } }));
+    await expect(runProjectValidation(task, {
+      checkDependencies: checkTaskDependencies,
+      runValidation: vi.fn(async () => undefined),
+    })).rejects.toThrow("dependencies not installed in task worktree");
+    expect(task.status).toBe("validation_failed");
+    expect(task.dependencyRecovery).toBe("dependency_setup_required");
   });
 
   it("classifies incomplete and symlinked task-local dependency trees for recovery", async () => {
