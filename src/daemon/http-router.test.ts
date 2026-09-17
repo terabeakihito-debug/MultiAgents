@@ -173,6 +173,10 @@ function dependencies(
     applyOperationsProviderRefreshMutation: vi.fn(async () => ({
       providers: [{ provider: "claude", status: "compatible" }],
     })) as never,
+    applyOperationsProviderAcknowledgeMutation: vi.fn(async () => ({
+      provider: "claude",
+      version: "1.2.3",
+    })) as never,
     loadDashboardTasks: vi.fn(async () => ({
       tasks: [{ id: "task-1" }],
       counts: {},
@@ -2827,25 +2831,54 @@ describe("daemon HTTP router", () => {
     expect(applyOperationsProviderRefreshMutation).toHaveBeenCalledTimes(1);
   });
 
-  it("does not expose provider acknowledge on the daemon yet", async () => {
-    const applyOperationsProviderRefreshMutation = vi.fn() as never;
+  it("rejects operations provider acknowledge POST without the human mutation gate", async () => {
+    const applyOperationsProviderAcknowledgeMutation = vi.fn(async () => ({
+      provider: "claude",
+      version: "1.2.3",
+    })) as never;
     const handler = createDaemonHttpHandler(
-      dependencies({ applyOperationsProviderRefreshMutation }),
+      dependencies({ applyOperationsProviderAcknowledgeMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/operations/providers/claude/acknowledge", {}, "{}"),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyOperationsProviderAcknowledgeMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts operations provider acknowledge POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce(
+      "operations-provider-acknowledge",
+    );
+    const payload = { provider: "claude", version: "1.2.3" };
+    const applyOperationsProviderAcknowledgeMutation = vi.fn(
+      async () => payload,
+    ) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyOperationsProviderAcknowledgeMutation }),
     );
     const output = response();
 
     await handler(
       postJsonRequest(
         "/operations/providers/claude/acknowledge",
-        {},
+        authorizedHumanHeaders(nonce, cookie, "operations-provider-acknowledge"),
         "{}",
       ),
       output.value,
     );
 
-    expect(output.status()).toBe(404);
-    expect(output.json()).toEqual({ error: "Not found" });
-    expect(applyOperationsProviderRefreshMutation).not.toHaveBeenCalled();
+    expect(output.status()).toBe(200);
+    expect(output.header("cache-control")).toBe("no-store");
+    expect(output.json()).toEqual(payload);
+    expect(applyOperationsProviderAcknowledgeMutation).toHaveBeenCalledWith(
+      "claude",
+    );
   });
 
   it("rejects a non-loopback Host header on operations overview", async () => {

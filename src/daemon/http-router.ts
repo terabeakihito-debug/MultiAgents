@@ -72,6 +72,11 @@ import {
   RemediationQueueQueryError,
 } from "../core/findings-queue-service";
 import { operationsOverviewService } from "../core/operations-overview-service";
+import {
+  OperationsProviderAcknowledgeConflictError,
+  OperationsProviderAcknowledgeNotFoundError,
+  operationsProviderAcknowledgeMutationService,
+} from "../core/operations-provider-acknowledge-mutation-service";
 import { operationsProviderRefreshMutationService } from "../core/operations-provider-refresh-mutation-service";
 import { outboundSlackSettingsService } from "../core/outbound-slack-settings-service";
 import {
@@ -254,6 +259,7 @@ type DaemonHttpDependencies = {
   loadFindingsQueue: typeof findingsQueueService.load;
   loadOperationsOverview: typeof operationsOverviewService.load;
   applyOperationsProviderRefreshMutation: typeof operationsProviderRefreshMutationService.apply;
+  applyOperationsProviderAcknowledgeMutation: typeof operationsProviderAcknowledgeMutationService.apply;
   loadDashboardTasks: typeof dashboardTasksService.load;
   loadRuntimeSandboxStatus: typeof runtimeSandboxStatusService.load;
   loadNotificationPreferences: typeof notificationPreferencesService.load;
@@ -350,6 +356,8 @@ export function createDaemonHttpHandler(
     loadOperationsOverview: () => operationsOverviewService.load(),
     applyOperationsProviderRefreshMutation: () =>
       operationsProviderRefreshMutationService.apply(),
+    applyOperationsProviderAcknowledgeMutation: (provider) =>
+      operationsProviderAcknowledgeMutationService.apply(provider),
     loadDashboardTasks: (url) => dashboardTasksService.load(url),
     loadRuntimeSandboxStatus: () => runtimeSandboxStatusService.load(),
     loadNotificationPreferences: () => notificationPreferencesService.load(),
@@ -2039,6 +2047,53 @@ export function createDaemonHttpHandler(
       return;
     }
 
+    const operationsProviderAcknowledgeId =
+      matchOperationsProviderAcknowledgePath(url.pathname);
+    if (operationsProviderAcknowledgeId) {
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "operations-provider-acknowledge",
+        { label: "Provider compatibility acknowledgement" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          await dependencies.applyOperationsProviderAcknowledgeMutation(
+            operationsProviderAcknowledgeId,
+          ),
+        );
+      } catch (error) {
+        if (error instanceof OperationsProviderAcknowledgeNotFoundError) {
+          writeJson(response, 404, { error: error.message });
+          return;
+        }
+        if (error instanceof OperationsProviderAcknowledgeConflictError) {
+          writeJson(response, 409, { error: error.message });
+          return;
+        }
+        console.error(
+          "daemon_operations_provider_acknowledge_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, {
+          error: "operations_provider_acknowledge_failed",
+        });
+      }
+      return;
+    }
+
     if (request.method === "GET" && url.pathname === "/dashboard/tasks") {
       try {
         writeJson(response, 200, await dependencies.loadDashboardTasks(url));
@@ -3053,6 +3108,13 @@ function isLoopbackHost(hostHeader: string) {
   } catch {
     return false;
   }
+}
+
+function matchOperationsProviderAcknowledgePath(pathname: string) {
+  const match = /^\/operations\/providers\/([^/]+)\/acknowledge$/.exec(
+    pathname,
+  );
+  return decodePathSegment(match?.[1]);
 }
 
 function matchStateBackupValidatePath(pathname: string) {
