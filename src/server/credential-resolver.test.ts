@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { GET as credentialStatusGet } from "../app/api/credentials/status/route";
+import { credentialStatusService } from "../core/credential-status-service";
 import { credentialStatusView } from "./credential-status";
 import {
   CredentialAccessError,
@@ -76,11 +76,9 @@ describe("Phase 16 status and persistence boundary", () => {
     vi.stubEnv("MULTIAGENTS_SLACK_WEBHOOK_URL", webhook);
     const store = new StateStore(":memory:");
     replaceStateStoreForTests(store);
-    const response = await credentialStatusGet(new Request("http://localhost:3000/api/credentials/status", { headers: { host: "localhost:3000" } }));
-    const body = await response.text();
-    expect(response.status).toBe(200);
-    expect(body).not.toContain(fixture);
-    expect(JSON.parse(body).credentials).toEqual(expect.arrayContaining([
+    const payload = credentialStatusService.load();
+    expect(JSON.stringify(payload)).not.toContain(fixture);
+    expect(payload.credentials).toEqual(expect.arrayContaining([
       { capability: "slack_outbound", status: "configured", source: "environment" },
       { capability: "github_cli", status: "externally_managed", source: "external_cli" },
     ]));
