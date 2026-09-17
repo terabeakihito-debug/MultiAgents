@@ -77,6 +77,7 @@ import {
   OutboundInputError,
   outboundSlackSettingsMutationService,
 } from "../core/outbound-slack-settings-mutation-service";
+import { outboundSlackTestMutationService } from "../core/outbound-slack-test-mutation-service";
 import { runtimeSandboxStatusService } from "../core/runtime-sandbox-status-service";
 import {
   notificationListService,
@@ -292,6 +293,7 @@ type DaemonHttpDependencies = {
   applyTaskRecoverPrMutation: typeof taskRecoverPrMutationService.apply;
   loadOutboundSlackSettings: typeof outboundSlackSettingsService.load;
   applyOutboundSlackSettingsMutation: typeof outboundSlackSettingsMutationService.apply;
+  applyOutboundSlackTestMutation: typeof outboundSlackTestMutationService.apply;
   loadMaintenanceState: typeof maintenanceStateService.load;
   loadStateBackups: typeof stateBackupsService.load;
   createStateBackup: typeof stateBackupCreateMutationService.create;
@@ -412,6 +414,8 @@ export function createDaemonHttpHandler(
     loadOutboundSlackSettings: () => outboundSlackSettingsService.load(),
     applyOutboundSlackSettingsMutation: (body) =>
       outboundSlackSettingsMutationService.apply(body),
+    applyOutboundSlackTestMutation: () =>
+      outboundSlackTestMutationService.apply(),
     loadMaintenanceState: () => maintenanceStateService.load(),
     loadStateBackups: () => stateBackupsService.load(),
     createStateBackup: () => stateBackupCreateMutationService.create(),
@@ -917,6 +921,41 @@ export function createDaemonHttpHandler(
       }
 
       writeJson(response, 404, { error: "Not found" });
+      return;
+    }
+
+    if (url.pathname === "/outbound/slack/test") {
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "outbound-test",
+        { label: "External notification" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      try {
+        const result = await dependencies.applyOutboundSlackTestMutation();
+        writeJson(
+          response,
+          result.outcome === "delivered" ? 200 : 502,
+          result.body,
+        );
+      } catch (error) {
+        writeJson(response, error instanceof OutboundInputError ? 400 : 500, {
+          error:
+            error instanceof Error
+              ? error.message
+              : "Slack test delivery failed",
+        });
+      }
       return;
     }
 

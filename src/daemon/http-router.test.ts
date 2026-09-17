@@ -292,6 +292,10 @@ function dependencies(
       configured: true,
       config: { enabled: true },
     })) as never,
+    applyOutboundSlackTestMutation: vi.fn(async () => ({
+      outcome: "delivered" as const,
+      body: { status: "delivered" as const },
+    })) as never,
     applyRepoProfileMutation: vi.fn(async () => ({
       profile: { repoId: "repo-1", profileId: "safe_default" },
     })) as never,
@@ -1102,6 +1106,51 @@ describe("daemon HTTP router", () => {
     expect(output.status()).toBe(404);
     expect(output.json()).toEqual({ error: "Not found" });
     expect(loadOutboundSlackSettings).not.toHaveBeenCalled();
+  });
+
+  it("rejects outbound Slack test POST without the human mutation gate", async () => {
+    const applyOutboundSlackTestMutation = vi.fn(async () => ({
+      outcome: "delivered" as const,
+      body: { status: "delivered" as const },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyOutboundSlackTestMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/outbound/slack/test", {}, "{}"),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyOutboundSlackTestMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts outbound Slack test POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("outbound-test");
+    const applyOutboundSlackTestMutation = vi.fn(async () => ({
+      outcome: "delivered" as const,
+      body: { status: "delivered" as const },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyOutboundSlackTestMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/outbound/slack/test",
+        authorizedHumanHeaders(nonce, cookie, "outbound-test"),
+        "{}",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual({ status: "delivered" });
+    expect(applyOutboundSlackTestMutation).toHaveBeenCalledTimes(1);
   });
 
   it("rejects a non-loopback Host header on outbound Slack settings", async () => {
