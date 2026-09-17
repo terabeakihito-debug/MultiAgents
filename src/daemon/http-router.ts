@@ -111,6 +111,7 @@ import {
   RepoCreateInputError,
   repoCreateMutationService,
 } from "../core/repo-create-mutation-service";
+import { repoInitializeMutationService } from "../core/repo-initialize-mutation-service";
 import { repoListService } from "../core/repo-list-service";
 import {
   repoProfileService,
@@ -239,6 +240,7 @@ type DaemonHttpDependencies = {
   loadRepoList: typeof repoListService.load;
   applyRepoCloneMutation: typeof repoCloneMutationService.apply;
   applyRepoCreateMutation: typeof repoCreateMutationService.apply;
+  applyRepoInitializeMutation: typeof repoInitializeMutationService.apply;
   loadCredentialStatus: typeof credentialStatusService.load;
   loadNotifications: typeof notificationListService.load;
   applyNotificationReadMutation: typeof notificationReadMutationService.apply;
@@ -324,6 +326,8 @@ export function createDaemonHttpHandler(
     loadRepoList: () => repoListService.load(),
     applyRepoCloneMutation: (body) => repoCloneMutationService.apply(body),
     applyRepoCreateMutation: (body) => repoCreateMutationService.apply(body),
+    applyRepoInitializeMutation: (repoId) =>
+      repoInitializeMutationService.apply(repoId),
     loadCredentialStatus: () => credentialStatusService.load(),
     loadNotifications: (url) => notificationListService.load(url),
     applyNotificationReadMutation: (notificationId) =>
@@ -1022,6 +1026,41 @@ export function createDaemonHttpHandler(
           error instanceof Error ? error.message : "unknown",
         );
         writeJson(response, 500, { error: "repo_list_failed" });
+      }
+      return;
+    }
+
+    const repoInitializeId = matchRepoLeafPath(url.pathname, "initialize");
+    if (repoInitializeId) {
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "repository-initialize",
+        { label: "Project" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          await dependencies.applyRepoInitializeMutation(repoInitializeId),
+        );
+      } catch (error) {
+        writeJson(response, 400, {
+          error:
+            error instanceof Error
+              ? error.message
+              : "Could not initialize the project",
+        });
       }
       return;
     }
@@ -2947,7 +2986,10 @@ function matchAgentRunPath(pathname: string) {
   return decodePathSegment(/^\/agents\/([^/]+)$/.exec(pathname)?.[1]);
 }
 
-function matchRepoLeafPath(pathname: string, leaf: "profile" | "templates" | "pulls") {
+function matchRepoLeafPath(
+  pathname: string,
+  leaf: "initialize" | "profile" | "templates" | "pulls",
+) {
   const match = /^\/repos\/([^/]+)\/([^/]+)$/.exec(pathname);
   if (!match || match[2] !== leaf) return;
   return decodePathSegment(match[1]);

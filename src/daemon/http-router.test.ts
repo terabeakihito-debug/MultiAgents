@@ -132,6 +132,9 @@ function dependencies(
       repo: { id: "repo-1", name: "new-proj" },
       needsInitialCommit: true,
     })) as never,
+    applyRepoInitializeMutation: vi.fn(async () => ({
+      repo: { id: "repo-1", name: "my-proj" },
+    })) as never,
     loadCredentialStatus: vi.fn(() => ({
       credentials: [{ capability: "github", status: "ready" }],
     })) as never,
@@ -1320,6 +1323,49 @@ describe("daemon HTTP router", () => {
     expect(applyRepoCloneMutation).toHaveBeenCalledWith({
       githubUrl: "https://github.com/o/r",
     });
+  });
+
+  it("rejects repo initialize POST without the human mutation gate", async () => {
+    const applyRepoInitializeMutation = vi.fn(async () => ({
+      repo: { id: "repo-1" },
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyRepoInitializeMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest("/repos/repo-1/initialize", {}, "{}"),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyRepoInitializeMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts repo initialize POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } =
+      await issuedHumanMutationNonce("repository-initialize");
+    const payload = { repo: { id: "repo-1", name: "my-proj" } };
+    const applyRepoInitializeMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyRepoInitializeMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/repos/repo-1/initialize",
+        authorizedHumanHeaders(nonce, cookie, "repository-initialize"),
+        "{}",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyRepoInitializeMutation).toHaveBeenCalledWith("repo-1");
   });
 
   it("does not expose repository listing on unsupported methods", async () => {
