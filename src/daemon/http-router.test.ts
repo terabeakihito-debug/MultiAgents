@@ -128,6 +128,10 @@ function dependencies(
     applyRepoCloneMutation: vi.fn(async () => ({
       repo: { id: "repo-1", name: "proj" },
     })) as never,
+    applyRepoCreateMutation: vi.fn(async () => ({
+      repo: { id: "repo-1", name: "new-proj" },
+      needsInitialCommit: true,
+    })) as never,
     loadCredentialStatus: vi.fn(() => ({
       credentials: [{ capability: "github", status: "ready" }],
     })) as never,
@@ -1215,6 +1219,59 @@ describe("daemon HTTP router", () => {
 
     expect(output.status()).toBe(500);
     expect(output.json()).toEqual({ error: "repo_list_failed" });
+  });
+
+  it("rejects repo create POST without the human mutation gate", async () => {
+    const applyRepoCreateMutation = vi.fn(async () => ({
+      repo: { id: "repo-1" },
+      needsInitialCommit: true,
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyRepoCreateMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/repos/create",
+        {},
+        '{"projectName":"my-proj"}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyRepoCreateMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts repo create POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce("repository-create");
+    const payload = {
+      repo: { id: "repo-1", name: "my-proj" },
+      needsInitialCommit: true,
+    };
+    const applyRepoCreateMutation = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyRepoCreateMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/repos/create",
+        authorizedHumanHeaders(nonce, cookie, "repository-create"),
+        '{"projectName":"my-proj","createReadme":true}',
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(201);
+    expect(output.json()).toEqual(payload);
+    expect(applyRepoCreateMutation).toHaveBeenCalledWith({
+      projectName: "my-proj",
+      createReadme: true,
+    });
   });
 
   it("rejects repo clone POST without the human mutation gate", async () => {
