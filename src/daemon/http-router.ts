@@ -182,6 +182,7 @@ import {
   DependencyRecoveryUnavailableError,
   taskDependencyRecoveryInstructionsMutationService,
 } from "../core/task-dependency-recovery-instructions-mutation-service";
+import { taskDependencyRecoveryCheckMutationService } from "../core/task-dependency-recovery-check-mutation-service";
 import {
   TaskReassociateInputError,
   taskReassociateMutationService,
@@ -300,6 +301,7 @@ type DaemonHttpDependencies = {
   applyTaskReassociatePreviewMutation: typeof taskReassociatePreviewMutationService.apply;
   applyTaskReassociateMutation: typeof taskReassociateMutationService.apply;
   applyTaskDependencyRecoveryInstructionsMutation: typeof taskDependencyRecoveryInstructionsMutationService.apply;
+  applyTaskDependencyRecoveryCheckMutation: typeof taskDependencyRecoveryCheckMutationService.apply;
   applyTaskRecoverPrMutation: typeof taskRecoverPrMutationService.apply;
   loadOutboundSlackSettings: typeof outboundSlackSettingsService.load;
   applyOutboundSlackSettingsMutation: typeof outboundSlackSettingsMutationService.apply;
@@ -424,6 +426,8 @@ export function createDaemonHttpHandler(
       taskReassociateMutationService.apply(taskId, body),
     applyTaskDependencyRecoveryInstructionsMutation: (taskId) =>
       taskDependencyRecoveryInstructionsMutationService.apply(taskId),
+    applyTaskDependencyRecoveryCheckMutation: (taskId) =>
+      taskDependencyRecoveryCheckMutationService.apply(taskId),
     applyTaskRecoverPrMutation: (body) =>
       taskRecoverPrMutationService.apply(body),
     loadOutboundSlackSettings: () => outboundSlackSettingsService.load(),
@@ -2565,6 +2569,49 @@ export function createDaemonHttpHandler(
       return;
     }
 
+    const taskDependencyRecoveryCheckId =
+      matchTaskDependencyRecoveryCheckPath(url.pathname);
+    if (taskDependencyRecoveryCheckId) {
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "task-dependency-recovery-check",
+        { label: "Dependency readiness check" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      try {
+        writeJson(
+          response,
+          200,
+          await dependencies.applyTaskDependencyRecoveryCheckMutation(
+            taskDependencyRecoveryCheckId,
+          ),
+        );
+      } catch (error) {
+        if (error instanceof DependencyRecoveryTaskNotFoundError) {
+          writeJson(response, 404, { error: "Task not found" });
+          return;
+        }
+        if (error instanceof DependencyRecoveryUnavailableError) {
+          writeJson(response, 409, {
+            error: "Dependency readiness check is unavailable for this task",
+          });
+          return;
+        }
+        throw error;
+      }
+      return;
+    }
+
     const taskReassociatePreviewId = matchTaskReassociatePreviewPath(url.pathname);
     if (taskReassociatePreviewId) {
       if (request.method !== "POST") {
@@ -3219,6 +3266,11 @@ function matchTaskReassociatePath(pathname: string) {
 function matchTaskDependencyRecoveryInstructionsPath(pathname: string) {
   const match =
     /^\/tasks\/([^/]+)\/dependency-recovery-instructions$/.exec(pathname);
+  return decodePathSegment(match?.[1]);
+}
+
+function matchTaskDependencyRecoveryCheckPath(pathname: string) {
+  const match = /^\/tasks\/([^/]+)\/dependency-recovery-check$/.exec(pathname);
   return decodePathSegment(match?.[1]);
 }
 
