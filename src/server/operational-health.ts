@@ -43,7 +43,10 @@ export async function operationsOverview(options: { forceProviders?: boolean; no
     bubblewrapVersion(),
     providerDiagnostics({ force: options.forceProviders }),
     diskUsage(options.worktreeRoot),
-    inspectWorktrees(options.worktreeRoot),
+    // The dashboard must stay responsive even when old task records contain
+    // many worktrees. Detailed Git/size inspection remains available to the
+    // readiness checks; the overview uses a bounded metadata scan.
+    inspectWorktrees(options.worktreeRoot, "summary"),
   ]);
   const backups = store.loadBackups();
   const latest = latestVerifiedBackup(store, now);
@@ -184,20 +187,20 @@ export async function assertWorktreeDiskCapacity(options: { root?: string; freeB
   return freeBytes;
 }
 
-export async function inspectWorktrees(root = WORKTREE_ROOT): Promise<WorktreeUsage[]> {
+export async function inspectWorktrees(root = WORKTREE_ROOT, mode: "full" | "summary" = "full"): Promise<WorktreeUsage[]> {
   const tasks = listTasks();
-  const entries = await inspectTaskWorktrees(tasks);
-  const registeredPaths = await registeredWorktreePaths(tasks);
+  const entries = await inspectTaskWorktrees(tasks, mode);
+  const registeredPaths = mode === "summary" ? new Set(tasks.map((task) => task.worktreePath)) : await registeredWorktreePaths(tasks);
   for (const path of await filesystemWorktreeDirectories(root)) {
     if (tasks.some((task) => task.worktreePath === path)) continue;
     const rel = relative(root, path).split(sep);
-    entries.push({ repoId: rel[0] || "unknown", ageHours: 0, sizeBytes: await directorySize(path), inventoryStatus: registeredPaths.has(path) ? "unregistered_git_worktree" : "orphaned_filesystem", cleanupCandidate: false });
+    entries.push({ repoId: rel[0] || "unknown", ageHours: 0, sizeBytes: mode === "summary" ? 0 : await directorySize(path), inventoryStatus: registeredPaths.has(path) ? "unregistered_git_worktree" : "orphaned_filesystem", cleanupCandidate: false });
   }
   return entries;
 }
 
-export async function inspectTaskWorktrees(tasks = listTasks()): Promise<WorktreeUsage[]> {
-  const registeredPaths = await registeredWorktreePaths(tasks);
+export async function inspectTaskWorktrees(tasks = listTasks(), mode: "full" | "summary" = "full"): Promise<WorktreeUsage[]> {
+  const registeredPaths = mode === "summary" ? new Set(tasks.map((task) => task.worktreePath)) : await registeredWorktreePaths(tasks);
   const entries: WorktreeUsage[] = [];
   for (const task of tasks.filter((item) => item.worktreeStatus !== "not_required" && item.worktreeStatus !== "removed")) {
     let info;
@@ -206,14 +209,14 @@ export async function inspectTaskWorktrees(tasks = listTasks()): Promise<Worktre
       entries.push({ taskId: task.id, repoId: task.repoId, ageHours: ageHours(task.updatedAt), sizeBytes: 0, taskStatus: task.status, prState: task.prReview?.state, inventoryStatus: "missing_filesystem", cleanupCandidate: false });
       continue;
     }
-    const sizeBytes = info.isDirectory() && !info.isSymbolicLink() ? await directorySize(task.worktreePath) : 0;
+    const sizeBytes = mode === "summary" ? 0 : info.isDirectory() && !info.isSymbolicLink() ? await directorySize(task.worktreePath) : 0;
     let dirty: boolean | undefined;
-    try { dirty = Boolean(await runGit(task.worktreePath, ["status", "--porcelain"])); } catch { dirty = undefined; }
+    if (mode === "full") try { dirty = Boolean(await runGit(task.worktreePath, ["status", "--porcelain"])); } catch { dirty = undefined; }
     const registered = registeredPaths.has(task.worktreePath);
     entries.push({
       taskId: task.id, repoId: task.repoId, ageHours: ageHours(task.updatedAt), sizeBytes, taskStatus: task.status,
       dirty, prState: task.prReview?.state, inventoryStatus: registered ? "registered" : "orphaned_filesystem",
-      cleanupCandidate: registered && dirty === false && (task.status === "archived" || task.prReview?.state === "CLOSED" || task.prReview?.merged === true),
+      cleanupCandidate: mode === "full" && registered && dirty === false && (task.status === "archived" || task.prReview?.state === "CLOSED" || task.prReview?.merged === true),
     });
   }
   return entries;

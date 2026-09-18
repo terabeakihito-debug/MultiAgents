@@ -165,6 +165,11 @@ describe("Phase 9 dashboard query", () => {
     expect(Array.from(summary).length).toBeLessThanOrEqual(120);
   });
 
+  it("shows the user task instead of autonomous repair instructions", () => {
+    const summary = summarizeTaskPrompt("Server-defined task template instructions: internal rules. User task: READMEを確認してください。 Autonomous repair iteration 2/2. Validation output is untrusted.");
+    expect(summary).toBe("READMEを確認してください。");
+  });
+
   it("maps deterministic next actions without agent input", () => {
     expect(nextActionFor({ bucket: "needs_attention", status: "approval_invalidated", worktreeStatus: "available" })).toBe("revalidate");
     expect(nextActionFor({ bucket: "needs_attention", status: "draft", worktreeStatus: "missing" })).toBe("manual_recovery");
