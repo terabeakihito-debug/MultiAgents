@@ -195,6 +195,7 @@ export default function Home() {
         const data = await response.json() as { task?: RepoTask; error?: string };
         if (!response.ok || !data.task) throw new Error(data.error || "タスクの開始に失敗しました。");
         setTask(data.task); setMode(data.task.template.executionMode === "parallel" ? "parallel" : "review"); await loadTaskHistory(data.task.id); setDashboardRefresh((value) => value + 1);
+        await runFlow(data.task, form.prompt);
       },
     });
   }
@@ -296,14 +297,14 @@ export default function Home() {
     }
   }
 
-  async function runFlow() {
+  async function runFlow(activeTask: RepoTask | null = task, activePrompt = prompt) {
     setFlowStatus("running");
     setSteps(initialSteps());
     setFinalOutput("");
     const abortController = new AbortController();
     flowAbortRef.current = abortController;
     try {
-      const response = await humanMutationFetch("/api/flows/review/stream", "review-run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt, taskId: task?.id }), signal: abortController.signal });
+      const response = await humanMutationFetch("/api/flows/review/stream", "review-run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt: activePrompt, taskId: activeTask?.id }), signal: abortController.signal });
       if (!response.ok) {
         const data = await response.json() as { error?: string };
         throw new Error(data.error || `リクエストに失敗しました（${response.status}）。`);
@@ -317,7 +318,7 @@ export default function Home() {
         for (const flowEvent of parser.push(decoder.decode(value, { stream: !done }))) applyFlowEvent(flowEvent as FlowEvent);
         if (done) break;
       }
-      if (task) await refreshDiff(task);
+      if (activeTask) await refreshDiff(activeTask);
     } catch (error) {
       const aborted = abortController.signal.aborted;
       setFlowStatus(aborted ? "aborted" : "error");
