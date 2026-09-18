@@ -286,6 +286,11 @@ function dependencies(
     applyTaskDependencyRecoveryInstructionsMutation: vi.fn(async () => ({
       steps: ["npm install"],
     })) as never,
+    applyTaskDependencyRecoveryCheckMutation: vi.fn(async () => ({
+      status: "ready",
+      message: "ready",
+      checkedAt: "2026-09-18T00:00:00.000Z",
+    })) as never,
     applyRetentionPolicyMutation: vi.fn(() => ({ preset: "balanced" })) as never,
     applyCleanupPreviewMutation: vi.fn(async () => ({
       selected: [],
@@ -3528,6 +3533,68 @@ describe("daemon HTTP router", () => {
     expect(output.status()).toBe(200);
     expect(output.json()).toEqual(payload);
     expect(applyTaskDependencyRecoveryInstructionsMutation).toHaveBeenCalledWith(
+      "task-1",
+    );
+  });
+
+  it("rejects dependency recovery check POST without the human mutation gate", async () => {
+    const applyTaskDependencyRecoveryCheckMutation = vi.fn(async () => ({
+      status: "ready",
+      message: "ready",
+      checkedAt: "2026-09-18T00:00:00.000Z",
+    })) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskDependencyRecoveryCheckMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/dependency-recovery-check",
+        {},
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyTaskDependencyRecoveryCheckMutation).not.toHaveBeenCalled();
+  });
+
+  it("accepts dependency recovery check POST after a daemon human-session nonce", async () => {
+    clearHumanMutationSessionsForTests();
+    const { nonce, cookie } = await issuedHumanMutationNonce(
+      "task-dependency-recovery-check",
+    );
+    const payload = {
+      status: "ready",
+      message: "ready",
+      checkedAt: "2026-09-18T00:00:00.000Z",
+    };
+    const applyTaskDependencyRecoveryCheckMutation = vi.fn(
+      async () => payload,
+    ) as never;
+    const handler = createDaemonHttpHandler(
+      dependencies({ applyTaskDependencyRecoveryCheckMutation }),
+    );
+    const output = response();
+
+    await handler(
+      postJsonRequest(
+        "/tasks/task-1/dependency-recovery-check",
+        authorizedHumanHeaders(
+          nonce,
+          cookie,
+          "task-dependency-recovery-check",
+        ),
+        "",
+      ),
+      output.value,
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(applyTaskDependencyRecoveryCheckMutation).toHaveBeenCalledWith(
       "task-1",
     );
   });
