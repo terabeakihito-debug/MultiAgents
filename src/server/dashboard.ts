@@ -71,13 +71,24 @@ export async function getDashboard(query: DashboardQuery, now = new Date()): Pro
 }
 
 export function summarizeTaskPrompt(prompt: string): string {
-  const collapsed = redactKnownSecrets(prompt).replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim();
+  const displayPrompt = extractUserTaskPrompt(prompt);
+  const collapsed = redactKnownSecrets(displayPrompt).replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim();
   const redacted = collapsed
     .replace(/\b(password|passwd|secret|token|credential|api[_ -]?key)\s*[:=]\s*\S+/gi, "$1: [redacted]")
     .replace(/\b(?:gh[opusr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,})\b/g, "[redacted]");
   if (!redacted) return "No task summary available";
   const characters = Array.from(redacted);
   return characters.length <= 120 ? redacted : `${characters.slice(0, 119).join("")}…`;
+}
+
+function extractUserTaskPrompt(prompt: string) {
+  if (!/Server-defined task template instructions:|Autonomous repair iteration/i.test(prompt)) return prompt;
+  const parts = prompt.split(/User task:\s*/i).slice(1);
+  for (let index = parts.length - 1; index >= 0; index -= 1) {
+    const candidate = parts[index].split(/\s+Autonomous repair iteration\b/i)[0].trim();
+    if (candidate && !candidate.startsWith("Server-defined task template instructions:")) return candidate;
+  }
+  return prompt.replace(/^Server-defined task template instructions:\s*/i, "").split(/\s+Autonomous repair iteration\b/i)[0].trim() || prompt;
 }
 
 export function nextActionFor(row: Pick<DashboardRow, "bucket" | "status" | "worktreeStatus" | "prNumber">): NextAction {

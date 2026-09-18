@@ -3,7 +3,7 @@ type StatusBadgeProps = {
 };
 
 const labels: Record<StatusBadgeProps["status"], string> = {
-  ready: "READY", ok: "OK", warning: "WARNING", attention: "ATTENTION", critical: "CRITICAL", enforced: "ENFORCED",
+  ready: "準備完了", ok: "正常", warning: "警告", attention: "要確認", critical: "重大", enforced: "適用中",
 };
 
 /** A single, text-labelled status treatment for operational state. */

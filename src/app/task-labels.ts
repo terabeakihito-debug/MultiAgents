@@ -1,5 +1,14 @@
 import type { TaskBucket } from "../dashboard/types";
 
+const templateLabels: Record<string, string> = {
+  "Bug Fix": "不具合修正", Documentation: "ドキュメント", Feature: "機能追加",
+  Investigation: "調査", Refactor: "リファクタリング", "Security Review": "セキュリティレビュー",
+};
+
+export function templateNameLabel(name: string) {
+  return templateLabels[name] ?? name;
+}
+
 export const taskBucketLabels: Record<TaskBucket, string> = {
   active: "進行中",
   needs_attention: "対応が必要",
@@ -18,6 +27,7 @@ export const taskStatusLabels = {
   ready_for_human_merge: "人によるマージ確認待ち", review_fetch_failed: "レビュー結果の取得に失敗",
   rework_failed: "修正作業で停止", ci_failed: "CIで停止", ci_pending: "CI実行中",
   validation_failed: "安全チェックで停止", secret_scan_failed: "機密情報の可能性を検出",
+  idle: "待機中", running: "実行中", completed: "完了", error: "エラー", skipped: "スキップ", stale: "再確認が必要", preparing: "準備中",
   approval_invalidated: "変更されたため再確認が必要", commit_failed: "変更の保存に失敗",
   push_failed: "GitHubへの送信に失敗", pr_failed: "PR作成に失敗", archived: "アーカイブ済み",
 } as const;
@@ -45,7 +55,7 @@ export function taskStatusLabel(status: string) {
 }
 
 export function historyEventStatusLabel(status: string | undefined) {
-  return status ? taskStatusLabel(status) : "";
+  return status ? taskStatusLabels[status as keyof typeof taskStatusLabels] ?? "記録済み" : "";
 }
 
 const validationStatusLabels: Record<string, string> = { pass: "成功", fail: "失敗", skip: "スキップ" };
