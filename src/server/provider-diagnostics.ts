@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import { access, lstat, mkdtemp, open, readdir, readFile, realpath, rm, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { dirname, isAbsolute, join, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createHash } from "node:crypto";
 import type { AgentId } from "../agents/types";
 import type { ProviderCredentialStatus, ProviderDiagnostic } from "../health/types";
@@ -118,12 +118,23 @@ function base(provider: AgentId, status: ProviderDiagnostic["status"]): Provider
 async function executeInSandbox(provider: AgentId, args: string[], cwd: string, capture?: ProviderIdentityCapture) {
   const binary = provider === "claude" ? join(homedir(), ".local", "bin", "claude") : providerCompatibilityDefinitions[provider].binary;
   const immutable = capture ? await prepareProviderImmutableBinding(provider, capture) : undefined;
+  let sandboxCwd: Awaited<ReturnType<typeof prepareProviderDiagnosticCwd>> | undefined;
   try {
-    const command = buildSandboxCommand({ profile: "agent_read_only", provider, cwd, command: { binary, args }, pseudoTty: provider === "cursor", codexRuntime: immutable?.codexRuntime, cursorRuntime: immutable?.cursorRuntime, claudeRuntime: immutable?.claudeRuntime });
+    sandboxCwd = await prepareProviderDiagnosticCwd(cwd);
+    const command = buildSandboxCommand({ profile: "agent_read_only", provider, cwd: sandboxCwd.path, command: { binary, args }, pseudoTty: provider === "cursor", codexRuntime: immutable?.codexRuntime, cursorRuntime: immutable?.cursorRuntime, claudeRuntime: immutable?.claudeRuntime });
     const result = await runHardenedProcess({ binary: command.binary, args: command.args, cwd: command.cwd, env: command.env, purpose: "validation", timeoutMs: 8_000 });
     if (result.timedOut) throw new ProviderDiagnosticTimeoutError();
     return result;
-  } finally { await immutable?.cleanup(); }
+  } finally { await immutable?.cleanup(); await sandboxCwd?.cleanup(); }
+}
+
+async function prepareProviderDiagnosticCwd(cwd: string) {
+  const normalized = resolve(cwd);
+  const usable = normalized !== "/" && normalized !== "/home" && normalized !== homedir() && normalized !== "/tmp" && !/^\/mnt\/[a-z](?:\/|$)/i.test(normalized) && await stat(normalized).then((info) => info.isDirectory(), () => false);
+  if (usable) return { path: normalized, cleanup: async () => undefined };
+  if (normalized !== resolve(process.cwd())) throw new Error("Provider diagnostic cwd is invalid");
+  const path = await mkdtemp(join(tmpdir(), "multiagents-provider-cwd-"));
+  return { path, cleanup: () => rm(path, { recursive: true, force: true }) };
 }
 async function providerExecutableIdentity(provider: AgentId): Promise<string | undefined> {
   const identity = await pathIdentity(providerBinaryPath(provider), true);
