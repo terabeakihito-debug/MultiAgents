@@ -139,6 +139,19 @@ function dependencies(
     loadCredentialStatus: vi.fn(() => ({
       credentials: [{ capability: "github", status: "ready" }],
     })) as never,
+    loadGitHubAccount: vi.fn(async () => ({
+      connected: true,
+      login: "demo",
+      hostname: "github.com",
+      detail: "ok",
+    })) as never,
+    loadGitHubRemoteRepositories: vi.fn(async () => ({
+      account: { connected: true, login: "demo", hostname: "github.com", detail: "ok" },
+      repositories: [{ nameWithOwner: "demo/repo", url: "https://github.com/demo/repo", isPrivate: false, isFork: false, description: "", managedLocally: false }],
+    })) as never,
+    applyGitHubConnectMutation: vi.fn(async () => ({
+      account: { connected: true, login: "demo", hostname: "github.com", detail: "ok" },
+    })) as never,
     loadNotifications: vi.fn(() => ({
       notifications: [{ id: "n-1" }],
       unreadCount: 1,
@@ -1255,6 +1268,56 @@ describe("daemon HTTP router", () => {
       error: "This API is available only on localhost",
     });
     expect(loadProfileList).not.toHaveBeenCalled();
+  });
+
+  it("serves GitHub account status through the core github-account boundary", async () => {
+    const payload = {
+      connected: true,
+      login: "demo",
+      hostname: "github.com",
+      detail: "ok",
+    };
+    const loadGitHubAccount = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(dependencies({ loadGitHubAccount }));
+    const output = response();
+
+    await handler(request("GET", "/github/account"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(loadGitHubAccount).toHaveBeenCalledTimes(1);
+  });
+
+  it("serves GitHub remote repositories through the core read boundary", async () => {
+    const payload = {
+      account: { connected: true, login: "demo", hostname: "github.com", detail: "ok" },
+      repositories: [],
+    };
+    const loadGitHubRemoteRepositories = vi.fn(async () => payload) as never;
+    const handler = createDaemonHttpHandler(dependencies({ loadGitHubRemoteRepositories }));
+    const output = response();
+
+    await handler(request("GET", "/github/repositories"), output.value);
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual(payload);
+    expect(loadGitHubRemoteRepositories).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects GitHub connect POST without the human mutation gate", async () => {
+    const applyGitHubConnectMutation = vi.fn(async () => ({
+      account: { connected: true, login: "demo", hostname: "github.com", detail: "ok" },
+    })) as never;
+    const handler = createDaemonHttpHandler(dependencies({ applyGitHubConnectMutation }));
+    const output = response();
+
+    await handler(
+      postJsonRequest("/github/connect", {}, '{"token":"ghp_test"}'),
+      output.value,
+    );
+
+    expect(output.status()).toBe(403);
+    expect(applyGitHubConnectMutation).not.toHaveBeenCalled();
   });
 
   it("serves the repository catalog through the core repo-list boundary", async () => {
