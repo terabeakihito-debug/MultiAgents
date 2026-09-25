@@ -5,6 +5,7 @@ import { installNextCloseAudit } from "./src/server/next-close-audit.mjs";
 import { createDaemonApiBridge } from "./src/server/daemon-api-bridge.mjs";
 import { createNextStaticUiBridge } from "./src/server/next-static-ui-bridge.mjs";
 import {
+  assertProductionStaticUiBuild,
   runOperationalStartupFromLauncher,
   shouldPrepareNextApp,
 } from "./src/server/operational-startup-launcher.mjs";
@@ -126,7 +127,8 @@ async function main() {
   installStartupBridge();
   const staticUiBridge = createNextStaticUiBridge({ development: dev });
   const staticUiActive = dev ? false : await staticUiBridge.isActive();
-  const prepareNext = shouldPrepareNextApp({ development: dev, staticUiActive });
+  assertProductionStaticUiBuild({ development: dev, staticUiActive });
+  const prepareNext = shouldPrepareNextApp({ development: dev });
   let handle;
 
   console.info("startup_phase", JSON.stringify({ phase: "operational_init" }));

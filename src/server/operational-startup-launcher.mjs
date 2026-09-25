@@ -7,8 +7,17 @@ const operationalStartupPath = join(
   "../../dist-daemon/server/operational-startup.js",
 );
 
-export function shouldPrepareNextApp({ development, staticUiActive }) {
-  return development || !staticUiActive;
+export const PRODUCTION_STATIC_UI_BUILD_REQUIRED_MESSAGE =
+  "Production startup requires a Next static UI build. Run `npm run build` before `npm start`.";
+
+export function shouldPrepareNextApp({ development }) {
+  return development;
+}
+
+export function assertProductionStaticUiBuild({ development, staticUiActive }) {
+  if (!development && !staticUiActive) {
+    throw new Error(PRODUCTION_STATIC_UI_BUILD_REQUIRED_MESSAGE);
+  }
 }
 
 /**
