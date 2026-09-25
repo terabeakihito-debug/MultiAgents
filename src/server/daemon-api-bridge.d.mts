@@ -1,7 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 export function stripApiPrefixFromRequestUrl(request: IncomingMessage): boolean;
-export function isDaemonApiBridgeEnabled(): boolean;
 
 type DaemonApiBridgeOptions = {
   loadHandler?: () => Promise<
@@ -12,7 +11,6 @@ type DaemonApiBridgeOptions = {
 export function createDaemonApiBridge(
   options?: DaemonApiBridgeOptions,
 ): {
-  isEnabled(): boolean;
   tryHandle(
     request: IncomingMessage,
     response: ServerResponse,

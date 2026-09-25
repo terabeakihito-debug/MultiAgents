@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createRepoPullsService, RepoPullsRequestError } from "./repo-pulls-service";
+import { createRepoPullsService } from "./repo-pulls-service";
 
 describe("repo pulls service", () => {
   it("returns open pull requests for the repository", async () => {
