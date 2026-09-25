@@ -10,10 +10,6 @@ export function shouldPrepareNextApp(options: {
   staticUiActive: boolean;
 }): boolean;
 
-export function shouldUseInstrumentationOperationalStartup(options: {
-  development: boolean;
-}): boolean;
-
 export function runOperationalStartupFromLauncher(
   startupBridge?: StartupBridge,
 ): Promise<void>;

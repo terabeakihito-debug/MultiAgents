@@ -1,15 +1,16 @@
 export async function register() {
   if (process.env.NEXT_RUNTIME !== "nodejs") return;
-  // `app.prepare()` starts this hook asynchronously in a custom Next server.
-  // The launcher publishes this small process-local handoff before prepare and
-  // waits for this exact promise before opening HTTP.  Do not create a second
-  // lifecycle initializer here: initializeOperationalStartup is join-only.
+  // Custom launcher runs operational startup before prepare.  Instrumentation
+  // remains for stock Next entrypoints and is a no-op once the launcher reports
+  // readiness.
   const bridge = (globalThis as typeof globalThis & Record<symbol, {
     cancelled?: boolean;
+    operationalReady?: boolean;
     ready?: () => void;
     failed?: (error: unknown) => void;
     setAbort?: (abort: () => Promise<void>) => void;
   } | undefined>)[Symbol.for("multiagents.launcher-startup.v1")];
+  if (bridge?.operationalReady) return;
   if (bridge?.cancelled) throw new Error("Launcher cancelled before operational startup");
   const { abortOperationalStartup, initializeOperationalStartup } = await import("./server/operational-startup");
   bridge?.setAbort?.(abortOperationalStartup);

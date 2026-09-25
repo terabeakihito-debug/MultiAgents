@@ -11,10 +11,6 @@ export function shouldPrepareNextApp({ development, staticUiActive }) {
   return development || !staticUiActive;
 }
 
-export function shouldUseInstrumentationOperationalStartup({ development }) {
-  return development;
-}
-
 /**
  * @param {import("./operational-startup-launcher.mjs").StartupBridge | undefined} startupBridge
  */

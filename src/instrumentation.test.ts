@@ -28,6 +28,24 @@ describe("custom launcher instrumentation handoff", () => {
     expect(ready).toHaveBeenCalledOnce();
   });
 
+  it("skips startup when the custom launcher already completed operational init", async () => {
+    const initializeOperationalStartup = vi.fn();
+    (globalThis as Record<symbol, unknown>)[bridgeKey] = {
+      operationalReady: true,
+      ready: vi.fn(),
+      failed: vi.fn(),
+      setAbort: vi.fn(),
+    };
+    vi.doMock("./server/operational-startup", () => ({
+      initializeOperationalStartup,
+      abortOperationalStartup: vi.fn(),
+    }));
+    process.env.NEXT_RUNTIME = "nodejs";
+    const instrumentation = await import("./instrumentation");
+    await expect(instrumentation.register()).resolves.toBeUndefined();
+    expect(initializeOperationalStartup).not.toHaveBeenCalled();
+  });
+
   it("reports a fatal initializer failure to the launcher without leaving Next work running", async () => {
     const failed = vi.fn();
     (globalThis as Record<symbol, unknown>)[bridgeKey] = { ready: vi.fn(), failed, setAbort: vi.fn() };

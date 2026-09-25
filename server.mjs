@@ -7,7 +7,6 @@ import { createNextStaticUiBridge } from "./src/server/next-static-ui-bridge.mjs
 import {
   runOperationalStartupFromLauncher,
   shouldPrepareNextApp,
-  shouldUseInstrumentationOperationalStartup,
 } from "./src/server/operational-startup-launcher.mjs";
 
 const dev = process.argv.includes("--dev");
@@ -33,36 +32,23 @@ const runtime = {
   closeHttp: closeHttpWithDeadline,
   closeNext: closeNextWithDeadline,
 };
-// Must exist before app.prepare(): instrumentation acquires ownership there.
 globalThis[shutdownRuntimeKey] = runtime;
 
 function installStartupBridge() {
   let ready, failed;
   const promise = new Promise((resolve, reject) => { ready = resolve; failed = reject; });
-  // Instrumentation uses this retained object to report the one authoritative
-  // operational startup promise it owns.  It is deliberately installed before
-  // Next loads any server modules.
   startupBridge = {
     cancelled: false,
-    ready: () => ready(),
+    operationalReady: false,
+    ready: () => {
+      startupBridge.operationalReady = true;
+      ready();
+    },
     failed: (error) => failed(error),
     setAbort: (abort) => { startupBridge.abort = abort; },
     promise,
   };
   globalThis[startupBridgeKey] = startupBridge;
-}
-
-async function awaitOperationalStartup() {
-  const timeout = new Promise((_, reject) => {
-    const timer = setTimeout(() => reject(new Error(`startup timeout after ${STARTUP_TIMEOUT_MS}ms waiting for operational initialization`)), STARTUP_TIMEOUT_MS);
-    timer.unref();
-  });
-  try { await Promise.race([startupBridge.promise, timeout]); }
-  catch (error) {
-    startupBridge.cancelled = true;
-    await startupBridge.abort?.();
-    throw error;
-  }
 }
 
 function startHttpClose() {
@@ -143,26 +129,16 @@ async function main() {
   const prepareNext = shouldPrepareNextApp({ development: dev, staticUiActive });
   let handle;
 
-  if (shouldUseInstrumentationOperationalStartup({ development: dev })) {
+  console.info("startup_phase", JSON.stringify({ phase: "operational_init" }));
+  await awaitDirectOperationalStartup();
+
+  if (prepareNext) {
     console.info("startup_phase", JSON.stringify({ phase: "next_prepare" }));
     app = next({ dev, hostname, port, httpServer: undefined });
     await app.prepare();
     runtime.resources.nextPrepared = true;
     installNextCleanupAudit();
-    console.info("startup_phase", JSON.stringify({ phase: "operational_init" }));
-    await awaitOperationalStartup();
     handle = app.getRequestHandler();
-  } else {
-    console.info("startup_phase", JSON.stringify({ phase: "operational_init" }));
-    await awaitDirectOperationalStartup();
-    if (prepareNext) {
-      console.info("startup_phase", JSON.stringify({ phase: "next_prepare" }));
-      app = next({ dev, hostname, port, httpServer: undefined });
-      await app.prepare();
-      runtime.resources.nextPrepared = true;
-      installNextCleanupAudit();
-      handle = app.getRequestHandler();
-    }
   }
 
   const daemonApiBridge = createDaemonApiBridge();
