@@ -4,6 +4,11 @@ import next from "next";
 import { installNextCloseAudit } from "./src/server/next-close-audit.mjs";
 import { createDaemonApiBridge } from "./src/server/daemon-api-bridge.mjs";
 import { createNextStaticUiBridge } from "./src/server/next-static-ui-bridge.mjs";
+import {
+  runOperationalStartupFromLauncher,
+  shouldPrepareNextApp,
+  shouldUseInstrumentationOperationalStartup,
+} from "./src/server/operational-startup-launcher.mjs";
 
 const dev = process.argv.includes("--dev");
 const port = Number.parseInt(process.env.PORT || "3000", 10);
@@ -85,13 +90,14 @@ async function closeHttpWithDeadline(remainingMs) {
 }
 
 async function closeNextWithDeadline(remainingMs) {
+  if (!app) return;
   const deadline = Date.now() + remainingMs;
   const frameworkClosed = await Promise.race([
     app.close().then(() => true),
     new Promise((resolve) => { const timer = setTimeout(() => resolve(false), Math.max(0, deadline - Date.now())); timer.unref(); }),
   ]);
   if (!frameworkClosed) throw new Error("http_framework_close_timed_out");
-  nextCleanupAudit.assertSucceeded();
+  nextCleanupAudit?.assertSucceeded();
 }
 
 function installNextCleanupAudit() {
@@ -116,19 +122,50 @@ async function signalShutdown(signal) {
   process.exit(process.exitCode);
 }
 
+async function awaitDirectOperationalStartup() {
+  const timeout = new Promise((_, reject) => {
+    const timer = setTimeout(() => reject(new Error(`startup timeout after ${STARTUP_TIMEOUT_MS}ms waiting for operational initialization`)), STARTUP_TIMEOUT_MS);
+    timer.unref();
+  });
+  try {
+    await Promise.race([runOperationalStartupFromLauncher(startupBridge), timeout]);
+  } catch (error) {
+    startupBridge.cancelled = true;
+    await startupBridge.abort?.();
+    throw error;
+  }
+}
+
 async function main() {
   installStartupBridge();
-  console.info("startup_phase", JSON.stringify({ phase: "next_prepare" }));
-  app = next({ dev, hostname, port, httpServer: undefined });
-  await app.prepare();
-  runtime.resources.nextPrepared = true;
-  installNextCleanupAudit();
-  console.info("startup_phase", JSON.stringify({ phase: "operational_init" }));
-  await awaitOperationalStartup();
-  const handle = app.getRequestHandler();
-  const daemonApiBridge = createDaemonApiBridge();
   const staticUiBridge = createNextStaticUiBridge({ development: dev });
-  const staticUiActive = await staticUiBridge.isActive();
+  const staticUiActive = dev ? false : await staticUiBridge.isActive();
+  const prepareNext = shouldPrepareNextApp({ development: dev, staticUiActive });
+  let handle;
+
+  if (shouldUseInstrumentationOperationalStartup({ development: dev })) {
+    console.info("startup_phase", JSON.stringify({ phase: "next_prepare" }));
+    app = next({ dev, hostname, port, httpServer: undefined });
+    await app.prepare();
+    runtime.resources.nextPrepared = true;
+    installNextCleanupAudit();
+    console.info("startup_phase", JSON.stringify({ phase: "operational_init" }));
+    await awaitOperationalStartup();
+    handle = app.getRequestHandler();
+  } else {
+    console.info("startup_phase", JSON.stringify({ phase: "operational_init" }));
+    await awaitDirectOperationalStartup();
+    if (prepareNext) {
+      console.info("startup_phase", JSON.stringify({ phase: "next_prepare" }));
+      app = next({ dev, hostname, port, httpServer: undefined });
+      await app.prepare();
+      runtime.resources.nextPrepared = true;
+      installNextCleanupAudit();
+      handle = app.getRequestHandler();
+    }
+  }
+
+  const daemonApiBridge = createDaemonApiBridge();
   server = createServer((request, response) => {
     if (!accepting) { response.statusCode = 503; response.end("shutting_down"); return; }
     void (async () => {
@@ -154,7 +191,7 @@ async function main() {
         response.end("static_ui_bridge_failed");
         return;
       }
-      if (dev || !staticUiActive) {
+      if (handle) {
         void handle(request, response);
         return;
       }
@@ -171,10 +208,10 @@ async function main() {
     JSON.stringify({
       active: staticUiActive,
       mode: dev ? "development" : "production",
-      fallbackToNextHandler: dev || !staticUiActive,
+      fallbackToNextHandler: Boolean(handle),
     }),
   );
-  // Instrumentation has completed the explicit ownership/RUNNING assertion.
+  // Operational startup has completed the explicit ownership/RUNNING assertion.
   const api = globalThis[shutdownApiKey];
   if (!api?.requestShutdown) throw new Error("startup readiness failed: lifecycle shutdown bridge missing");
   process.on("SIGTERM", () => { void signalShutdown("SIGTERM"); });
