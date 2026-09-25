@@ -3,4 +3,5 @@ export const viteUiRoot: string;
 export const viteUiIndexHtmlPath: string;
 
 export function isViteUiBuildAvailable(): Promise<boolean>;
+export function isNextAppUiBuildAvailable(): Promise<boolean>;
 export function isStaticUiBuildAvailable(): Promise<boolean>;

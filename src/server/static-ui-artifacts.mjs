@@ -17,14 +17,18 @@ export async function isViteUiBuildAvailable() {
   }
 }
 
-export async function isStaticUiBuildAvailable() {
-  if (await isViteUiBuildAvailable()) {
-    return true;
-  }
+export async function isNextAppUiBuildAvailable() {
   try {
     await access(staticUiIndexHtmlPath);
     return true;
   } catch {
     return false;
   }
+}
+
+export async function isStaticUiBuildAvailable() {
+  if (await isViteUiBuildAvailable()) {
+    return true;
+  }
+  return isNextAppUiBuildAvailable();
 }
