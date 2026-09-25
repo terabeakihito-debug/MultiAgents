@@ -67,6 +67,13 @@ import { cleanupCandidatesService } from "../core/cleanup-candidates-service";
 import { cleanupExecuteMutationService } from "../core/cleanup-execute-mutation-service";
 import { cleanupPreviewMutationService } from "../core/cleanup-preview-mutation-service";
 import { credentialStatusService } from "../core/credential-status-service";
+import { githubAccountService } from "../core/github-account-service";
+import { githubConnectMutationService } from "../core/github-connect-mutation-service";
+import { githubRemoteRepositoriesService } from "../core/github-remote-repositories-service";
+import {
+  GitHubConnectError,
+  GitHubConnectInputError,
+} from "../server/github-account";
 import { findingDetailService } from "../core/finding-detail-service";
 import {
   findingsQueueService,
@@ -251,6 +258,9 @@ type DaemonHttpDependencies = {
   applyRepoCreateMutation: typeof repoCreateMutationService.apply;
   applyRepoInitializeMutation: typeof repoInitializeMutationService.apply;
   loadCredentialStatus: typeof credentialStatusService.load;
+  loadGitHubAccount: typeof githubAccountService.load;
+  loadGitHubRemoteRepositories: typeof githubRemoteRepositoriesService.load;
+  applyGitHubConnectMutation: typeof githubConnectMutationService.apply;
   loadNotifications: typeof notificationListService.load;
   applyNotificationReadMutation: typeof notificationReadMutationService.apply;
   applyNotificationDismissMutation: typeof notificationDismissMutationService.apply;
@@ -343,6 +353,9 @@ export function createDaemonHttpHandler(
     applyRepoInitializeMutation: (repoId) =>
       repoInitializeMutationService.apply(repoId),
     loadCredentialStatus: () => credentialStatusService.load(),
+    loadGitHubAccount: () => githubAccountService.load(),
+    loadGitHubRemoteRepositories: () => githubRemoteRepositoriesService.load(),
+    applyGitHubConnectMutation: (body) => githubConnectMutationService.apply(body),
     loadNotifications: (url) => notificationListService.load(url),
     applyNotificationReadMutation: (notificationId) =>
       notificationReadMutationService.apply(notificationId),
@@ -1289,6 +1302,71 @@ export function createDaemonHttpHandler(
           error instanceof Error ? error.message : "unknown",
         );
         writeJson(response, 500, { error: "credential_status_failed" });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/github/account") {
+      try {
+        writeJson(response, 200, await dependencies.loadGitHubAccount());
+      } catch (error) {
+        console.error(
+          "daemon_github_account_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "github_account_failed" });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/github/repositories") {
+      try {
+        writeJson(response, 200, await dependencies.loadGitHubRemoteRepositories());
+      } catch (error) {
+        console.error(
+          "daemon_github_repositories_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        writeJson(response, 500, { error: "github_repositories_failed" });
+      }
+      return;
+    }
+
+    if (url.pathname === "/github/connect") {
+      if (request.method !== "POST") {
+        writeJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const webRequest = await toWebRequestWithBody(request);
+      const rejection = dependencies.rejectHumanMutation(
+        webRequest,
+        "github-connect",
+        { label: "GitHub" },
+      );
+      if (rejection) {
+        await writeWebResponse(response, rejection);
+        return;
+      }
+
+      let body: unknown;
+      try {
+        body = await webRequest.json();
+      } catch {
+        writeJson(response, 400, { error: "Request body must be valid JSON" });
+        return;
+      }
+
+      try {
+        writeJson(response, 200, await dependencies.applyGitHubConnectMutation(body));
+      } catch (error) {
+        if (error instanceof GitHubConnectInputError || error instanceof GitHubConnectError) {
+          writeJson(response, 400, { error: error.message });
+          return;
+        }
+        writeJson(response, 400, {
+          error: error instanceof Error ? error.message : "GitHub connection failed",
+        });
       }
       return;
     }

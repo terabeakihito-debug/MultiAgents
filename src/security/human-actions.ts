@@ -8,6 +8,7 @@ export const humanMutationActions = [
   "retention-policy", "cleanup-preview", "cleanup-execute",
   "task-reassociation-preview", "task-reassociation-confirm",
   "repository-clone", "repository-create", "repository-initialize",
+  "github-connect",
 ] as const;
 
 export type HumanMutationAction = (typeof humanMutationActions)[number];
