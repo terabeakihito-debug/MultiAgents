@@ -2,7 +2,13 @@ import { access, stat } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, normalize, sep } from "node:path";
-import { isStaticUiBuildAvailable, staticUiIndexHtmlPath } from "./static-ui-artifacts.mjs";
+import {
+  isStaticUiBuildAvailable,
+  isViteUiBuildAvailable,
+  staticUiIndexHtmlPath,
+  viteUiIndexHtmlPath,
+  viteUiRoot,
+} from "./static-ui-artifacts.mjs";
 
 const bridgeRoot = dirname(fileURLToPath(import.meta.url));
 const projectRoot = join(bridgeRoot, "../..");
@@ -51,6 +57,27 @@ export function mapPathnameToStaticAsset(pathname) {
     return null;
   }
   return join(nextStaticRoot, pathname.slice("/_next/static/".length));
+}
+
+/**
+ * @param {string} pathname
+ */
+export function mapPathnameToViteAsset(pathname) {
+  if (!pathname.startsWith("/assets/")) {
+    return null;
+  }
+  return join(viteUiRoot, pathname.slice(1));
+}
+
+/**
+ * @param {string} pathname
+ */
+export function mapPathnameToViteAppHtml(pathname) {
+  const trimmed = pathname.replace(/\/$/, "") || "/";
+  if (trimmed !== "/") {
+    return null;
+  }
+  return viteUiIndexHtmlPath;
 }
 
 function contentTypeFor(filePath) {
@@ -107,12 +134,28 @@ export function createNextStaticUiBridge() {
       const pathname = parseRequestPathname(request);
       if (pathname.startsWith("/api")) return false;
 
-      const staticAsset = mapPathnameToStaticAsset(pathname);
-      const htmlPath = staticAsset ? null : mapPathnameToAppHtml(pathname);
+      const viteAsset = mapPathnameToViteAsset(pathname);
+      const nextAsset = mapPathnameToStaticAsset(pathname);
+      const staticAsset = viteAsset ?? nextAsset;
+      let htmlPath = null;
+      if (!staticAsset) {
+        const viteHtml = mapPathnameToViteAppHtml(pathname);
+        if (viteHtml && (await isViteUiBuildAvailable())) {
+          htmlPath = viteHtml;
+        } else {
+          htmlPath = mapPathnameToAppHtml(pathname);
+        }
+      }
       const candidate = staticAsset ?? htmlPath;
       if (!candidate) return false;
 
-      const root = staticAsset ? nextStaticRoot : nextAppHtmlRoot;
+      const root = staticAsset
+        ? viteAsset
+          ? viteUiRoot
+          : nextStaticRoot
+        : htmlPath === viteUiIndexHtmlPath
+          ? viteUiRoot
+          : nextAppHtmlRoot;
       const relative = candidate.slice(root.length + 1);
       const safePath = resolvePathUnderRoot(root, relative);
       if (!safePath) return false;
