@@ -69,15 +69,29 @@ export function mapPathnameToViteAsset(pathname) {
   return join(viteUiRoot, pathname.slice(1));
 }
 
+/** @type {Record<string, string>} */
+export const viteAppHtmlFiles = {
+  "/": "index.html",
+  "/p2-mock": "p2-mock.html",
+};
+
 /**
  * @param {string} pathname
  */
 export function mapPathnameToViteAppHtml(pathname) {
   const trimmed = pathname.replace(/\/$/, "") || "/";
-  if (trimmed !== "/") {
+  const htmlFile = viteAppHtmlFiles[trimmed];
+  if (!htmlFile) {
     return null;
   }
-  return viteUiIndexHtmlPath;
+  return join(viteUiRoot, htmlFile);
+}
+
+/**
+ * @param {string} htmlPath
+ */
+export function isViteAppHtmlPath(htmlPath) {
+  return htmlPath.startsWith(`${viteUiRoot}${sep}`);
 }
 
 function contentTypeFor(filePath) {
@@ -153,7 +167,7 @@ export function createNextStaticUiBridge() {
         ? viteAsset
           ? viteUiRoot
           : nextStaticRoot
-        : htmlPath === viteUiIndexHtmlPath
+        : isViteAppHtmlPath(htmlPath)
           ? viteUiRoot
           : nextAppHtmlRoot;
       const relative = candidate.slice(root.length + 1);

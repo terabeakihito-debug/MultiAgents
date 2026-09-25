@@ -17,7 +17,8 @@ describe("next static UI bridge", () => {
 
   it("maps vite assets under dist-ui", () => {
     expect(mapPathnameToViteAppHtml("/")).toMatch(/dist-ui\/index\.html$/);
-    expect(mapPathnameToViteAppHtml("/p2-mock")).toBeNull();
+    expect(mapPathnameToViteAppHtml("/p2-mock/")).toMatch(/dist-ui\/p2-mock\.html$/);
+    expect(mapPathnameToViteAppHtml("/unknown")).toBeNull();
     expect(mapPathnameToViteAsset("/assets/index-abc.js")).toMatch(
       /dist-ui\/assets\/index-abc\.js$/,
     );
