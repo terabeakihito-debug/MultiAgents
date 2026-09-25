@@ -1,13 +1,10 @@
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
-import next from "next";
-import { installNextCloseAudit } from "./src/server/next-close-audit.mjs";
 import { createDaemonApiBridge } from "./src/server/daemon-api-bridge.mjs";
 import { createNextStaticUiBridge } from "./src/server/next-static-ui-bridge.mjs";
 import {
-  assertProductionStaticUiBuild,
+  assertStaticUiBuildAvailable,
   runOperationalStartupFromLauncher,
-  shouldPrepareNextApp,
 } from "./src/server/operational-startup-launcher.mjs";
 
 const dev = process.argv.includes("--dev");
@@ -15,22 +12,19 @@ const port = Number.parseInt(process.env.PORT || "3000", 10);
 const hostname = process.env.HOSTNAME || "127.0.0.1";
 const shutdownApiKey = Symbol.for("multiagents.shutdown-api.v1");
 const shutdownRuntimeKey = Symbol.for("multiagents.shutdown-runtime.v1");
-const nextCleanupAuditKey = Symbol.for("multiagents.next-cleanup-audit.v1");
 const STARTUP_TIMEOUT_MS = Number.parseInt(process.env.MULTIAGENTS_STARTUP_TIMEOUT_MS || "60000", 10);
 
 let accepting = true;
 let closeStarted;
-let app;
 let server;
 let exitStarted = false;
 let shutdownId;
 let startupBridge;
-let nextCleanupAudit;
 const runtime = {
-  resources: { nextPrepared: false, httpListening: false },
+  resources: { httpListening: false },
   stopAcceptingHttp: () => { accepting = false; },
   closeHttp: closeHttpWithDeadline,
-  closeNext: closeNextWithDeadline,
+  closeNext: async () => undefined,
 };
 globalThis[shutdownRuntimeKey] = runtime;
 
@@ -59,28 +53,8 @@ async function closeHttpWithDeadline(remainingMs) {
   if (!completed) {
     server.closeAllConnections();
   }
-  // Neither a stuck keep-alive socket nor its close callback may hold R09
-  // ownership forever. Framework closure is a distinct lifecycle phase.
   if (closeError) throw closeError;
   if (!completed) throw new Error("http_server_close_timed_out");
-}
-
-async function closeNextWithDeadline(remainingMs) {
-  if (!app) return;
-  const deadline = Date.now() + remainingMs;
-  const frameworkClosed = await Promise.race([
-    app.close().then(() => true),
-    new Promise((resolve) => { const timer = setTimeout(() => resolve(false), Math.max(0, deadline - Date.now())); timer.unref(); }),
-  ]);
-  if (!frameworkClosed) throw new Error("http_framework_close_timed_out");
-  nextCleanupAudit?.assertSucceeded();
-}
-
-function installNextCleanupAudit() {
-  nextCleanupAudit = installNextCloseAudit(app);
-  try { nextCleanupAudit.register("multiagents_next_close_barrier", async () => undefined); }
-  catch { /* closeNextWithDeadline reports unavailable audit as a required failure */ }
-  globalThis[nextCleanupAuditKey] = nextCleanupAudit;
 }
 
 async function signalShutdown(signal) {
@@ -92,8 +66,6 @@ async function signalShutdown(signal) {
   if (exitStarted) return;
   exitStarted = true;
   process.exitCode = result.success ? 0 : 1;
-  // This is the sole intentional process exit decision. It runs only after
-  // the shared lifecycle promise has released R09 ownership.
   console.info("shutdown_event", JSON.stringify({ shutdownId: result.shutdownId, phase: "launcher_exit", timestamp: new Date().toISOString(), exitCode: process.exitCode }));
   process.exit(process.exitCode);
 }
@@ -114,23 +86,12 @@ async function awaitDirectOperationalStartup() {
 
 async function main() {
   installStartupBridge();
-  const staticUiBridge = createNextStaticUiBridge({ development: dev });
-  const staticUiActive = dev ? false : await staticUiBridge.isActive();
-  assertProductionStaticUiBuild({ development: dev, staticUiActive });
-  const prepareNext = shouldPrepareNextApp({ development: dev });
-  let handle;
+  const staticUiBridge = createNextStaticUiBridge();
+  const staticUiActive = await staticUiBridge.isActive();
+  assertStaticUiBuildAvailable({ staticUiActive });
 
   console.info("startup_phase", JSON.stringify({ phase: "operational_init" }));
   await awaitDirectOperationalStartup();
-
-  if (prepareNext) {
-    console.info("startup_phase", JSON.stringify({ phase: "next_prepare" }));
-    app = next({ dev, hostname, port, httpServer: undefined });
-    await app.prepare();
-    runtime.resources.nextPrepared = true;
-    installNextCleanupAudit();
-    handle = app.getRequestHandler();
-  }
 
   const daemonApiBridge = createDaemonApiBridge();
   server = createServer((request, response) => {
@@ -158,10 +119,6 @@ async function main() {
         response.end("static_ui_bridge_failed");
         return;
       }
-      if (handle) {
-        void handle(request, response);
-        return;
-      }
       response.statusCode = 404;
       response.end("not_found");
     })();
@@ -175,16 +132,12 @@ async function main() {
     JSON.stringify({
       active: staticUiActive,
       mode: dev ? "development" : "production",
-      fallbackToNextHandler: Boolean(handle),
     }),
   );
-  // Operational startup has completed the explicit ownership/RUNNING assertion.
   const api = globalThis[shutdownApiKey];
   if (!api?.requestShutdown) throw new Error("startup readiness failed: lifecycle shutdown bridge missing");
   process.on("SIGTERM", () => { void signalShutdown("SIGTERM"); });
   process.on("SIGINT", () => { void signalShutdown("SIGINT"); });
-  // The custom launcher owns the only application signal listeners; Next is
-  // embedded via its request handler rather than invoked through its CLI.
   console.info("startup_signal_listeners", JSON.stringify({ SIGTERM: process.listenerCount("SIGTERM"), SIGINT: process.listenerCount("SIGINT") }));
   console.info("startup_phase", JSON.stringify({ phase: "http_listen" }));
   await new Promise((resolve, reject) => server.listen(port, hostname, (error) => error ? reject(error) : resolve()));
@@ -197,6 +150,5 @@ main().catch(async (error) => {
   console.error("startup_failed", JSON.stringify({ phase: server ? "http_listen" : "operational_init", reason: error instanceof Error ? error.message : "unknown" }));
   if (startupBridge) startupBridge.cancelled = true;
   try { await startupBridge?.abort?.(); } catch { /* operational startup already performs cleanup */ }
-  try { await app?.close?.(); } catch { /* no HTTP server was opened */ }
   process.exitCode = 1;
 });

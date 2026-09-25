@@ -84,18 +84,13 @@ async function sendFile(response, filePath, statusCode = 200) {
   });
 }
 
-export function createNextStaticUiBridge(options = {}) {
-  const development = options.development ?? false;
-  let active = !development;
+export function createNextStaticUiBridge() {
+  let active = false;
   let checkedBuild = false;
 
   async function ensureBuildAvailable() {
     if (checkedBuild) return active;
     checkedBuild = true;
-    if (development) {
-      active = false;
-      return active;
-    }
     try {
       await access(join(nextAppHtmlRoot, "index.html"));
       active = true;
@@ -108,9 +103,6 @@ export function createNextStaticUiBridge(options = {}) {
   return {
     async isActive() {
       return ensureBuildAvailable();
-    },
-    shouldFallbackToNextHandler() {
-      return development || !active;
     },
     async tryHandle(request, response) {
       if (!(await ensureBuildAvailable())) return false;
