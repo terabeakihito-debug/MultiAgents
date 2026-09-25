@@ -1,4 +1,5 @@
-import type { AgentAdapter, AgentId, AgentResult } from "../agents/types";
+import type { AgentAdapter, AgentId, AgentResult, FlowStepId } from "../agents/types";
+import type { FlowStepModelPlan } from "../flows/agent-models";
 import type { RuntimePolicy } from "../runtime/types";
 import { buildTaskRuntimePolicies, runTaskAgentWithPolicy } from "./runtime-policy";
 import { withProviderWorkBoundary } from "./provider-work-boundary";
@@ -8,19 +9,19 @@ export async function prepareTaskRuntime(task: RepoTask) {
   const policies = await buildTaskRuntimePolicies(task);
   return {
     policies,
-    execute: (adapter: AgentAdapter, prompt: string, signal?: AbortSignal, stepId?: string, onProviderWorkStart?: () => boolean | void, onChildClose?: () => void): Promise<AgentResult> => {
+    execute: (adapter: AgentAdapter, prompt: string, signal?: AbortSignal, stepId?: string, onProviderWorkStart?: () => boolean | void, onChildClose?: () => void, model?: string): Promise<AgentResult> => {
       const policy = policies[adapter.id];
-      return executePolicy(adapter, policy, prompt, signal, stepId, onProviderWorkStart, onChildClose);
+      return executePolicy(adapter, policy, prompt, signal, stepId, onProviderWorkStart, onChildClose, model);
     },
-    executePolicy: (adapter: AgentAdapter, policy: RuntimePolicy, prompt: string, signal?: AbortSignal, stepId?: string, onProviderWorkStart?: () => boolean | void, onChildClose?: () => void): Promise<AgentResult> => {
-      return executePolicy(adapter, policy, prompt, signal, stepId, onProviderWorkStart, onChildClose);
+    executePolicy: (adapter: AgentAdapter, policy: RuntimePolicy, prompt: string, signal?: AbortSignal, stepId?: string, onProviderWorkStart?: () => boolean | void, onChildClose?: () => void, model?: string): Promise<AgentResult> => {
+      return executePolicy(adapter, policy, prompt, signal, stepId, onProviderWorkStart, onChildClose, model);
     },
   };
 
-  function executePolicy(adapter: AgentAdapter, policy: RuntimePolicy, prompt: string, signal?: AbortSignal, stepId?: string, onProviderWorkStart?: () => boolean | void, onChildClose?: () => void) {
+  function executePolicy(adapter: AgentAdapter, policy: RuntimePolicy, prompt: string, signal?: AbortSignal, stepId?: string, onProviderWorkStart?: () => boolean | void, onChildClose?: () => void, model?: string) {
       let providerWorkRejected = false;
       const operation = () => runTaskAgentWithPolicy({
-        task, adapter, policy, prompt, signal, stepId,
+        task, adapter, policy, prompt, signal, stepId, model,
         onAudit: (type, activePolicy, violation) => recordRuntimeAudit(task, type, activePolicy, stepId, violation),
         onViolation: (activePolicy, violation) => markRuntimeViolation(task, activePolicy, violation),
         onSandboxAudit: (event) => {
@@ -40,7 +41,20 @@ export async function prepareTaskRuntime(task: RepoTask) {
 }
 
 export function taskRuntimeExecutor(runtime: Awaited<ReturnType<typeof prepareTaskRuntime>>, adapters: Record<AgentId, AgentAdapter>) {
-  return (agent: AgentId, prompt: string, signal: AbortSignal, stepId: string, onProviderWorkStart?: () => boolean | void, onChildClose?: () => void) => runtime.execute(adapters[agent], prompt, signal, stepId, onProviderWorkStart, onChildClose);
+  return (agent: AgentId, prompt: string, signal: AbortSignal, stepId: string, onProviderWorkStart?: () => boolean | void, onChildClose?: () => void, model?: string) =>
+    runtime.execute(adapters[agent], prompt, signal, stepId, onProviderWorkStart, onChildClose, model);
+}
+
+export function taskRuntimeExecutorForStepModels(
+  runtime: Awaited<ReturnType<typeof prepareTaskRuntime>>,
+  adapters: Record<AgentId, AgentAdapter>,
+  stepModels?: FlowStepModelPlan,
+) {
+  const execute = taskRuntimeExecutor(runtime, adapters);
+  return (agent: AgentId, prompt: string, signal: AbortSignal, stepId: string, onProviderWorkStart?: () => boolean | void, onChildClose?: () => void) => {
+    const model = stepModels?.[stepId as FlowStepId];
+    return execute(agent, prompt, signal, stepId, onProviderWorkStart, onChildClose, model);
+  };
 }
 
 export type TaskRuntime = { policies: Record<AgentId, RuntimePolicy> };

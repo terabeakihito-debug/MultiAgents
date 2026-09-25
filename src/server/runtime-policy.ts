@@ -120,6 +120,7 @@ export async function runTaskAgentWithPolicy(input: {
   prompt: string;
   signal?: AbortSignal;
   stepId?: string;
+  model?: string;
   onAudit: (type: "runtime_policy_created" | "runtime_execution_started" | "runtime_execution_completed" | "runtime_violation_detected", policy: RuntimePolicy, violation?: RuntimeViolation) => void;
   onViolation: (policy: RuntimePolicy, violation: RuntimeViolation) => void;
   onSandboxAudit: (event: import("./os-sandbox").OsSandboxAudit) => void;
@@ -178,6 +179,7 @@ export async function runTaskAgentWithPolicy(input: {
   try {
     const result = await adapter.run(input.prompt, {
       signal: input.signal,
+      ...(input.model ? { model: input.model } : {}),
       policy,
       onSandboxAudit: input.onSandboxAudit,
       onLifecycleTelemetry: input.onLifecycleTelemetry,

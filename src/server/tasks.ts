@@ -20,6 +20,12 @@ import type { AgentLifecycleTelemetry } from "../agents/types";
 import { acquireTaskLock, holdsTaskLock, isTaskLocked, releaseTaskLock } from "./task-lock";
 import { beginRegisteredOperation } from "./operation-registry";
 import {
+  defaultFlowStepModels,
+  FlowStepModelPlanError,
+  parseFlowStepModelPlan,
+  type FlowStepModelPlan,
+} from "../flows/agent-models";
+import {
   defaultFlowStepAgents,
   FlowStepAgentPlanError,
   parseFlowStepAgentPlan,
@@ -115,6 +121,7 @@ export type RepoTask = {
   flowStatus?: string;
   flowSteps?: FlowStep[];
   flowStepAgents?: FlowStepAgentPlan;
+  flowStepModels?: FlowStepModelPlan;
   finalOutput?: string;
   recoveryStatus: RecoveryStatus;
   recoveryMessage?: string;
@@ -189,7 +196,7 @@ const transitions: Record<TaskStatus, readonly TaskStatus[]> = {
   archived: [],
 };
 
-export async function createTask(repoId: string, options: { allowedRoot?: string; worktreeRoot?: string; templateId?: string; prompt?: string; autonomous?: boolean; stepAgents?: FlowStepAgentPlan; sourceFindingId?: string; sourceTaskId?: string } = {}): Promise<RepoTask> {
+export async function createTask(repoId: string, options: { allowedRoot?: string; worktreeRoot?: string; templateId?: string; prompt?: string; autonomous?: boolean; stepAgents?: FlowStepAgentPlan; stepModels?: FlowStepModelPlan; sourceFindingId?: string; sourceTaskId?: string } = {}): Promise<RepoTask> {
   loadPersistedTasks();
   const allowedRoot = options.allowedRoot ?? ALLOWED_ROOT;
   const repo = await validateRepository(repoId, allowedRoot);
@@ -205,6 +212,14 @@ export async function createTask(repoId: string, options: { allowedRoot?: string
       flowStepAgents = parseFlowStepAgentPlan(options.stepAgents, profile, template);
     } catch (error) {
       throw new Error(error instanceof FlowStepAgentPlanError ? error.message : "Step agent selection is invalid");
+    }
+  }
+  let flowStepModels = defaultFlowStepModels(flowStepAgents);
+  if (options.stepModels !== undefined) {
+    try {
+      flowStepModels = parseFlowStepModelPlan(options.stepModels, flowStepAgents);
+    } catch (error) {
+      throw new Error(error instanceof FlowStepModelPlanError ? error.message : "Step model selection is invalid");
     }
   }
   if (options.prompt !== undefined && (typeof options.prompt !== "string" || options.prompt.length > 20_000)) throw new Error("Task prompt is invalid");
@@ -257,6 +272,7 @@ export async function createTask(repoId: string, options: { allowedRoot?: string
     sourceFindingId: options.sourceFindingId,
     sourceTaskId: options.sourceTaskId,
     flowStepAgents,
+    flowStepModels,
   };
   tasks.set(id, task);
   const store = getStateStore();
@@ -434,6 +450,7 @@ export function publicTask(task: RepoTask) {
     flowStatus: task.flowStatus,
     flowSteps: task.flowSteps ?? [],
     flowStepAgents: task.flowStepAgents,
+    flowStepModels: task.flowStepModels,
     finalOutput: task.finalOutput,
     recoveryStatus: task.recoveryStatus,
     recoveryMessage: task.recoveryMessage,

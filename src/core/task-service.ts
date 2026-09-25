@@ -1,3 +1,4 @@
+import type { FlowStepModelPlan } from "../flows/agent-models";
 import type { FlowStepAgentPlan } from "../flows/step-agents";
 import { createTask, initializeTaskRecovery, listTasks, publicTask } from "../server/tasks";
 
@@ -9,6 +10,7 @@ export type TaskCreateRequest = {
   prompt?: string;
   autonomous?: boolean;
   stepAgents?: FlowStepAgentPlan;
+  stepModels?: FlowStepModelPlan;
 };
 
 export type TaskRequestErrorCode =
@@ -35,11 +37,14 @@ export function parseTaskCreateRequest(input: unknown): TaskCreateRequest {
   if (typeof body.repoId !== "string") {
     throw new TaskRequestError("repository_required", "Repository is required");
   }
-  if (Object.keys(body).some((key) => !["repoId", "templateId", "prompt", "autonomous", "stepAgents"].includes(key))) {
+  if (Object.keys(body).some((key) => !["repoId", "templateId", "prompt", "autonomous", "stepAgents", "stepModels"].includes(key))) {
     throw new TaskRequestError("forbidden_field", "Task creation contains a forbidden field");
   }
   if (body.stepAgents !== undefined && (typeof body.stepAgents !== "object" || body.stepAgents === null || Array.isArray(body.stepAgents))) {
     throw new TaskRequestError("forbidden_field", "Step agent selection is invalid");
+  }
+  if (body.stepModels !== undefined && (typeof body.stepModels !== "object" || body.stepModels === null || Array.isArray(body.stepModels))) {
+    throw new TaskRequestError("forbidden_field", "Step model selection is invalid");
   }
   if (body.templateId !== undefined && typeof body.templateId !== "string") {
     throw new TaskRequestError("template_invalid", "Task template is invalid");
@@ -59,6 +64,7 @@ export function parseTaskCreateRequest(input: unknown): TaskCreateRequest {
     prompt: body.prompt as string | undefined,
     ...(body.autonomous === undefined ? {} : { autonomous: body.autonomous as boolean }),
     ...(body.stepAgents === undefined ? {} : { stepAgents: body.stepAgents as FlowStepAgentPlan }),
+    ...(body.stepModels === undefined ? {} : { stepModels: body.stepModels as FlowStepModelPlan }),
   };
 }
 
@@ -89,6 +95,7 @@ export function createTaskService(dependencies: TaskDependencies = {
         prompt: request.prompt,
         ...(request.autonomous === undefined ? {} : { autonomous: request.autonomous }),
         ...(request.stepAgents === undefined ? {} : { stepAgents: request.stepAgents }),
+        ...(request.stepModels === undefined ? {} : { stepModels: request.stepModels }),
       });
       return dependencies.toPublic(task);
     },
