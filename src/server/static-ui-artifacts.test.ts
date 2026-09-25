@@ -12,7 +12,7 @@ describe("static UI artifacts", () => {
     expect(viteUiIndexHtmlPath).toMatch(/dist-ui\/index\.html$/);
   });
 
-  it("detects vite or next build output in this workspace", async () => {
+  it("detects vite build output for runtime UI", async () => {
     expect(await isViteUiBuildAvailable()).toBe(true);
     expect(await isStaticUiBuildAvailable()).toBe(true);
   });

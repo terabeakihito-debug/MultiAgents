@@ -27,8 +27,5 @@ export async function isNextAppUiBuildAvailable() {
 }
 
 export async function isStaticUiBuildAvailable() {
-  if (await isViteUiBuildAvailable()) {
-    return true;
-  }
-  return isNextAppUiBuildAvailable();
+  return isViteUiBuildAvailable();
 }

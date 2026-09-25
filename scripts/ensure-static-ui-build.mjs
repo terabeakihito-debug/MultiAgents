@@ -1,38 +1,21 @@
 import { spawn } from "node:child_process";
-import {
-  isNextAppUiBuildAvailable,
-  isViteUiBuildAvailable,
-} from "../src/server/static-ui-artifacts.mjs";
+import { isViteUiBuildAvailable } from "../src/server/static-ui-artifacts.mjs";
 
 async function main() {
-  if (!(await isViteUiBuildAvailable())) {
-    console.info(
-      "static_ui_build",
-      JSON.stringify({ phase: "vite_build", reason: "missing_dist_ui" }),
-    );
-    await runViteBuild();
+  if (await isViteUiBuildAvailable()) {
+    return;
   }
 
-  if (!(await isNextAppUiBuildAvailable())) {
-    console.info(
-      "static_ui_build",
-      JSON.stringify({ phase: "next_build", reason: "missing_next_app_html" }),
-    );
-    await runNextBuild();
-  }
+  console.info(
+    "static_ui_build",
+    JSON.stringify({ phase: "vite_build", reason: "missing_dist_ui" }),
+  );
+  await runViteBuild();
 }
 
 function runViteBuild() {
-  return run(process.execPath, ["./node_modules/vite/bin/vite.js", "build"]);
-}
-
-function runNextBuild() {
-  return run(process.execPath, ["./node_modules/next/dist/bin/next", "build"]);
-}
-
-function run(command, args) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
+    const child = spawn(process.execPath, ["./node_modules/vite/bin/vite.js", "build"], {
       cwd: process.cwd(),
       stdio: "inherit",
       env: process.env,
@@ -45,7 +28,7 @@ function run(command, args) {
       }
       reject(
         new Error(
-          `static ui build command failed: code=${code ?? "null"} signal=${signal ?? "null"}`,
+          `vite build failed: code=${code ?? "null"} signal=${signal ?? "null"}`,
         ),
       );
     });
