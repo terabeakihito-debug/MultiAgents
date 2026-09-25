@@ -2,11 +2,12 @@ import { access, stat } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, normalize, sep } from "node:path";
+import { isStaticUiBuildAvailable, staticUiIndexHtmlPath } from "./static-ui-artifacts.mjs";
 
 const bridgeRoot = dirname(fileURLToPath(import.meta.url));
 const projectRoot = join(bridgeRoot, "../..");
 const nextStaticRoot = join(projectRoot, ".next/static");
-const nextAppHtmlRoot = join(projectRoot, ".next/server/app");
+const nextAppHtmlRoot = dirname(staticUiIndexHtmlPath);
 
 const CONTENT_TYPES = {
   ".css": "text/css; charset=utf-8",
@@ -91,12 +92,7 @@ export function createNextStaticUiBridge() {
   async function ensureBuildAvailable() {
     if (checkedBuild) return active;
     checkedBuild = true;
-    try {
-      await access(join(nextAppHtmlRoot, "index.html"));
-      active = true;
-    } catch {
-      active = false;
-    }
+    active = await isStaticUiBuildAvailable();
     return active;
   }
 

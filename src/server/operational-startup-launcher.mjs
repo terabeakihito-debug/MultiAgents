@@ -8,11 +8,16 @@ const operationalStartupPath = join(
 );
 
 export const STATIC_UI_BUILD_REQUIRED_MESSAGE =
-  "Static UI build output is missing. Run `npm run build` before `npm run dev` or `npm start`.";
+  "Static UI build output is missing. Run `npm run build` before `npm start`.";
 
-export function assertStaticUiBuildAvailable({ staticUiActive }) {
+export const STATIC_UI_DEV_BOOTSTRAP_FAILED_MESSAGE =
+  "Static UI build output is missing after dev bootstrap.";
+
+export function assertStaticUiBuildAvailable({ staticUiActive, development = false }) {
   if (!staticUiActive) {
-    throw new Error(STATIC_UI_BUILD_REQUIRED_MESSAGE);
+    throw new Error(
+      development ? STATIC_UI_DEV_BOOTSTRAP_FAILED_MESSAGE : STATIC_UI_BUILD_REQUIRED_MESSAGE,
+    );
   }
 }
 

@@ -88,7 +88,7 @@ async function main() {
   installStartupBridge();
   const staticUiBridge = createNextStaticUiBridge();
   const staticUiActive = await staticUiBridge.isActive();
-  assertStaticUiBuildAvailable({ staticUiActive });
+  assertStaticUiBuildAvailable({ staticUiActive, development: dev });
 
   console.info("startup_phase", JSON.stringify({ phase: "operational_init" }));
   await awaitDirectOperationalStartup();
