@@ -6,7 +6,7 @@ import { createReviewFlowStream } from "../flows/review-stream";
 import { createDiffSnapshot } from "../server/pull-request";
 import { defaultFlowStepModels } from "../flows/agent-models";
 import { defaultFlowStepAgents } from "../flows/step-agents";
-import { prepareTaskRuntime, taskRuntimeExecutorForStepModels } from "../server/task-runtime";
+import { prepareTaskRuntime, taskRuntimeExecutor, taskRuntimeExecutorForStepModels } from "../server/task-runtime";
 import {
   beginTaskReview,
   completeTaskReview,
