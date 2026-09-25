@@ -1,3 +1,4 @@
+import type { FlowStepAgentPlan } from "../flows/step-agents";
 import { createTask, initializeTaskRecovery, listTasks, publicTask } from "../server/tasks";
 
 export const MAX_TASK_PROMPT_LENGTH = 20_000;
@@ -7,6 +8,7 @@ export type TaskCreateRequest = {
   templateId?: string;
   prompt?: string;
   autonomous?: boolean;
+  stepAgents?: FlowStepAgentPlan;
 };
 
 export type TaskRequestErrorCode =
@@ -33,8 +35,11 @@ export function parseTaskCreateRequest(input: unknown): TaskCreateRequest {
   if (typeof body.repoId !== "string") {
     throw new TaskRequestError("repository_required", "Repository is required");
   }
-  if (Object.keys(body).some((key) => !["repoId", "templateId", "prompt", "autonomous"].includes(key))) {
+  if (Object.keys(body).some((key) => !["repoId", "templateId", "prompt", "autonomous", "stepAgents"].includes(key))) {
     throw new TaskRequestError("forbidden_field", "Task creation contains a forbidden field");
+  }
+  if (body.stepAgents !== undefined && (typeof body.stepAgents !== "object" || body.stepAgents === null || Array.isArray(body.stepAgents))) {
+    throw new TaskRequestError("forbidden_field", "Step agent selection is invalid");
   }
   if (body.templateId !== undefined && typeof body.templateId !== "string") {
     throw new TaskRequestError("template_invalid", "Task template is invalid");
@@ -53,6 +58,7 @@ export function parseTaskCreateRequest(input: unknown): TaskCreateRequest {
     templateId: body.templateId as string | undefined,
     prompt: body.prompt as string | undefined,
     ...(body.autonomous === undefined ? {} : { autonomous: body.autonomous as boolean }),
+    ...(body.stepAgents === undefined ? {} : { stepAgents: body.stepAgents as FlowStepAgentPlan }),
   };
 }
 
@@ -82,6 +88,7 @@ export function createTaskService(dependencies: TaskDependencies = {
         templateId: request.templateId,
         prompt: request.prompt,
         ...(request.autonomous === undefined ? {} : { autonomous: request.autonomous }),
+        ...(request.stepAgents === undefined ? {} : { stepAgents: request.stepAgents }),
       });
       return dependencies.toPublic(task);
     },

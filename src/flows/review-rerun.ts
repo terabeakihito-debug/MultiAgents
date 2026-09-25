@@ -57,7 +57,7 @@ export function reconstructReviewRerunRequest(
     if (item.output.length > MAX_STEP_OUTPUT_CHARS) return { error: `Step output must be ${MAX_STEP_OUTPUT_CHARS} characters or fewer` };
     const source = item as unknown as FlowStep;
     const canonical = canonicalStep(source.id);
-    steps.push({ ...source, ...canonical, output: item.output });
+    steps.push({ ...canonical, ...source, id: canonical.id, role: canonical.role, output: item.output });
   }
   const missing = requiredUpstream(stepId).find((id) => {
     const step = steps.find((item) => item.id === id)!;

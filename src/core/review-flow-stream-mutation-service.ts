@@ -126,6 +126,7 @@ export function createReviewFlowStreamMutationService(
             roles: template!.roles,
             repositoryReadOnly: template!.readOnly,
             runtimePolicies: taskRuntime!.policies,
+            stepAgents: task.flowStepAgents,
             executeAgent: dependencies.runtimeExecutor(taskRuntime!, dependencies.agentSet),
             fingerprint: async () => (await dependencies.diffFingerprint(task)).hash,
             getDiff: async () => {
