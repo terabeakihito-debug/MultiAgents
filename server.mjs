@@ -15,7 +15,6 @@ const port = Number.parseInt(process.env.PORT || "3000", 10);
 const hostname = process.env.HOSTNAME || "127.0.0.1";
 const shutdownApiKey = Symbol.for("multiagents.shutdown-api.v1");
 const shutdownRuntimeKey = Symbol.for("multiagents.shutdown-runtime.v1");
-const startupBridgeKey = Symbol.for("multiagents.launcher-startup.v1");
 const nextCleanupAuditKey = Symbol.for("multiagents.next-cleanup-audit.v1");
 const STARTUP_TIMEOUT_MS = Number.parseInt(process.env.MULTIAGENTS_STARTUP_TIMEOUT_MS || "60000", 10);
 
@@ -36,20 +35,10 @@ const runtime = {
 globalThis[shutdownRuntimeKey] = runtime;
 
 function installStartupBridge() {
-  let ready, failed;
-  const promise = new Promise((resolve, reject) => { ready = resolve; failed = reject; });
   startupBridge = {
     cancelled: false,
-    operationalReady: false,
-    ready: () => {
-      startupBridge.operationalReady = true;
-      ready();
-    },
-    failed: (error) => failed(error),
     setAbort: (abort) => { startupBridge.abort = abort; },
-    promise,
   };
-  globalThis[startupBridgeKey] = startupBridge;
 }
 
 function startHttpClose() {

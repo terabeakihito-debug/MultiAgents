@@ -39,7 +39,7 @@ export function initializeOperationalStartup() {
   return startup.promise;
 }
 
-/** Explicit readiness gate shared by the custom launcher and instrumentation. */
+/** Explicit readiness gate shared by the custom launcher and standalone daemon. */
 export function assertOperationalStartupReady(lease?: ServerInstanceLease): asserts lease is ServerInstanceLease {
   if (!lease || lifecycleState() !== "RUNNING" || ownershipLostEver() || !hasMutationOwnershipPredicate()) {
     throw new Error("Operational startup readiness assertion failed");

@@ -1,7 +1,6 @@
 export type StartupBridge = {
   cancelled?: boolean;
-  ready?: () => void;
-  failed?: (error: unknown) => void;
+  abort?: () => Promise<void>;
   setAbort?: (abort: () => Promise<void>) => void;
 };
 

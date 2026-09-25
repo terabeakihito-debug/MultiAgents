@@ -32,11 +32,5 @@ export async function runOperationalStartupFromLauncher(startupBridge) {
     operationalStartupPath
   );
   startupBridge?.setAbort?.(abortOperationalStartup);
-  try {
-    await initializeOperationalStartup();
-    startupBridge?.ready?.();
-  } catch (error) {
-    startupBridge?.failed?.(error);
-    throw error;
-  }
+  await initializeOperationalStartup();
 }
