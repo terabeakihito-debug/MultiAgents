@@ -2,14 +2,14 @@ import { describe, expect, it } from "vitest";
 import {
   isStaticUiBuildAvailable,
   isViteUiBuildAvailable,
-  staticUiIndexHtmlPath,
   viteUiIndexHtmlPath,
+  viteUiNotFoundHtmlPath,
 } from "./static-ui-artifacts.mjs";
 
 describe("static UI artifacts", () => {
-  it("points at next and vite prebuilt index html paths", () => {
-    expect(staticUiIndexHtmlPath).toMatch(/\.next\/server\/app\/index\.html$/);
+  it("points at vite prebuilt html paths", () => {
     expect(viteUiIndexHtmlPath).toMatch(/dist-ui\/index\.html$/);
+    expect(viteUiNotFoundHtmlPath).toMatch(/dist-ui\/404\.html$/);
   });
 
   it("detects vite build output for runtime UI", async () => {

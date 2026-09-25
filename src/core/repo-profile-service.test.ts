@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createRepoProfileService, RepoProfileNotFoundError } from "./repo-profile-service";
+import { createRepoProfileService } from "./repo-profile-service";
 
 describe("repo profile service", () => {
   it("returns the repository profile", async () => {

@@ -1,9 +1,29 @@
+import js from "@eslint/js";
 import { defineConfig, globalIgnores } from "eslint/config";
-import nextVitals from "eslint-config-next/core-web-vitals";
-import nextTypeScript from "eslint-config-next/typescript";
+import globals from "globals";
+import tseslint from "typescript-eslint";
 
 export default defineConfig([
-  ...nextVitals,
-  ...nextTypeScript,
-  globalIgnores([".next/**", "out/**", "coverage/**", "dist-daemon/**", "next-env.d.ts"]),
+  js.configs.recommended,
+  ...tseslint.configs.recommended,
+  globalIgnores([".next/**", "out/**", "coverage/**", "dist-daemon/**", "dist-ui/**"]),
+  {
+    files: ["**/*.{js,mjs,cjs}"],
+    languageOptions: {
+      globals: globals.node,
+    },
+  },
+  {
+    files: ["src/app/**/*.{ts,tsx}"],
+    languageOptions: {
+      globals: globals.browser,
+    },
+  },
+  {
+    rules: {
+      "no-control-regex": "off",
+      "no-constant-condition": "off",
+      "no-useless-escape": "off",
+    },
+  },
 ]);

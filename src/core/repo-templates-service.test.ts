@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createRepoTemplatesService, RepoTemplatesNotFoundError } from "./repo-templates-service";
+import { createRepoTemplatesService } from "./repo-templates-service";
 
 describe("repo templates service", () => {
   it("returns repository template settings", async () => {

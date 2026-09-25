@@ -1,19 +1,12 @@
 import { access, stat } from "node:fs/promises";
 import { createReadStream } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname, join, normalize, sep } from "node:path";
+import { join, normalize, sep } from "node:path";
 import {
   isStaticUiBuildAvailable,
   isViteUiBuildAvailable,
-  staticUiIndexHtmlPath,
-  viteUiIndexHtmlPath,
+  viteUiNotFoundHtmlPath,
   viteUiRoot,
 } from "./static-ui-artifacts.mjs";
-
-const bridgeRoot = dirname(fileURLToPath(import.meta.url));
-const projectRoot = join(bridgeRoot, "../..");
-const nextStaticRoot = join(projectRoot, ".next/static");
-const nextAppHtmlRoot = dirname(staticUiIndexHtmlPath);
 
 const CONTENT_TYPES = {
   ".css": "text/css; charset=utf-8",
@@ -36,27 +29,6 @@ export function resolvePathUnderRoot(root, relativePath) {
     return candidate;
   }
   return null;
-}
-
-/**
- * @param {string} pathname
- */
-export function mapPathnameToAppHtml(pathname) {
-  const trimmed = pathname.replace(/\/$/, "") || "/";
-  if (trimmed === "/") {
-    return join(nextAppHtmlRoot, "index.html");
-  }
-  return join(nextAppHtmlRoot, `${trimmed.slice(1)}.html`);
-}
-
-/**
- * @param {string} pathname
- */
-export function mapPathnameToStaticAsset(pathname) {
-  if (!pathname.startsWith("/_next/static/")) {
-    return null;
-  }
-  return join(nextStaticRoot, pathname.slice("/_next/static/".length));
 }
 
 /**
@@ -149,27 +121,21 @@ export function createNextStaticUiBridge() {
       if (pathname.startsWith("/api")) return false;
 
       const viteAsset = mapPathnameToViteAsset(pathname);
-      const nextAsset = mapPathnameToStaticAsset(pathname);
-      const staticAsset = viteAsset ?? nextAsset;
       let htmlPath = null;
-      if (!staticAsset) {
+      let responseStatus = 200;
+      if (!viteAsset) {
         const viteHtml = mapPathnameToViteAppHtml(pathname);
         if (viteHtml && (await isViteUiBuildAvailable())) {
           htmlPath = viteHtml;
         } else {
-          htmlPath = mapPathnameToAppHtml(pathname);
+          htmlPath = viteUiNotFoundHtmlPath;
+          responseStatus = 404;
         }
       }
-      const candidate = staticAsset ?? htmlPath;
+      const candidate = viteAsset ?? htmlPath;
       if (!candidate) return false;
 
-      const root = staticAsset
-        ? viteAsset
-          ? viteUiRoot
-          : nextStaticRoot
-        : isViteAppHtmlPath(htmlPath)
-          ? viteUiRoot
-          : nextAppHtmlRoot;
+      const root = viteUiRoot;
       const relative = candidate.slice(root.length + 1);
       const safePath = resolvePathUnderRoot(root, relative);
       if (!safePath) return false;
@@ -177,33 +143,19 @@ export function createNextStaticUiBridge() {
       try {
         await access(safePath);
       } catch {
-        if (staticAsset) return false;
-        const notFound = resolvePathUnderRoot(nextAppHtmlRoot, "_not-found.html");
-        if (!notFound) return false;
-        try {
-          await access(notFound);
-        } catch {
-          return false;
-        }
-        if (request.method === "HEAD") {
-          response.statusCode = 404;
-          response.end();
-          return true;
-        }
-        await sendFile(response, notFound, 404);
-        return true;
+        return false;
       }
 
       if (request.method === "HEAD") {
         const fileStat = await stat(safePath);
-        response.statusCode = 200;
+        response.statusCode = responseStatus;
         response.setHeader("Content-Type", contentTypeFor(safePath));
         response.setHeader("Content-Length", String(fileStat.size));
         response.end();
         return true;
       }
 
-      await sendFile(response, safePath);
+      await sendFile(response, safePath, responseStatus);
       return true;
     },
   };

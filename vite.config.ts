@@ -17,6 +17,7 @@ export default defineConfig({
       input: {
         main: path.resolve(__dirname, "src/ui-vite/index.html"),
         "p2-mock": path.resolve(__dirname, "src/ui-vite/p2-mock.html"),
+        "404": path.resolve(__dirname, "src/ui-vite/404.html"),
       },
     },
   },

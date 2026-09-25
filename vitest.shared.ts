@@ -7,7 +7,7 @@ export const sharedVitestConfig = {
   },
   resolve: {
     alias: {
-      "server-only": fileURLToPath(new URL("./node_modules/next/dist/compiled/server-only/empty.js", import.meta.url)),
+      "server-only": fileURLToPath(new URL("./test/server-only-stub.js", import.meta.url)),
     },
   },
 } satisfies UserConfig;
