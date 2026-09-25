@@ -143,12 +143,10 @@ async function main() {
       void handle(request, response);
     })();
   });
-  if (daemonApiBridge.isEnabled()) {
-    console.info(
-      "daemon_api_bridge",
-      JSON.stringify({ enabled: true, mode: dev ? "development" : "production" }),
-    );
-  }
+  console.info(
+    "daemon_api_bridge",
+    JSON.stringify({ enabled: true, mode: dev ? "development" : "production" }),
+  );
   // Instrumentation has completed the explicit ownership/RUNNING assertion.
   const api = globalThis[shutdownApiKey];
   if (!api?.requestShutdown) throw new Error("startup readiness failed: lifecycle shutdown bridge missing");
