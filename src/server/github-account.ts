@@ -139,7 +139,6 @@ export async function listGitHubRemoteRepositories(): Promise<{ account: GitHubA
   const result = await ghRunner([
     "repo", "list",
     "--limit", String(GH_REPO_LIST_LIMIT),
-    "--hostname", GITHUB_HOSTNAME,
     "--json", "nameWithOwner,url,isPrivate,isFork,description",
   ], cwd);
   if (result.code !== 0) {

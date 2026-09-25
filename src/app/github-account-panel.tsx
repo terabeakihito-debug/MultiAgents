@@ -15,19 +15,20 @@ export function GitHubAccountPanel({ onCloneUrl }: { onCloneUrl?: (url: string) 
   const refresh = useCallback(async () => {
     setFailed(false);
     try {
-      const [accountResponse, repositoriesResponse] = await Promise.all([
-        fetch("/api/github/account", { cache: "no-store" }),
-        fetch("/api/github/repositories", { cache: "no-store" }),
-      ]);
+      const accountResponse = await fetch("/api/github/account", { cache: "no-store" });
       const accountData = await accountResponse.json() as GitHubAccountView & { error?: string };
+      if (!accountResponse.ok) throw new Error(accountData.error || "GitHub account status is unavailable");
+      setAccount(accountData);
+      if (!accountData.connected) {
+        setRepositories([]);
+        return;
+      }
+      const repositoriesResponse = await fetch("/api/github/repositories", { cache: "no-store" });
       const repositoriesData = await repositoriesResponse.json() as {
-        account?: GitHubAccountView;
         repositories?: GitHubRemoteRepositoryView[];
         error?: string;
       };
-      if (!accountResponse.ok) throw new Error(accountData.error || "GitHub account status is unavailable");
       if (!repositoriesResponse.ok) throw new Error(repositoriesData.error || "GitHub repositories are unavailable");
-      setAccount(accountData);
       setRepositories(repositoriesData.repositories ?? []);
     } catch {
       setFailed(true);
