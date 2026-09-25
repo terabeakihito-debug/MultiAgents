@@ -125,7 +125,7 @@ function runProcess(
       let immutableRuntime: Awaited<ReturnType<typeof prepareProviderImmutableBinding>> | undefined;
       try {
         safePrompt = redactKnownSecrets(prompt);
-        innerArgs = definition.args(safePrompt, SANDBOX_PROJECT_ROOT, policy.source === "task_snapshots", policy.allowWrite);
+        innerArgs = definition.args(safePrompt, SANDBOX_PROJECT_ROOT, policy.source === "task_snapshots", policy.allowWrite, runOptions?.model);
         executionBinding = !testBypass ? await assertProviderExecutionIdentity(definition.id, diagnostic!) : undefined;
         immutableRuntime = !testBypass && executionBinding ? await prepareProviderImmutableBinding(definition.id, executionBinding) : undefined;
         command = testBypass

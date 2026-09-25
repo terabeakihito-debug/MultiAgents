@@ -4,7 +4,9 @@ import { recordTaskEvent, persistTask } from "../server/tasks";
 import { createAutonomousFlowStream, MAX_AUTONOMOUS_ITERATIONS, type AutonomousFlowStreamOptions } from "../flows/autonomous";
 import { createReviewFlowStream } from "../flows/review-stream";
 import { createDiffSnapshot } from "../server/pull-request";
-import { prepareTaskRuntime, taskRuntimeExecutor } from "../server/task-runtime";
+import { defaultFlowStepModels } from "../flows/agent-models";
+import { defaultFlowStepAgents } from "../flows/step-agents";
+import { prepareTaskRuntime, taskRuntimeExecutorForStepModels } from "../server/task-runtime";
 import {
   beginTaskReview,
   completeTaskReview,
@@ -127,7 +129,11 @@ export function createReviewFlowStreamMutationService(
             repositoryReadOnly: template!.readOnly,
             runtimePolicies: taskRuntime!.policies,
             stepAgents: task.flowStepAgents,
-            executeAgent: dependencies.runtimeExecutor(taskRuntime!, dependencies.agentSet),
+            executeAgent: taskRuntimeExecutorForStepModels(
+              taskRuntime!,
+              dependencies.agentSet,
+              task.flowStepModels ?? defaultFlowStepModels(task.flowStepAgents ?? defaultFlowStepAgents()),
+            ),
             fingerprint: async () => (await dependencies.diffFingerprint(task)).hash,
             getDiff: async () => {
               const diff = await dependencies.loadDiff(task);

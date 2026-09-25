@@ -346,6 +346,7 @@ export class StateStore {
       profileSnapshot: profile,
       templateSnapshot: template,
       flowStepAgents: task.flowStepAgents,
+      flowStepModels: task.flowStepModels,
     });
     this.transaction(() => {
       this.database.prepare(`
@@ -1220,6 +1221,7 @@ export class StateStore {
       baseState: optionalString(payload.baseState) as RepoTask["baseState"],
       baseAheadCount: optionalNumber(payload.baseAheadCount),
       flowStepAgents: objectOrUndefined(payload.flowStepAgents) as RepoTask["flowStepAgents"],
+      flowStepModels: objectOrUndefined(payload.flowStepModels) as RepoTask["flowStepModels"],
     } as RepoTask;
   }
 

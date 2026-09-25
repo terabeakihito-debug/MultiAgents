@@ -44,11 +44,12 @@ export type AgentDefinition = {
   id: AgentId;
   name: string;
   binary: string;
-  args: (prompt: string, cwd: string, repositoryTask: boolean, writeAccess: boolean) => string[];
+  args: (prompt: string, cwd: string, repositoryTask: boolean, writeAccess: boolean, model?: string) => string[];
 };
 
 export type AgentRunOptions = {
   signal?: AbortSignal;
+  model?: string;
   policy?: import("../runtime/types").RuntimePolicy;
   onSandboxAudit?: (event: import("../server/os-sandbox").OsSandboxAudit) => unknown;
   /** Called synchronously at the authoritative spawned-child close boundary. */

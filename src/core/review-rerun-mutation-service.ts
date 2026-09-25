@@ -5,7 +5,9 @@ import {
   reconstructReviewRerunRequest,
 } from "../flows/review-rerun";
 import { createDiffSnapshot } from "../server/pull-request";
-import { prepareTaskRuntime, taskRuntimeExecutor } from "../server/task-runtime";
+import { defaultFlowStepModels } from "../flows/agent-models";
+import { defaultFlowStepAgents } from "../flows/step-agents";
+import { prepareTaskRuntime, taskRuntimeExecutor, taskRuntimeExecutorForStepModels } from "../server/task-runtime";
 import {
   beginTaskRerun,
   completeTaskReview,
@@ -128,9 +130,10 @@ export function createReviewRerunMutationService(
               return [diff.patch, diff.untrackedPatch].filter(Boolean).join("\n\n");
             },
             runtimePolicies: taskRuntime.policies,
-            executeAgent: dependencies.runtimeExecutor(
+            executeAgent: taskRuntimeExecutorForStepModels(
               taskRuntime,
               dependencies.agentSet,
+              task.flowStepModels ?? defaultFlowStepModels(task.flowStepAgents ?? defaultFlowStepAgents()),
             ),
             onEvent: (event) => dependencies.recordEvent(task, event),
             onComplete: (result) =>
