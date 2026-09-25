@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import next from "next";
 import { installNextCloseAudit } from "./src/server/next-close-audit.mjs";
 import { createDaemonApiBridge } from "./src/server/daemon-api-bridge.mjs";
+import { createNextStaticUiBridge } from "./src/server/next-static-ui-bridge.mjs";
 
 const dev = process.argv.includes("--dev");
 const port = Number.parseInt(process.env.PORT || "3000", 10);
@@ -126,6 +127,8 @@ async function main() {
   await awaitOperationalStartup();
   const handle = app.getRequestHandler();
   const daemonApiBridge = createDaemonApiBridge();
+  const staticUiBridge = createNextStaticUiBridge({ development: dev });
+  const staticUiActive = await staticUiBridge.isActive();
   server = createServer((request, response) => {
     if (!accepting) { response.statusCode = 503; response.end("shutting_down"); return; }
     void (async () => {
@@ -140,12 +143,36 @@ async function main() {
         response.end("daemon_api_bridge_failed");
         return;
       }
-      void handle(request, response);
+      try {
+        if (await staticUiBridge.tryHandle(request, response)) return;
+      } catch (error) {
+        console.error(
+          "static_ui_bridge_failed",
+          error instanceof Error ? error.message : "unknown",
+        );
+        response.statusCode = 500;
+        response.end("static_ui_bridge_failed");
+        return;
+      }
+      if (dev || !staticUiActive) {
+        void handle(request, response);
+        return;
+      }
+      response.statusCode = 404;
+      response.end("not_found");
     })();
   });
   console.info(
     "daemon_api_bridge",
     JSON.stringify({ enabled: true, mode: dev ? "development" : "production" }),
+  );
+  console.info(
+    "static_ui_bridge",
+    JSON.stringify({
+      active: staticUiActive,
+      mode: dev ? "development" : "production",
+      fallbackToNextHandler: dev || !staticUiActive,
+    }),
   );
   // Instrumentation has completed the explicit ownership/RUNNING assertion.
   const api = globalThis[shutdownApiKey];
