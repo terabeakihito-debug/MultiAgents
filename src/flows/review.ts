@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { agents as defaultAgents } from "../agents";
 import { isReviewFlowTimeoutAbortReason, isReviewStepBudgetAbortReason, reviewFlowTimeoutAbortReason, reviewStepBudgetAbortReason } from "../agents/abort-origin";
-import type { AgentAdapter, AgentId, FlowEvent, FlowRole, FlowStep, FlowStepId, ReviewFlowResult } from "../agents/types";
+import type { AgentAdapter, AgentId, FlowEvent, FlowStep, FlowStepId, ReviewFlowResult } from "../agents/types";
 import type { RolePolicy } from "../profiles/policy";
 import type { RuntimePolicy } from "../runtime/types";
 import { buildGenericRuntimePolicy } from "../server/runtime-policy";
 import { withProviderWorkBoundary } from "../server/provider-work-boundary";
+import { buildInitialFlowSteps, FLOW_STEP_DEFINITIONS, type FlowStepAgentPlan } from "./step-agents";
 
 export const MAX_FLOW_MS = 5 * 60 * 1_000;
 export const MAX_HANDOFF_CHARS = 30_000;
@@ -30,18 +31,14 @@ export type FlowOptions = {
   getDiff?: () => Promise<string>;
   fingerprint?: () => Promise<string>;
   roles?: RolePolicy;
+  stepAgents?: FlowStepAgentPlan;
   repositoryReadOnly?: boolean;
   runtimePolicies?: Record<AgentId, RuntimePolicy>;
   executeAgent?: (agent: AgentId, prompt: string, signal: AbortSignal, stepId: FlowStepId, onProviderWorkStart?: () => boolean | void, onChildClose?: () => void) => Promise<import("../agents/types").AgentResult>;
 };
 type FlowLogEntry = { flowId: string; stepId: FlowStepId; agent: AgentId; status: FlowStep["status"]; durationMs?: number };
 
-const definitions: Array<{ id: FlowStepId; agent: AgentId; role: FlowRole }> = [
-  { id: "codex_draft", agent: "codex", role: "draft" },
-  { id: "cursor_review", agent: "cursor", role: "review" },
-  { id: "claude_review", agent: "claude", role: "review" },
-  { id: "codex_final", agent: "codex", role: "final" },
-];
+const definitions = FLOW_STEP_DEFINITIONS;
 
 const downstreamMinimumWorkMs: Partial<Record<FlowStepId, number>> = {
   cursor_review: 45_000,
@@ -85,7 +82,7 @@ export async function runReviewFlow(prompt: string, options: FlowOptions = {}): 
   const adapters = options.agents ?? defaultAgents;
   const now = options.now ?? Date.now;
   const flowId = options.flowId ?? randomUUID();
-  const steps = definitions.map<FlowStep>((step) => ({ ...step, status: "idle", output: "" }));
+  const steps = buildInitialFlowSteps(options.stepAgents);
   const flowDeadlineMs = now() + (options.maxFlowMs ?? MAX_FLOW_MS);
   const controller = new AbortController();
   let timedOut = false;

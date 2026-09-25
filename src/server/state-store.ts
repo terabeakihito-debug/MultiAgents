@@ -345,6 +345,7 @@ export class StateStore {
       baseAheadCount: task.baseAheadCount,
       profileSnapshot: profile,
       templateSnapshot: template,
+      flowStepAgents: task.flowStepAgents,
     });
     this.transaction(() => {
       this.database.prepare(`
@@ -1218,6 +1219,7 @@ export class StateStore {
       localClonePath: optionalString(payload.localClonePath),
       baseState: optionalString(payload.baseState) as RepoTask["baseState"],
       baseAheadCount: optionalNumber(payload.baseAheadCount),
+      flowStepAgents: objectOrUndefined(payload.flowStepAgents) as RepoTask["flowStepAgents"],
     } as RepoTask;
   }
 

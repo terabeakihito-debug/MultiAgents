@@ -19,6 +19,12 @@ import type { OsSandboxAudit } from "./os-sandbox";
 import type { AgentLifecycleTelemetry } from "../agents/types";
 import { acquireTaskLock, holdsTaskLock, isTaskLocked, releaseTaskLock } from "./task-lock";
 import { beginRegisteredOperation } from "./operation-registry";
+import {
+  defaultFlowStepAgents,
+  FlowStepAgentPlanError,
+  parseFlowStepAgentPlan,
+  type FlowStepAgentPlan,
+} from "../flows/step-agents";
 
 export const WORKTREE_ROOT = join(homedir(), "code", ".multiagents-worktrees");
 export const TASK_BRANCH_PATTERN = /^multiagents\/[0-9a-f-]{36}$/;
@@ -108,6 +114,7 @@ export type RepoTask = {
   flowId?: string;
   flowStatus?: string;
   flowSteps?: FlowStep[];
+  flowStepAgents?: FlowStepAgentPlan;
   finalOutput?: string;
   recoveryStatus: RecoveryStatus;
   recoveryMessage?: string;
@@ -182,7 +189,7 @@ const transitions: Record<TaskStatus, readonly TaskStatus[]> = {
   archived: [],
 };
 
-export async function createTask(repoId: string, options: { allowedRoot?: string; worktreeRoot?: string; templateId?: string; prompt?: string; autonomous?: boolean; sourceFindingId?: string; sourceTaskId?: string } = {}): Promise<RepoTask> {
+export async function createTask(repoId: string, options: { allowedRoot?: string; worktreeRoot?: string; templateId?: string; prompt?: string; autonomous?: boolean; stepAgents?: FlowStepAgentPlan; sourceFindingId?: string; sourceTaskId?: string } = {}): Promise<RepoTask> {
   loadPersistedTasks();
   const allowedRoot = options.allowedRoot ?? ALLOWED_ROOT;
   const repo = await validateRepository(repoId, allowedRoot);
@@ -192,6 +199,14 @@ export async function createTask(repoId: string, options: { allowedRoot?: string
   requireUsableTaskProfile(profile, repoId);
   const template = await selectTaskTemplate(repoId, options.templateId, profile, allowedRoot);
   if (options.autonomous === true && template.readOnly) throw new Error("Autonomous execution requires a writable task template");
+  let flowStepAgents = defaultFlowStepAgents();
+  if (options.stepAgents !== undefined) {
+    try {
+      flowStepAgents = parseFlowStepAgentPlan(options.stepAgents, profile, template);
+    } catch (error) {
+      throw new Error(error instanceof FlowStepAgentPlanError ? error.message : "Step agent selection is invalid");
+    }
+  }
   if (options.prompt !== undefined && (typeof options.prompt !== "string" || options.prompt.length > 20_000)) throw new Error("Task prompt is invalid");
   if ((options.sourceFindingId !== undefined && !/^[0-9a-f-]{36}$/i.test(options.sourceFindingId)) || (options.sourceTaskId !== undefined && !/^[0-9a-f-]{36}$/i.test(options.sourceTaskId))) throw new Error("Task source linkage is invalid");
   if (Boolean(options.sourceFindingId) !== Boolean(options.sourceTaskId)) throw new Error("Task source linkage must include both finding and task IDs");
@@ -241,6 +256,7 @@ export async function createTask(repoId: string, options: { allowedRoot?: string
     templateSnapshotValid: true,
     sourceFindingId: options.sourceFindingId,
     sourceTaskId: options.sourceTaskId,
+    flowStepAgents,
   };
   tasks.set(id, task);
   const store = getStateStore();
@@ -417,6 +433,7 @@ export function publicTask(task: RepoTask) {
     flowId: task.flowId,
     flowStatus: task.flowStatus,
     flowSteps: task.flowSteps ?? [],
+    flowStepAgents: task.flowStepAgents,
     finalOutput: task.finalOutput,
     recoveryStatus: task.recoveryStatus,
     recoveryMessage: task.recoveryMessage,
